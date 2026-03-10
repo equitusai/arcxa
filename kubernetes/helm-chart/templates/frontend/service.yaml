@@ -1,0 +1,15 @@
+{{- if .Values.graphica.frontend.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: graphica-frontend
+  namespace: graphica
+spec:
+  ports:
+  - port: 8080
+    name: http
+  clusterIP: None
+  selector:
+    app: graphica
+    component: frontend
+{{- end }}

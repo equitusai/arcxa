@@ -1,0 +1,115 @@
+# Example Workflow: DDL with Conditional Approval
+#
+# This workflow demonstrates conditional approval based on environment and risk level.
+#
+# Key Feature: skip_if condition allows bypassing approval in certain scenarios:
+# - Non-production environments (dev, staging, test)
+# - Low-risk operations (small table sizes, non-destructive changes)
+# - Automated testing scenarios
+#
+# Use Case: Auto-approve in dev/staging, require approval only in production
+
+id: ddl_conditional_approval_workflow
+name: "DDL with Conditional Approval"
+description: "Auto-approves in non-prod, requires approval in production"
+version: 1
+
+routes:
+  - id: main_route
+    name: "Conditional Approval Flow"
+    description: "Parse → Generate DDL → Conditional Approval → Execute"
+    enabled: true
+    priority: 1
+
+    actions:
+      # Step 1: Parse CSV and generate DDL from SHACL ontology
+      - transform:
+          transformer: "shacl_ddl"
+          config:
+            source_file_id: "${input.source_file_id}"
+            ontology_file_id: "${input.ontology_file_id}"
+            target_schema: "${input.target_schema}"
+            target_table: "${input.target_table}"
+            dialect: "db2"
+
+      # Step 2: Set risk level based on operation
+      - set_field:
+          field: "risk_level"
+          value: "${input.risk_level}"  # "low", "medium", "high"
+
+      # Step 3: CONDITIONAL APPROVAL GATE
+      # Skipped if:
+      # - Environment is dev or staging
+      # - OR risk level is low
+      # Required if:
+      # - Environment is production AND risk level is medium/high
+      - wait_for_approval:
+          approval_id: "ddl_execution_approval"
+          approval_type: "ddl_execution"
+          approval_payload:
+            operation: "CREATE_TABLE"
+            target_schema: "${input.target_schema}"
+            target_table: "${input.target_table}"
+            ddl_statement: "${data.generated_ddl}"
+            risk_level: "${data.risk_level}"
+            environment: "${env.ENVIRONMENT}"
+          timeout_secs: 86400
+          # CONDITIONAL SKIP: Auto-approve in non-prod or for low-risk ops
+          skip_if: |
+            "${env.ENVIRONMENT}" == "dev" ||
+            "${env.ENVIRONMENT}" == "staging" ||
+            "${data.risk_level}" == "low"
+
+      # Step 4: Execute DDL (with or without approval)
+      - transform:
+          transformer: "db2_load"
+          config:
+            connection:
+              host: "${env.DB2_HOST}"
+              port: "${env.DB2_PORT}"
+              database: "${env.DB2_DATABASE}"
+              username: "${env.DB2_USERNAME}"
+              password: "${env.DB2_PASSWORD}"
+            ddl_statements:
+              - "${data.generated_ddl}"
+
+      # Step 5: Load data
+      - transform:
+          transformer: "db2_load"
+          config:
+            source_file_id: "${input.source_file_id}"
+            target_schema: "${input.target_schema}"
+            target_table: "${input.target_table}"
+            connection:
+              host: "${env.DB2_HOST}"
+              port: "${env.DB2_PORT}"
+              database: "${env.DB2_DATABASE}"
+              username: "${env.DB2_USERNAME}"
+              password: "${env.DB2_PASSWORD}"
+
+      # Step 6: Success notification
+      - log:
+          message: "DDL execution completed for ${input.target_table} (approved: ${approval.skipped})"
+          level: "info"
+
+# Usage Examples:
+#
+# 1. Development environment (auto-approved):
+#   ENVIRONMENT=dev cargo run -- execute-workflow ddl_conditional_approval_workflow \
+#     --input '{"source_file_id": "file_123", "ontology_file_id": "file_456", "target_table": "CUSTOMERS", "risk_level": "medium"}'
+#   => Approval skipped (environment is dev)
+#
+# 2. Staging environment (auto-approved):
+#   ENVIRONMENT=staging cargo run -- execute-workflow ddl_conditional_approval_workflow \
+#     --input '{"source_file_id": "file_123", "ontology_file_id": "file_456", "target_table": "CUSTOMERS", "risk_level": "high"}'
+#   => Approval skipped (environment is staging)
+#
+# 3. Production with low risk (auto-approved):
+#   ENVIRONMENT=production cargo run -- execute-workflow ddl_conditional_approval_workflow \
+#     --input '{"source_file_id": "file_123", "ontology_file_id": "file_456", "target_table": "TEMP_TABLE", "risk_level": "low"}'
+#   => Approval skipped (risk level is low)
+#
+# 4. Production with high risk (requires approval):
+#   ENVIRONMENT=production cargo run -- execute-workflow ddl_conditional_approval_workflow \
+#     --input '{"source_file_id": "file_123", "ontology_file_id": "file_456", "target_table": "CUSTOMERS", "risk_level": "high"}'
+#   => Workflow pauses, admin must approve via API

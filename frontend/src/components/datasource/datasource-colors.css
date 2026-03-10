@@ -1,0 +1,131 @@
+/**
+ * Datasource Category Color System
+ * Oracle Redwood × Microsoft Fluent
+ *
+ * Usage:
+ * - Import in DatasourceTypeSelector.tsx
+ * - Use CSS variables for dynamic theming
+ * - All colors are WCAG AA compliant
+ */
+
+:root {
+  /* Relational Databases - Fluent Blue (trustworthy, enterprise) */
+  --ds-relational-base: rgb(0, 120, 212);
+  --ds-relational-bg: rgba(0, 120, 212, 0.08);
+  --ds-relational-border: rgba(0, 120, 212, 0.20);
+  --ds-relational-hover: rgba(0, 120, 212, 0.12);
+
+  /* Document Stores - Success Green (flexible, modern) */
+  --ds-document-base: rgb(16, 124, 16);
+  --ds-document-bg: rgba(16, 124, 16, 0.08);
+  --ds-document-border: rgba(16, 124, 16, 0.20);
+  --ds-document-hover: rgba(16, 124, 16, 0.12);
+
+  /* Search Engines - Warning Amber (discovery, indexing) */
+  --ds-search-base: rgb(255, 185, 0);
+  --ds-search-bg: rgba(255, 185, 0, 0.08);
+  --ds-search-border: rgba(255, 185, 0, 0.20);
+  --ds-search-hover: rgba(255, 185, 0, 0.12);
+
+  /* Object Storage - Purple (cloud-native) */
+  --ds-storage-base: rgb(92, 46, 145);
+  --ds-storage-bg: rgba(92, 46, 145, 0.08);
+  --ds-storage-border: rgba(92, 46, 145, 0.20);
+  --ds-storage-hover: rgba(92, 46, 145, 0.12);
+
+  /* Streaming Platforms - Danger Red (real-time, urgent) */
+  --ds-streaming-base: rgb(209, 52, 56);
+  --ds-streaming-bg: rgba(209, 52, 56, 0.08);
+  --ds-streaming-border: rgba(209, 52, 56, 0.20);
+  --ds-streaming-hover: rgba(209, 52, 56, 0.12);
+
+  /* Graph Databases - Cyan (relationships) */
+  --ds-graph-base: rgb(0, 153, 188);
+  --ds-graph-bg: rgba(0, 153, 188, 0.08);
+  --ds-graph-border: rgba(0, 153, 188, 0.20);
+  --ds-graph-hover: rgba(0, 153, 188, 0.12);
+
+  /* Time-Series - Neutral Gray (metrics, temporal) */
+  --ds-timeseries-base: rgb(118, 118, 118);
+  --ds-timeseries-bg: rgba(118, 118, 118, 0.08);
+  --ds-timeseries-border: rgba(118, 118, 118, 0.20);
+  --ds-timeseries-hover: rgba(118, 118, 118, 0.12);
+
+  /* Custom Plugins - Muted (user-defined) */
+  --ds-custom-base: rgb(127, 134, 147);
+  --ds-custom-bg: rgba(127, 134, 147, 0.08);
+  --ds-custom-border: rgba(127, 134, 147, 0.20);
+  --ds-custom-hover: rgba(127, 134, 147, 0.12);
+
+  /* Capability Colors */
+  --cap-cdc: rgb(0, 120, 212);           /* Blue - real-time streams */
+  --cap-batch: rgb(16, 124, 16);         /* Green - bulk operations */
+  --cap-profiling: rgb(92, 46, 145);     /* Purple - analysis */
+  --cap-lineage: rgb(255, 140, 0);       /* Orange - provenance */
+  --cap-schema: rgb(255, 185, 0);        /* Yellow - evolution */
+  --cap-transaction: rgb(209, 52, 56);   /* Red - ACID guarantees */
+
+  /* Neutral Palette (Redwood-inspired) */
+  --neutral-0: #FFFFFF;
+  --neutral-50: #F7F7F8;
+  --neutral-100: #F1F2F4;
+  --neutral-200: #E6E7EA;
+  --neutral-300: #D6D8DD;
+  --neutral-400: #B9BCC4;
+  --neutral-500: #9CA1AB;
+  --neutral-600: #7F8693;
+  --neutral-700: #626B7B;
+  --neutral-800: #434C5E;
+  --neutral-900: #2C3443;
+
+  /* Border & Shadow Tokens */
+  --border-subtle: rgba(0, 0, 0, 0.06);
+  --border-default: rgba(0, 0, 0, 0.10);
+  --border-emphasis: rgba(0, 0, 0, 0.18);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 2px 6px rgba(0, 0, 0, 0.10);
+  --shadow-lg: 0 6px 16px rgba(0, 0, 0, 0.14);
+
+  /* Focus Ring (Fluent-style) */
+  --focus-ring: 0 0 0 2px rgba(0, 120, 212, 0.35);
+  --focus-ring-offset: 2px;
+}
+
+/* Dark Mode Overrides (future enhancement) */
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Invert neutral ramp */
+    --neutral-0: #1B1F24;
+    --neutral-50: #2C3443;
+    --neutral-100: #434C5E;
+    --neutral-900: #F7F7F8;
+
+    /* Increase border opacity for dark backgrounds */
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-default: rgba(255, 255, 255, 0.12);
+    --border-emphasis: rgba(255, 255, 255, 0.20);
+
+    /* Adjust shadows for dark mode */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.20);
+    --shadow-md: 0 2px 6px rgba(0, 0, 0, 0.30);
+    --shadow-lg: 0 6px 16px rgba(0, 0, 0, 0.40);
+  }
+}
+
+/* High Contrast Mode (accessibility) */
+@media (prefers-contrast: high) {
+  :root {
+    --border-default: rgba(0, 0, 0, 0.30);
+    --border-emphasis: rgba(0, 0, 0, 0.50);
+  }
+}
+
+/* Reduced Motion (accessibility) */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

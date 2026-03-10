@@ -1,0 +1,37 @@
+{{- if .Values.graphica.modelService.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphica-model-service
+  namespace: {{ .Release.namespace }}
+spec:
+  replicas: {{ .Values.graphica.modelService.replicas }}
+  selector:
+    matchLabels:
+      app: graphica
+      component: model
+  template:
+    metadata:
+      labels:
+        app: graphica
+        component: model
+    spec:
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
+      imagePullSecrets:
+      - name: graphica-pull
+      containers:
+      - name: graphica-model-service
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        image: {{ .Values.graphica.modelService.imageTag }}
+        args:
+          - ./graphica-model-service
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: GRAPHICA_MODEL_PATH
+          value: ./models/minilm
+        - name: GRPC_PORT
+          value: '50051'
+        securityContext:
+          runAsUser: 1000
+{{- end }}

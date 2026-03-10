@@ -1,0 +1,81 @@
+// RDF-star validation test for Oxigraph 0.4.11
+//
+// This test verifies if Oxigraph 0.4.11 supports true RDF-star quoted triples
+// as subjects (Subject::Triple) vs reification
+
+use oxigraph::model::*;
+use oxigraph::model::vocab::xsd;
+use oxigraph::store::Store;
+
+#[test]
+fn test_oxigraph_rdf_star_support() {
+    // Create an in-memory store
+    let store = Store::new().unwrap();
+
+    // Create a base triple
+    let subject = NamedNode::new("http://example.org/entity/1").unwrap();
+    let predicate = NamedNode::new("http://example.org/prop/revenue").unwrap();
+    let object = Literal::new_simple_literal("1000000");
+
+    let base_triple = Triple::new(
+        subject.clone(),
+        predicate.clone(),
+        Term::Literal(object.clone()),
+    );
+
+    // Try to create a quoted triple as subject (RDF-star feature)
+    #[allow(unreachable_code)]
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        // This will cause a compile error if Subject::Triple doesn't exist
+        let quoted_subject = Subject::Triple(Box::new(base_triple.clone()));
+
+        // Try to use it in a quad with annotation
+        let ann_predicate = NamedNode::new("http://graphica.io/ontology#confidence")?;
+        let ann_object = Literal::new_typed_literal("0.95", xsd::DECIMAL);
+
+        let annotation_quad = Quad::new(
+            quoted_subject,
+            ann_predicate,
+            Term::Literal(ann_object),
+            GraphName::DefaultGraph,
+        );
+
+        store.insert(&annotation_quad)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(_) => {
+            println!("✅ SUCCESS: Oxigraph 0.4.11 supports Subject::Triple for RDF-star");
+        }
+        Err(e) => {
+            println!("⚠️  Subject::Triple exists but insertion failed: {:?}", e);
+            // This is OK - we just want to know if the type exists
+        }
+    }
+}
+
+#[test]
+fn test_oxigraph_has_update_method() {
+    // Check if Store has an update() method for SPARQL UPDATE
+    let store = Store::new().unwrap();
+
+    let update_query = r#"
+        INSERT DATA {
+            <http://example.org/test> <http://example.org/value> "123" .
+        }
+    "#;
+
+    // Try to execute update - this will cause compile error if method doesn't exist
+    let result = store.update(update_query);
+
+    match result {
+        Ok(_) => {
+            println!("✅ SUCCESS: Oxigraph 0.4.11 has update() method and it works");
+        }
+        Err(e) => {
+            println!("⚠️  update() method exists but query failed: {:?}", e);
+            // This is still success - the method exists
+        }
+    }
+}

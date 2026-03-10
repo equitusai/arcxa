@@ -1,0 +1,6 @@
+apiVersion: v2
+name: graphica
+description: Helm chart for Graphica
+type: application
+version: 0.0.1
+appVersion: "2025.11.20"

@@ -1,0 +1,119 @@
+# Example Workflow: Bulk Delete with Size-Based Conditional Approval
+#
+# This workflow demonstrates conditional approval based on operation size.
+#
+# Key Feature: skip_if condition allows bypassing approval for small deletes:
+# - Auto-approve if estimated_rows < 1000
+# - Require approval if estimated_rows >= 1000
+#
+# Use Case: Small cleanup operations don't need approval, large deletes do
+
+id: bulk_delete_conditional_approval
+name: "Bulk Delete with Size-Based Approval"
+description: "Auto-approves small deletes, requires approval for large deletes"
+version: 1
+
+routes:
+  - id: main_route
+    name: "Conditional Delete Flow"
+    description: "Estimate size → Conditional Approval → Execute delete"
+    enabled: true
+    priority: 1
+
+    actions:
+      # Step 1: Estimate number of rows to be deleted
+      - transform:
+          transformer: "sql_query"
+          config:
+            connection:
+              host: "${env.DB2_HOST}"
+              port: "${env.DB2_PORT}"
+              database: "${env.DB2_DATABASE}"
+              username: "${env.DB2_USERNAME}"
+              password: "${env.DB2_PASSWORD}"
+            query: |
+              SELECT COUNT(*) as estimated_rows
+              FROM ${input.target_table}
+              WHERE ${input.filter_condition}
+
+      # Step 2: Log estimated size
+      - log:
+          message: "Estimated rows to delete: ${data.estimated_rows}"
+          level: "info"
+
+      # Step 3: CONDITIONAL APPROVAL GATE (size-based)
+      # Skipped if: estimated_rows < 1000
+      # Required if: estimated_rows >= 1000
+      - wait_for_approval:
+          approval_id: "bulk_delete_approval_${execution.id}"
+          approval_type: "data_deletion"
+          approval_payload:
+            operation: "DELETE"
+            table: "${input.target_table}"
+            filter: "${input.filter_condition}"
+            estimated_rows: "${data.estimated_rows}"
+            requested_by: "${input.requester}"
+          timeout_secs: 3600
+          # AUTO-APPROVE SMALL DELETES
+          skip_if: "${data.estimated_rows} < 1000"
+
+      # Step 4: Execute delete (with or without approval)
+      - transform:
+          transformer: "sql_execute"
+          config:
+            connection:
+              host: "${env.DB2_HOST}"
+              port: "${env.DB2_PORT}"
+              database: "${env.DB2_DATABASE}"
+              username: "${env.DB2_USERNAME}"
+              password: "${env.DB2_PASSWORD}"
+            statement: |
+              DELETE FROM ${input.target_table}
+              WHERE ${input.filter_condition}
+
+      # Step 5: Record lineage
+      - record_lineage:
+          source_id: "${input.target_table}"
+          target_id: "${input.target_table}"
+          transformation: "bulk_delete"
+          metadata:
+            deleted_rows: "${data.estimated_rows}"
+            filter: "${input.filter_condition}"
+            auto_approved: "${approval.skipped}"
+            approved_by: "${approval.approved_by}"
+
+      # Step 6: Success notification
+      - notify:
+          channel: "workflow_events"
+          message: "Bulk delete completed: ${data.estimated_rows} rows deleted from ${input.target_table}"
+
+# Usage Examples:
+#
+# 1. Small delete (auto-approved):
+#   POST /api/v1/workflows/bulk_delete_conditional_approval/execute
+#   {
+#     "input": {
+#       "target_table": "USER_SESSIONS",
+#       "filter_condition": "created_at < '2024-01-01' AND session_type = 'guest'",
+#       "requester": "cleanup-job@company.com"
+#     }
+#   }
+#   => If estimated rows < 1000, approval skipped
+#
+# 2. Large delete (requires approval):
+#   POST /api/v1/workflows/bulk_delete_conditional_approval/execute
+#   {
+#     "input": {
+#       "target_table": "TRANSACTIONS",
+#       "filter_condition": "created_at < '2020-01-01'",
+#       "requester": "data-admin@company.com"
+#     }
+#   }
+#   => If estimated rows >= 1000, workflow pauses for approval
+#   => Admin reviews and approves via API
+#   => DELETE executes
+
+# Risk Levels:
+# - < 1000 rows: LOW RISK → Auto-approved
+# - 1000-10000 rows: MEDIUM RISK → Requires single approval
+# - > 10000 rows: HIGH RISK → Could require multi-level approval (future enhancement)

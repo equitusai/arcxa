@@ -1,0 +1,36 @@
+[package]
+name = "arcxa-cli"
+version = "0.4.0"
+edition = "2021"
+authors = ["Equitus Corporation"]
+license-file = "../LICENSE.md"
+description = "Command-line tools for the ARCXA data governance platform"
+
+[lib]
+name = "graphica_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "migrate"
+path = "src/bin/migrate.rs"
+
+[dependencies]
+graphica-migrations = { package = "arcxa-migrations", path = "../arcxa-migrations" }
+
+# Core utilities
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Storage (for migrate tool)
+rocksdb = "0.22"

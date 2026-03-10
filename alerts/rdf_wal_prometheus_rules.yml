@@ -1,0 +1,187 @@
+groups:
+  - name: rdf_wal_alerts
+    interval: 30s
+    rules:
+      # Critical Alerts - Page Immediately
+
+      - alert: RdfWalRecoveryFailure
+        expr: increase(test_rdf_wal_recovery_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL recovery failed on {{ $labels.instance }}"
+          description: "WAL recovery has failed {{ $value }} times in the last 5 minutes. Data durability may be compromised."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-recovery-failure"
+
+      - alert: RdfWalHighFsyncLatency
+        expr: histogram_quantile(0.99, rate(test_rdf_wal_fsync_duration_seconds_bucket[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL fsync latency is critically high on {{ $labels.instance }}"
+          description: "p99 fsync latency is {{ $value }}s (threshold: 100ms). Write performance is severely degraded."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-high-latency"
+
+      - alert: RdfWalStorageFull
+        expr: test_rdf_wal_storage_bytes > 50 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: critical
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL storage exceeds 50GB on {{ $labels.instance }}"
+          description: "WAL storage is {{ $value | humanize1024 }}B. Coordinator may run out of disk space."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-storage-full"
+
+      - alert: RdfWalErrorRate
+        expr: rate(test_rdf_wal_errors_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: critical
+          component: rdf_wal
+        annotations:
+          summary: "High RDF WAL error rate on {{ $labels.instance }}"
+          description: "WAL errors occurring at {{ $value }} errors/sec. Data durability may be at risk."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-errors"
+
+      # Warning Alerts - Investigate Soon
+
+      - alert: RdfWalHighSegmentCount
+        expr: test_rdf_wal_active_segments > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "High number of WAL segments on {{ $labels.instance }}"
+          description: "{{ $value }} active segments detected. Consider checkpoint/compaction."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-high-segments"
+
+      - alert: RdfWalSlowRecovery
+        expr: test_rdf_wal_last_recovery_duration_seconds > 30
+        for: 1m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL recovery is slow on {{ $labels.instance }}"
+          description: "Last recovery took {{ $value }}s (threshold: 30s). Large WAL may need compaction."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-slow-recovery"
+
+      - alert: RdfWalHighWriteRate
+        expr: rate(test_rdf_wal_bytes_written_total[5m]) > 100 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "High WAL write rate on {{ $labels.instance }}"
+          description: "WAL write rate is {{ $value | humanize1024 }}B/s. Monitor disk I/O capacity."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-high-write-rate"
+
+      - alert: RdfWalShardErrors
+        expr: rate(test_rdf_wal_shard_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL experiencing shard errors on {{ $labels.instance }}"
+          description: "Shard errors occurring at {{ $value }} errors/sec during WAL operations."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-shard-errors"
+
+      - alert: RdfWalNoRecentWrites
+        expr: rate(test_rdf_wal_triples_written_total[10m]) == 0 and test_rdf_wal_triples_written_total > 0
+        for: 30m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "No RDF WAL writes detected on {{ $labels.instance }}"
+          description: "WAL has not received writes for 30 minutes. Possible pipeline issue."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-no-writes"
+
+      # Informational Alerts - Track Metrics
+
+      - alert: RdfWalSegmentRotation
+        expr: increase(test_rdf_wal_segment_rotations_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: info
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL segment rotated on {{ $labels.instance }}"
+          description: "{{ $value }} segment rotations in last 5 minutes."
+
+      - alert: RdfWalRecoveryCompleted
+        expr: changes(test_rdf_wal_last_recovery_timestamp_seconds[5m]) > 0
+        for: 1m
+        labels:
+          severity: info
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL recovery completed on {{ $labels.instance }}"
+          description: "Recovered {{ test_rdf_wal_last_recovery_triples_total }} triples in {{ test_rdf_wal_last_recovery_duration_seconds }}s."
+
+      # Performance Degradation Detection
+
+      - alert: RdfWalBatchSizeDecreased
+        expr: histogram_quantile(0.50, rate(test_rdf_wal_batch_size_bucket[5m])) < 10
+        for: 10m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL batch size degraded on {{ $labels.instance }}"
+          description: "Median batch size is {{ $value }} triples. Small batches reduce throughput."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-small-batches"
+
+      - alert: RdfWalCompressionIneffective
+        expr: (test_rdf_wal_bytes_written_total / test_rdf_wal_bytes_before_compression_total) > 0.9
+        for: 15m
+        labels:
+          severity: info
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL compression ineffective on {{ $labels.instance }}"
+          description: "Compression ratio is {{ $value }}, achieving <10% reduction. Data may not be compressible."
+
+      # Capacity Planning
+
+      - alert: RdfWalStorageGrowthHigh
+        expr: predict_linear(test_rdf_wal_storage_bytes[1h], 24 * 3600) > 100 * 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "RDF WAL storage projected to exceed 100GB in 24h on {{ $labels.instance }}"
+          description: "Current growth rate will fill disk in <24h. Plan checkpoint/compaction."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-capacity-planning"
+
+      - alert: RdfWalLsnGrowthAnomalous
+        expr: deriv(test_rdf_wal_current_lsn[10m]) > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: rdf_wal
+        annotations:
+          summary: "Anomalous LSN growth rate on {{ $labels.instance }}"
+          description: "LSN growing at {{ $value }}/sec. Possible burst activity or issue."
+
+      # Durability Validation
+
+      - alert: RdfWalTriplesMismatch
+        expr: abs(test_rdf_wal_triples_written_total - test_rdf_wal_last_recovery_triples_total) > 1000 and test_rdf_wal_last_recovery_timestamp_seconds > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: rdf_wal
+        annotations:
+          summary: "Mismatch between written and recovered triples on {{ $labels.instance }}"
+          description: "{{ $value }} triples difference detected. Potential data loss or corruption."
+          runbook: "https://docs.graphica.dev/runbooks/rdf-wal-data-mismatch"

@@ -1,0 +1,419 @@
+//! REST API endpoints for workflow orchestration
+//!
+//! Provides HTTP endpoints for:
+//! - Workflow registration and lifecycle management
+//! - Workflow execution with input validation
+//! - Execution history and status queries
+//! - Model registry integration
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+
+use crate::orchestration::workflow::{
+    WorkflowDefinition, WorkflowExecutor, ExecutionContext, WorkflowResult,
+};
+use crate::orchestration::ml::{ModelRegistry, ModelCache, ModelInvoker};
+use crate::orchestration::rules::RuleExecutor;
+
+/// API state for workflow orchestration endpoints
+#[derive(Clone)]
+pub struct WorkflowApiState {
+    /// Workflow engine for managing registered workflows
+    pub workflow_engine: Arc<crate::orchestration::WorkflowEngine>,
+    /// Model registry for ML integration
+    pub model_registry: Arc<ModelRegistry>,
+    /// Model cache for ML predictions
+    pub model_cache: Arc<ModelCache>,
+    /// Rule executor for heuristics and WASM rules
+    pub rule_executor: Arc<RuleExecutor>,
+}
+
+impl WorkflowApiState {
+    pub fn new(
+        workflow_engine: Arc<crate::orchestration::WorkflowEngine>,
+        model_registry: Arc<ModelRegistry>,
+        model_cache: Arc<ModelCache>,
+        rule_executor: Arc<RuleExecutor>,
+    ) -> Self {
+        Self {
+            workflow_engine,
+            model_registry,
+            model_cache,
+            rule_executor,
+        }
+    }
+}
+
+/// Build workflow API routes (to be integrated into main router)
+pub fn workflow_routes() -> Router<Arc<WorkflowApiState>> {
+    Router::new()
+        .route("/workflows", post(register_workflow))
+        .route("/workflows", get(list_workflows))
+        .route("/workflows/:id", get(get_workflow))
+        .route("/workflows/:id/execute", post(execute_workflow))
+        .route("/workflows/:id/executions", get(get_workflow_executions))
+        .route("/executions/:execution_id", get(get_execution_status))
+}
+
+// ============================================================================
+// Request/Response Types
+// ============================================================================
+
+/// Request to register a new workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterWorkflowRequest {
+    /// Workflow ID (optional, generated if not provided)
+    pub id: Option<String>,
+    /// Human-readable workflow name
+    pub name: String,
+    /// Workflow description
+    pub description: Option<String>,
+    /// Workflow definition (YAML or JSON)
+    pub definition: WorkflowDefinition,
+    /// Tags for categorization
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Response from workflow registration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterWorkflowResponse {
+    pub workflow_id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Request to execute a workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteWorkflowRequest {
+    /// Input data for workflow execution
+    pub input: serde_json::Value,
+    /// Optional execution context parameters
+    #[serde(default)]
+    pub context: ExecutionContextParams,
+}
+
+/// Execution context parameters
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionContextParams {
+    /// Request ID for tracing
+    pub request_id: Option<String>,
+    /// User/system initiating the execution
+    pub initiator: Option<String>,
+    /// Additional metadata
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// Response from workflow execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteWorkflowResponse {
+    /// Execution ID for tracking
+    pub execution_id: String,
+    /// Workflow ID that was executed
+    pub workflow_id: String,
+    /// Execution result
+    pub result: ExecutionResultDto,
+    /// Execution started timestamp
+    pub started_at: DateTime<Utc>,
+    /// Execution completed timestamp
+    pub completed_at: DateTime<Utc>,
+}
+
+/// Data transfer object for execution result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionResultDto {
+    pub success: bool,
+    pub step_results: Vec<StepResultDto>,
+    pub final_output: serde_json::Value,
+    pub confidence: f64,
+}
+
+/// Data transfer object for step result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepResultDto {
+    pub step_id: String,
+    pub success: bool,
+    pub output: serde_json::Value,
+    pub confidence: f64,
+    pub duration_ms: u64,
+}
+
+/// Workflow summary for listing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    pub workflow_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub execution_count: u64,
+    pub last_executed_at: Option<DateTime<Utc>>,
+}
+
+/// List workflows query parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListWorkflowsQuery {
+    pub tag: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// Execution status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStatus {
+    pub execution_id: String,
+    pub workflow_id: String,
+    pub status: ExecutionState,
+    pub result: Option<ExecutionResultDto>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Execution state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionState {
+    Running,
+    Completed,
+    Failed,
+}
+
+// ============================================================================
+// Handler Functions
+// ============================================================================
+
+/// Register a new workflow
+async fn register_workflow(
+    State(state): State<Arc<WorkflowApiState>>,
+    Json(request): Json<RegisterWorkflowRequest>,
+) -> Result<Json<RegisterWorkflowResponse>, ApiError> {
+    // Generate workflow ID if not provided
+    let workflow_id = request.id.unwrap_or_else(|| format!("wf_{}", Uuid::new_v4()));
+
+    // Validate workflow definition
+    request.definition.validate()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid workflow definition: {}", e)))?;
+
+    // Register workflow in engine
+    state.workflow_engine.register_workflow(
+        workflow_id.clone(),
+        request.name.clone(),
+        request.definition,
+    ).await
+        .map_err(|e| ApiError::InternalError(format!("Failed to register workflow: {}", e)))?;
+
+    Ok(Json(RegisterWorkflowResponse {
+        workflow_id,
+        name: request.name,
+        created_at: Utc::now(),
+    }))
+}
+
+/// List all registered workflows
+async fn list_workflows(
+    State(state): State<Arc<WorkflowApiState>>,
+    Query(_query): Query<ListWorkflowsQuery>,
+) -> Result<Json<Vec<WorkflowSummary>>, ApiError> {
+    // Get all workflows from engine
+    let workflows = state.workflow_engine.list_workflows().await
+        .map_err(|e| ApiError::InternalError(format!("Failed to list workflows: {}", e)))?;
+
+    let summaries = workflows.into_iter().map(|(id, metadata)| {
+        WorkflowSummary {
+            workflow_id: id,
+            name: metadata.name,
+            description: metadata.description,
+            tags: metadata.tags,
+            created_at: metadata.created_at,
+            execution_count: metadata.execution_count,
+            last_executed_at: metadata.last_executed_at,
+        }
+    }).collect();
+
+    Ok(Json(summaries))
+}
+
+/// Get workflow details
+async fn get_workflow(
+    State(state): State<Arc<WorkflowApiState>>,
+    Path(workflow_id): Path<String>,
+) -> Result<Json<WorkflowDefinition>, ApiError> {
+    let workflow = state.workflow_engine.get_workflow(&workflow_id).await
+        .map_err(|e| ApiError::InternalError(format!("Failed to get workflow: {}", e)))?
+        .ok_or_else(|| ApiError::NotFound(format!("Workflow not found: {}", workflow_id)))?;
+
+    Ok(Json(workflow.definition))
+}
+
+/// Execute a workflow
+async fn execute_workflow(
+    State(state): State<Arc<WorkflowApiState>>,
+    Path(workflow_id): Path<String>,
+    Json(request): Json<ExecuteWorkflowRequest>,
+) -> Result<Json<ExecuteWorkflowResponse>, ApiError> {
+    // Get workflow from engine
+    let workflow_metadata = state.workflow_engine.get_workflow(&workflow_id).await
+        .map_err(|e| ApiError::InternalError(format!("Failed to get workflow: {}", e)))?
+        .ok_or_else(|| ApiError::NotFound(format!("Workflow not found: {}", workflow_id)))?;
+
+    // Create model invoker for this execution
+    let invoker = Arc::new(
+        ModelInvoker::new(
+            state.model_registry.clone(),
+            state.model_cache.clone(),
+        ).map_err(|e| ApiError::InternalError(format!("Failed to create model invoker: {}", e)))?
+    );
+
+    // Create workflow executor
+    let executor = WorkflowExecutor::new(
+        workflow_metadata.definition.clone(),
+        invoker,
+        state.rule_executor.clone(),
+    ).map_err(|e| ApiError::InternalError(format!("Failed to create executor: {}", e)))?;
+
+    // Create execution context
+    let context = ExecutionContext::new(request.input);
+
+    // Execute workflow
+    let result = executor.execute(context).await
+        .map_err(|e| ApiError::InternalError(format!("Workflow execution failed: {}", e)))?;
+
+    // Record execution in workflow engine (increment count and update timestamp)
+    state.workflow_engine.record_execution(&workflow_id).await
+        .map_err(|e| ApiError::InternalError(format!("Failed to record execution: {}", e)))?;
+
+    // Convert workflow result to DTO
+    let result_dto = convert_workflow_result(&result);
+
+    Ok(Json(ExecuteWorkflowResponse {
+        execution_id: result.execution_id.clone(),
+        workflow_id,
+        result: result_dto,
+        started_at: result.started_at,
+        completed_at: result.completed_at,
+    }))
+}
+
+/// Get workflow execution history
+async fn get_workflow_executions(
+    State(_state): State<Arc<WorkflowApiState>>,
+    Path(_workflow_id): Path<String>,
+) -> Result<Json<Vec<ExecutionStatus>>, ApiError> {
+    // TODO: Implement execution history tracking
+    Ok(Json(vec![]))
+}
+
+/// Get execution status
+async fn get_execution_status(
+    State(_state): State<Arc<WorkflowApiState>>,
+    Path(_execution_id): Path<String>,
+) -> Result<Json<ExecutionStatus>, ApiError> {
+    // TODO: Implement execution status tracking
+    Err(ApiError::NotImplemented("Execution status tracking not yet implemented".to_string()))
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Convert WorkflowResult to DTO
+fn convert_workflow_result(result: &WorkflowResult) -> ExecutionResultDto {
+    let step_results = result.step_results.iter().map(|(step_id, step_result)| {
+        let duration_ms = (step_result.completed_at - step_result.started_at)
+            .num_milliseconds() as u64;
+
+        StepResultDto {
+            step_id: step_id.clone(),
+            success: step_result.success,
+            output: step_result.output.clone(),
+            confidence: step_result.confidence,
+            duration_ms,
+        }
+    }).collect();
+
+    ExecutionResultDto {
+        success: result.success,
+        step_results,
+        final_output: serde_json::json!({
+            "decision": format!("{:?}", result.final_decision),
+            "confidence": result.confidence,
+        }),
+        confidence: result.confidence,
+    }
+}
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+/// API error types
+#[derive(Debug, Clone, Serialize)]
+pub enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    InternalError(String),
+    NotImplemented(String),
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, message) = match self {
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg),
+        };
+
+        (status, Json(serde_json::json!({
+            "error": message,
+        }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_register_workflow_request_serialization() {
+        let request = RegisterWorkflowRequest {
+            id: Some("test_workflow".to_string()),
+            name: "Test Workflow".to_string(),
+            description: Some("A test workflow".to_string()),
+            definition: WorkflowDefinition {
+                steps: vec![],
+                fusion_threshold: 0.8,
+                fallback: crate::orchestration::workflow::definition::FallbackStrategy::ManualReview,
+            },
+            tags: vec!["test".to_string()],
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("Test Workflow"));
+    }
+
+    #[test]
+    fn test_execute_workflow_request_deserialization() {
+        let json = r#"{
+            "input": {"feature1": "value1", "feature2": 42},
+            "context": {
+                "request_id": "req_123",
+                "initiator": "user_456"
+            }
+        }"#;
+
+        let request: ExecuteWorkflowRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.context.request_id, Some("req_123".to_string()));
+        assert_eq!(request.context.initiator, Some("user_456".to_string()));
+    }
+}

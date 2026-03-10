@@ -1,0 +1,917 @@
+//! Workflow engine for orchestrating multi-step governance operations
+
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use super::dag::DagExecutor;
+use super::definition::{WorkflowDefinition, WorkflowStep};
+use super::executor::{
+    DbExtractCallback, DbLoaderCallback, ExecutionContext, TransformerCallback, WorkflowExecutor,
+    WorkflowResult,
+};
+use super::lineage_tracker::LineageTracker;
+use super::row_lineage_context::RowLineageContext;
+use crate::orchestration::ml::ModelInvoker;
+use crate::orchestration::rules::RuleExecutor;
+
+/// Workflow engine managing workflow lifecycle
+pub struct WorkflowEngine {
+    /// Registered workflows by ID
+    workflows: Arc<RwLock<HashMap<String, RegisteredWorkflow>>>,
+    /// ML model invoker for workflow execution
+    model_invoker: Option<Arc<ModelInvoker>>,
+    /// Rule executor for workflow execution
+    rule_executor: Option<Arc<RuleExecutor>>,
+    /// Optional RDF persistence callback
+    rdf_persistence_callback:
+        Option<Arc<dyn Fn(&str, &WorkflowResult) -> Result<()> + Send + Sync>>,
+    /// Optional lineage tracker for field-level and row-level provenance
+    lineage_tracker: Option<Arc<dyn LineageTracker>>,
+    /// Optional transformer callback for ETL steps (injected by coordinator)
+    transformer_callback: Option<Arc<TransformerCallback>>,
+    /// Optional DB loader callback for database loading steps (injected by coordinator)
+    db_loader_callback: Option<Arc<DbLoaderCallback>>,
+    /// Optional DB extract callback for database extraction steps (injected by coordinator)
+    db_extract_callback: Option<Arc<DbExtractCallback>>,
+}
+
+/// Registered workflow with metadata
+#[derive(Debug, Clone)]
+struct RegisteredWorkflow {
+    id: String,
+    name: String,
+    description: Option<String>,
+    tags: Vec<String>,
+    definition: WorkflowDefinition,
+    version: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    /// Number of times this workflow has been executed
+    execution_count: u64,
+    /// Timestamp of the last execution (None if never executed)
+    last_executed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl RegisteredWorkflow {
+    fn to_metadata(&self) -> WorkflowMetadata {
+        WorkflowMetadata {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            tags: self.tags.clone(),
+            definition: self.definition.clone(),
+            version: self.version.clone(),
+            created_at: self.created_at,
+            execution_count: self.execution_count,
+            last_executed_at: self.last_executed_at,
+        }
+    }
+}
+
+/// Public workflow metadata
+#[derive(Debug, Clone)]
+pub struct WorkflowMetadata {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub definition: WorkflowDefinition,
+    pub version: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub execution_count: u64,
+    pub last_executed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl WorkflowEngine {
+    /// Create new workflow engine without execution capabilities
+    pub fn new() -> Self {
+        Self {
+            workflows: Arc::new(RwLock::new(HashMap::new())),
+            model_invoker: None,
+            rule_executor: None,
+            rdf_persistence_callback: None,
+            lineage_tracker: None,
+            transformer_callback: None,
+            db_loader_callback: None,
+            db_extract_callback: None,
+        }
+    }
+
+    /// Create new workflow engine with execution capabilities
+    pub fn new_with_execution(
+        model_invoker: Arc<ModelInvoker>,
+        rule_executor: Arc<RuleExecutor>,
+    ) -> Self {
+        Self {
+            workflows: Arc::new(RwLock::new(HashMap::new())),
+            model_invoker: Some(model_invoker),
+            rule_executor: Some(rule_executor),
+            rdf_persistence_callback: None,
+            lineage_tracker: None,
+            transformer_callback: None,
+            db_loader_callback: None,
+            db_extract_callback: None,
+        }
+    }
+
+    /// Set RDF persistence callback (called after each execution)
+    pub fn with_rdf_persistence<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &WorkflowResult) -> Result<()> + Send + Sync + 'static,
+    {
+        self.rdf_persistence_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set lineage tracker for field-level and row-level provenance tracking
+    pub fn with_lineage_tracker(mut self, tracker: Arc<dyn LineageTracker>) -> Self {
+        self.lineage_tracker = Some(tracker);
+        self
+    }
+
+    /// Set transformer callback for ETL steps (injected by coordinator)
+    pub fn with_transformer_callback(mut self, callback: Arc<TransformerCallback>) -> Self {
+        self.transformer_callback = Some(callback);
+        self
+    }
+
+    /// Set DB loader callback for database loading steps (injected by coordinator)
+    pub fn with_db_loader_callback(mut self, callback: Arc<DbLoaderCallback>) -> Self {
+        self.db_loader_callback = Some(callback);
+        self
+    }
+
+    /// Set DB extract callback for database extraction steps (injected by coordinator)
+    pub fn with_db_extract_callback(mut self, callback: Arc<DbExtractCallback>) -> Self {
+        self.db_extract_callback = Some(callback);
+        self
+    }
+
+    /// Get reference to model invoker (if configured)
+    pub fn model_invoker(&self) -> &Option<Arc<ModelInvoker>> {
+        &self.model_invoker
+    }
+
+    /// Get reference to rule executor (if configured)
+    pub fn rule_executor(&self) -> &Option<Arc<RuleExecutor>> {
+        &self.rule_executor
+    }
+
+    /// Register a new workflow with optional metadata
+    pub async fn register_workflow(
+        &self,
+        workflow_id: String,
+        name: String,
+        definition: WorkflowDefinition,
+        description: Option<String>,
+        tags: Vec<String>,
+    ) -> Result<String> {
+        // Validate workflow definition
+        definition
+            .validate()
+            .context("Invalid workflow definition")?;
+
+        // Validate DAG structure
+        DagExecutor::from_workflow(&definition).context("Failed to build DAG from workflow")?;
+
+        let mut workflows = self.workflows.write().await;
+        if workflows.contains_key(&workflow_id) {
+            anyhow::bail!("Workflow already exists: {}", workflow_id);
+        }
+
+        let workflow = RegisteredWorkflow {
+            id: workflow_id.clone(),
+            name,
+            description,
+            tags,
+            definition,
+            version: "1.0.0".to_string(),
+            created_at: chrono::Utc::now(),
+            execution_count: 0,
+            last_executed_at: None,
+        };
+
+        workflows.insert(workflow_id.clone(), workflow);
+
+        Ok(workflow_id)
+    }
+
+    /// Get workflow by ID (returns full metadata)
+    pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowMetadata>> {
+        let workflows = self.workflows.read().await;
+        Ok(workflows
+            .get(workflow_id)
+            .map(RegisteredWorkflow::to_metadata))
+    }
+
+    /// Get workflow definition only
+    pub async fn get_workflow_definition(&self, workflow_id: &str) -> Result<WorkflowDefinition> {
+        let workflows = self.workflows.read().await;
+        workflows
+            .get(workflow_id)
+            .map(|w| w.definition.clone())
+            .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))
+    }
+
+    /// List all registered workflows (returns full metadata)
+    pub async fn list_workflows(&self) -> Result<Vec<(String, WorkflowMetadata)>> {
+        let workflows = self.workflows.read().await;
+        Ok(workflows
+            .iter()
+            .map(|(id, w)| (id.clone(), w.to_metadata()))
+            .collect())
+    }
+
+    /// List workflows as summaries
+    pub async fn list_workflow_summaries(&self) -> Vec<WorkflowSummary> {
+        let workflows = self.workflows.read().await;
+        workflows
+            .values()
+            .map(|w| WorkflowSummary {
+                id: w.id.clone(),
+                name: w.name.clone(),
+                version: w.version.clone(),
+                step_count: w.definition.steps.len(),
+                created_at: w.created_at,
+                execution_count: w.execution_count,
+                last_executed_at: w.last_executed_at,
+            })
+            .collect()
+    }
+
+    /// Delete workflow
+    pub async fn delete_workflow(&self, workflow_id: &str) -> Result<()> {
+        let mut workflows = self.workflows.write().await;
+        workflows
+            .remove(workflow_id)
+            .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))?;
+        Ok(())
+    }
+
+    /// Update workflow (creates new version)
+    pub async fn update_workflow(
+        &self,
+        workflow_id: &str,
+        name: String,
+        description: Option<String>,
+        tags: Vec<String>,
+        definition: WorkflowDefinition,
+    ) -> Result<WorkflowMetadata> {
+        // Validate new definition
+        definition
+            .validate()
+            .context("Invalid workflow definition")?;
+
+        DagExecutor::from_workflow(&definition).context("Failed to build DAG from workflow")?;
+
+        let mut workflows = self.workflows.write().await;
+        let workflow = workflows
+            .get_mut(workflow_id)
+            .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))?;
+
+        // Increment version
+        let version_parts: Vec<&str> = workflow.version.split('.').collect();
+        let major: u32 = version_parts[0].parse().unwrap_or(1);
+        let new_version = format!("{}.0.0", major + 1);
+
+        workflow.name = name;
+        workflow.description = description;
+        workflow.tags = tags;
+        workflow.definition = definition;
+        workflow.version = new_version;
+
+        Ok(workflow.to_metadata())
+    }
+
+    /// Record a workflow execution (increment count and update timestamp)
+    pub async fn record_execution(&self, workflow_id: &str) -> Result<()> {
+        let mut workflows = self.workflows.write().await;
+        let workflow = workflows
+            .get_mut(workflow_id)
+            .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))?;
+
+        workflow.execution_count += 1;
+        workflow.last_executed_at = Some(chrono::Utc::now());
+
+        Ok(())
+    }
+
+    /// Validate workflow without registering
+    pub fn validate_workflow(&self, definition: &WorkflowDefinition) -> Result<()> {
+        definition.validate()?;
+        DagExecutor::from_workflow(definition)?;
+        Ok(())
+    }
+
+    /// Execute a registered workflow
+    pub async fn execute_workflow(
+        &self,
+        workflow_id: &str,
+        input: serde_json::Value,
+        context: &HashMap<String, String>,
+    ) -> Result<WorkflowResult> {
+        // Check execution capabilities
+        let (model_invoker, rule_executor) = match (&self.model_invoker, &self.rule_executor) {
+            (Some(m), Some(r)) => (m.clone(), r.clone()),
+            _ => anyhow::bail!(
+                "Workflow engine not configured for execution. Use new_with_execution()"
+            ),
+        };
+
+        // Get workflow definition
+        let definition = self.get_workflow_definition(workflow_id).await?;
+
+        // Create executor with or without lineage tracking
+        let mut executor = if let Some(ref tracker) = self.lineage_tracker {
+            WorkflowExecutor::with_lineage(
+                definition,
+                model_invoker,
+                rule_executor,
+                tracker.clone(),
+            )
+            .context("Failed to create workflow executor with lineage")?
+        } else {
+            WorkflowExecutor::new(definition, model_invoker, rule_executor)
+                .context("Failed to create workflow executor")?
+        };
+
+        // Inject transformer callback if available
+        if let Some(callback) = &self.transformer_callback {
+            executor = executor.with_transformer_callback(callback.clone());
+        }
+
+        // Inject DB loader callback if available
+        if let Some(callback) = &self.db_loader_callback {
+            executor = executor.with_db_loader_callback(callback.clone());
+        }
+
+        // Inject DB extract callback if available
+        if let Some(callback) = &self.db_extract_callback {
+            executor = executor.with_db_extract_callback(callback.clone());
+        }
+
+        // Create execution context
+        let mut exec_context = ExecutionContext::new(input);
+        exec_context.metadata = context.clone();
+        exec_context.workflow_id = Some(workflow_id.to_string());
+
+        // Execute workflow
+        let result = executor
+            .execute(exec_context)
+            .await
+            .context("Workflow execution failed")?;
+
+        // Record execution
+        self.record_execution(workflow_id).await?;
+
+        // Persist to RDF if callback is set
+        if let Some(ref callback) = self.rdf_persistence_callback {
+            callback(workflow_id, &result).context("Failed to persist workflow result to RDF")?;
+        }
+
+        Ok(result)
+    }
+
+    /// Execute workflow with graph-native input (NEW - Phase 1)
+    ///
+    /// Accepts `WorkflowInput` which can be:
+    /// - SPARQL query to select data from the graph
+    /// - Entity filter to select by type/time range
+    /// - Legacy JSON for backward compatibility
+    ///
+    /// Requires an `InputAdapter` to convert WorkflowInput → ExecutionContext.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use graphica_core::orchestration::workflow::{
+    ///     WorkflowInput, SparqlInputAdapter,
+    /// };
+    ///
+    /// let input = WorkflowInput::SparqlQuery {
+    ///     query: "SELECT ?customer WHERE { ?customer a gph:Customer }".to_string(),
+    ///     graph: Some("http://graphica.io/latest".to_string()),
+    ///     batch_size: Some(100),
+    ///     limit: None,
+    /// };
+    ///
+    /// // Engine.execute_workflow_with_input(workflow_id, input, adapter, context).await
+    /// ```
+    pub async fn execute_workflow_with_input(
+        &self,
+        workflow_id: &str,
+        input: super::input::WorkflowInput,
+        adapter: Arc<dyn super::input::InputAdapter>,
+        context: &HashMap<String, String>,
+    ) -> Result<Vec<WorkflowResult>> {
+        // Validate input
+        input.validate().context("Invalid workflow input")?;
+
+        // Check execution capabilities
+        let (model_invoker, rule_executor) = match (&self.model_invoker, &self.rule_executor) {
+            (Some(m), Some(r)) => (m.clone(), r.clone()),
+            _ => anyhow::bail!(
+                "Workflow engine not configured for execution. Use new_with_execution()"
+            ),
+        };
+
+        // Get workflow definition
+        let definition = self.get_workflow_definition(workflow_id).await?;
+
+        // Create executor with or without lineage tracking
+        let mut executor = if let Some(ref tracker) = self.lineage_tracker {
+            WorkflowExecutor::with_lineage(
+                definition,
+                model_invoker,
+                rule_executor,
+                tracker.clone(),
+            )
+            .context("Failed to create workflow executor with lineage")?
+        } else {
+            WorkflowExecutor::new(definition, model_invoker, rule_executor)
+                .context("Failed to create workflow executor")?
+        };
+
+        // Inject transformer callback if available
+        if let Some(callback) = &self.transformer_callback {
+            executor = executor.with_transformer_callback(callback.clone());
+        }
+
+        // Inject DB loader callback if available
+        if let Some(callback) = &self.db_loader_callback {
+            executor = executor.with_db_loader_callback(callback.clone());
+        }
+
+        // Inject DB extract callback if available
+        if let Some(callback) = &self.db_extract_callback {
+            executor = executor.with_db_extract_callback(callback.clone());
+        }
+
+        // Prepare execution contexts using adapter
+        let mut exec_contexts = adapter
+            .prepare_context(&input)
+            .await
+            .context("Failed to prepare execution context from input")?;
+
+        // Add metadata to all contexts and enable row lineage if tracker is present
+        let has_lineage_tracker = self.lineage_tracker.is_some();
+        for ctx in &mut exec_contexts {
+            ctx.metadata = context.clone();
+
+            // Enable row-level lineage tracking if we have a tracker
+            if has_lineage_tracker && ctx.row_lineage.is_none() {
+                // Generate execution context identifiers
+                let execution_id = format!("exec_{}", uuid::Uuid::new_v4());
+                let job_id = context
+                    .get("job_id")
+                    .cloned()
+                    .unwrap_or_else(|| format!("job_{}", uuid::Uuid::new_v4()));
+                let tenant_id = context
+                    .get("tenant_id")
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+
+                ctx.row_lineage = Some(RowLineageContext::new(execution_id, job_id, tenant_id));
+            }
+        }
+
+        // Execute workflow for each context (batched execution)
+        let mut results = Vec::new();
+        for exec_context in exec_contexts {
+            let result = executor
+                .execute(exec_context)
+                .await
+                .context("Workflow execution failed")?;
+
+            // Persist to RDF if callback is set
+            if let Some(ref callback) = self.rdf_persistence_callback {
+                callback(workflow_id, &result)
+                    .context("Failed to persist workflow result to RDF")?;
+            }
+
+            results.push(result);
+        }
+
+        // Record execution once (not per batch)
+        self.record_execution(workflow_id).await?;
+
+        Ok(results)
+    }
+
+    /// Execute a single workflow step (for testing)
+    pub async fn execute_step(
+        &self,
+        step: &WorkflowStep,
+        input: serde_json::Value,
+        context: &HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        // Check execution capabilities
+        let (model_invoker, rule_executor) = match (&self.model_invoker, &self.rule_executor) {
+            (Some(m), Some(r)) => (m.clone(), r.clone()),
+            _ => anyhow::bail!("Workflow engine not configured for execution"),
+        };
+
+        // Create minimal workflow with single step
+        let workflow = WorkflowDefinition {
+            steps: vec![step.clone()],
+            fusion_threshold: 0.8,
+            fallback: super::definition::FallbackStrategy::ManualReview,
+        };
+
+        // Create executor
+        let executor = WorkflowExecutor::new(workflow, model_invoker, rule_executor)?;
+
+        // Create execution context
+        let mut exec_context = ExecutionContext::new(input);
+        exec_context.metadata = context.clone();
+
+        // Execute workflow (single step)
+        let result = executor.execute(exec_context).await?;
+
+        // Return the step output
+        result
+            .step_results
+            .get(&step.id)
+            .map(|step_result| step_result.output.clone())
+            .ok_or_else(|| anyhow::anyhow!("Step result not found"))
+    }
+
+    // ============================================================================
+    // Scheduling Methods (Stub - Not Yet Implemented)
+    // ============================================================================
+
+    /// Schedule workflow for recurring execution (STUB)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn schedule_workflow(
+        &self,
+        _workflow_id: &str,
+        _schedule_id: &str,
+        _cron_expression: Option<String>,
+        _interval_seconds: Option<u64>,
+        _input: serde_json::Value,
+        _context: HashMap<String, String>,
+        _enabled: bool,
+    ) -> Result<()> {
+        anyhow::bail!("Workflow scheduling not yet implemented. Coming in next release.")
+    }
+
+    /// Get scheduled executions for a workflow (STUB)
+    pub async fn get_workflow_schedules(
+        &self,
+        _workflow_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        // Return empty list for now
+        Ok(vec![])
+    }
+
+    /// Cancel scheduled workflow execution (STUB)
+    pub async fn unschedule_workflow(&self, _workflow_id: &str) -> Result<()> {
+        Ok(()) // No-op since scheduling isn't implemented
+    }
+}
+
+impl Default for WorkflowEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Workflow summary for listings
+#[derive(Debug, Clone)]
+pub struct WorkflowSummary {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub step_count: usize,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub execution_count: u64,
+    pub last_executed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::workflow::definition::{
+        ConfidenceGateConfig, FallbackStrategy, StepConfig, StepType, WorkflowStep,
+    };
+
+    fn create_test_definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "step1".to_string(),
+                step_type: StepType::ConfidenceGate,
+                config: StepConfig::ConfidenceGate(ConfidenceGateConfig {
+                    threshold: 0.8,
+                    input_step: None,
+                }),
+                depends_on: vec![],
+            }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_workflow() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert!(workflow_id.starts_with("wf_"));
+    }
+
+    #[tokio::test]
+    async fn test_get_workflow() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition.clone(),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let retrieved = engine.get_workflow(&workflow_id).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().definition.steps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_workflows() {
+        let engine = WorkflowEngine::new();
+
+        let def1 = create_test_definition();
+        let def2 = create_test_definition();
+
+        engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "workflow1".to_string(),
+                def1,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "workflow2".to_string(),
+                def2,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let list = engine.list_workflows().await.unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_workflow() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        engine.delete_workflow(&workflow_id).await.unwrap();
+
+        let result = engine.get_workflow(&workflow_id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_workflow() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let mut new_definition = create_test_definition();
+        new_definition.fusion_threshold = 0.9;
+
+        let updated_metadata = engine
+            .update_workflow(
+                &workflow_id,
+                "renamed_workflow".to_string(),
+                Some("Updated description".to_string()),
+                vec!["production".to_string()],
+                new_definition,
+            )
+            .await
+            .unwrap();
+
+        let updated = engine.get_workflow(&workflow_id).await.unwrap();
+        assert!(updated.is_some());
+        let updated = updated.unwrap();
+        assert_eq!(updated.definition.fusion_threshold, 0.9);
+        assert_eq!(updated.name, "renamed_workflow");
+        assert_eq!(updated.description.as_deref(), Some("Updated description"));
+        assert_eq!(updated.tags, vec!["production".to_string()]);
+        assert_eq!(updated_metadata.name, updated.name);
+        assert_eq!(updated_metadata.created_at, updated.created_at);
+    }
+
+    #[tokio::test]
+    async fn test_register_workflow_rejects_duplicate_id() {
+        let engine = WorkflowEngine::new();
+        let workflow_id = format!("wf_{}", Uuid::new_v4());
+
+        engine
+            .register_workflow(
+                workflow_id.clone(),
+                "original_workflow".to_string(),
+                create_test_definition(),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let duplicate = engine
+            .register_workflow(
+                workflow_id.clone(),
+                "replacement_workflow".to_string(),
+                create_test_definition(),
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(duplicate.is_err());
+        assert!(duplicate
+            .unwrap_err()
+            .to_string()
+            .contains("Workflow already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let result = engine.validate_workflow(&definition);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reject_invalid_workflow() {
+        let engine = WorkflowEngine::new();
+        let invalid_definition = WorkflowDefinition {
+            steps: vec![], // Empty steps - invalid
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let result = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "invalid".to_string(),
+                invalid_definition,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execution_tracking_initial_state() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let workflow = engine.get_workflow(&workflow_id).await.unwrap().unwrap();
+
+        // Initially, execution count should be 0 and last_executed_at should be None
+        assert_eq!(workflow.execution_count, 0);
+        assert!(workflow.last_executed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_record_execution() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Record first execution
+        engine.record_execution(&workflow_id).await.unwrap();
+
+        let workflow = engine.get_workflow(&workflow_id).await.unwrap().unwrap();
+        assert_eq!(workflow.execution_count, 1);
+        assert!(workflow.last_executed_at.is_some());
+
+        let first_execution_time = workflow.last_executed_at.unwrap();
+
+        // Record second execution
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        engine.record_execution(&workflow_id).await.unwrap();
+
+        let workflow = engine.get_workflow(&workflow_id).await.unwrap().unwrap();
+        assert_eq!(workflow.execution_count, 2);
+        assert!(workflow.last_executed_at.is_some());
+
+        let second_execution_time = workflow.last_executed_at.unwrap();
+        assert!(second_execution_time > first_execution_time);
+    }
+
+    #[tokio::test]
+    async fn test_record_execution_nonexistent_workflow() {
+        let engine = WorkflowEngine::new();
+
+        let result = engine.record_execution("nonexistent_wf").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Workflow not found"));
+    }
+
+    #[tokio::test]
+    async fn test_list_workflow_summaries_with_execution_tracking() {
+        let engine = WorkflowEngine::new();
+        let definition = create_test_definition();
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "test_workflow".to_string(),
+                definition,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Before execution
+        let summaries = engine.list_workflow_summaries().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].execution_count, 0);
+        assert!(summaries[0].last_executed_at.is_none());
+
+        // After execution
+        engine.record_execution(&workflow_id).await.unwrap();
+
+        let summaries = engine.list_workflow_summaries().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].execution_count, 1);
+        assert!(summaries[0].last_executed_at.is_some());
+    }
+}

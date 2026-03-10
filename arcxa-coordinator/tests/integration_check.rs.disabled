@@ -1,0 +1,98 @@
+// Test to verify if RdfStore and TemporalIndexes are actually integrated
+
+use graphica_coordinator::governance::bitemporal::{TemporalIndexes, TransactionId};
+use graphica_coordinator::governance::rdf_star::AnnotatedTriple;
+use graphica_coordinator::governance::rdf_store::{GraphicaRdfStore, RdfStore};
+use chrono::Utc;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+#[test]
+fn test_rdf_store_temporal_indexes_integration() {
+    println!("\n🔬 Testing RdfStore + TemporalIndexes Integration...\n");
+
+    // 1. Create both stores
+    let rdf_store = GraphicaRdfStore::new_in_memory().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let temporal_indexes = TemporalIndexes::new(temp_dir.path().join("temporal_idx")).unwrap();
+
+    // 2. Create and insert a triple into RDF store
+    let tx_id = TransactionId::new(1, Utc::now(), 1);
+    let triple = AnnotatedTriple::new(
+        "http://example.org/entity/test",
+        "http://example.org/prop/value",
+        "100",
+    )
+    .with_valid_time(Utc::now(), None)
+    .with_transaction_time(&tx_id, None);
+
+    rdf_store.insert_rdf_star_triple(&triple, None).unwrap();
+
+    // 3. Manually index in temporal indexes (because they're not connected!)
+    let version_id = Uuid::new_v4().to_string();
+    temporal_indexes.index_version(&triple, &version_id, &tx_id).unwrap();
+
+    // 4. Insert v2 ONLY into RDF store
+    let tx_id2 = TransactionId::new(2, Utc::now(), 1);
+    let triple2 = AnnotatedTriple::new(
+        "http://example.org/entity/test",
+        "http://example.org/prop/value",
+        "200",  // Different value
+    )
+    .with_valid_time(Utc::now(), None)
+    .with_transaction_time(&tx_id2, None);
+
+    rdf_store.insert_rdf_star_triple(&triple2, None).unwrap();
+
+    // 5. Check if temporal index knows about v2
+    let current = temporal_indexes
+        .find_current_version("http://example.org/entity/test", "http://example.org/prop/value")
+        .unwrap()
+        .expect("Should have a current version");
+
+    // CRITICAL ASSERTION: This will FAIL because temporal indexes don't know about v2!
+    // They are completely separate systems!
+    assert_eq!(
+        current.object, "100",  // Still shows v1!
+        "Temporal index is NOT integrated with RDF store - still shows old value"
+    );
+
+    println!("❌ CONFIRMED: RDF Store and Temporal Indexes are NOT integrated!");
+    println!("   - RDF Store has v2 (value=200)");
+    println!("   - Temporal Index still shows v1 (value=100)");
+    println!("   - They are completely separate systems!");
+}
+
+#[test]
+fn test_version_manager_uses_temporal_indexes() {
+    use std::sync::Arc;
+
+    // Check if VersionManager actually uses TemporalIndexes
+    let rdf_store = Arc::new(GraphicaRdfStore::new_in_memory().unwrap());
+
+    // Create VersionManager (only takes RDF store, not temporal indexes!)
+    let version_manager = graphica_coordinator::governance::bitemporal::version_manager::VersionManager::new(
+        Arc::clone(&rdf_store)
+    );
+
+    // This proves VersionManager ONLY uses RDF store, not temporal indexes!
+    println!("❌ VersionManager constructor only takes RdfStore, not TemporalIndexes!");
+    println!("   This proves they are NOT integrated!");
+}
+
+#[test]
+fn test_mvcc_query_executor_uses_temporal_indexes() {
+    use std::sync::Arc;
+
+    // Check if MVCCQueryExecutor actually uses TemporalIndexes
+    let rdf_store = Arc::new(GraphicaRdfStore::new_in_memory().unwrap());
+
+    // Create MVCCQueryExecutor (only takes RDF store, not temporal indexes!)
+    let query_executor = graphica_coordinator::governance::bitemporal::query_executor::MVCCQueryExecutor::new(
+        Arc::clone(&rdf_store)
+    );
+
+    // This proves MVCCQueryExecutor ONLY uses RDF store SPARQL, not temporal indexes!
+    println!("❌ MVCCQueryExecutor constructor only takes RdfStore, not TemporalIndexes!");
+    println!("   Temporal queries are done via SPARQL, not via efficient RocksDB indexes!");
+}

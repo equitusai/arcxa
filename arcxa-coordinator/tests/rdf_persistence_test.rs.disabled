@@ -1,0 +1,132 @@
+//! Tests for RDF store hybrid persistence
+
+use graphica_coordinator::governance::rdf_store::{GraphicaRdfStore, RdfStore};
+use graphica_coordinator::governance::rdf_star::AnnotatedTriple;
+use tempfile::TempDir;
+
+#[test]
+fn test_rdf_persistence_save_and_load() {
+    println!("\n=== TEST: RDF Persistence Save and Load ===");
+
+    let temp_dir = TempDir::new().unwrap();
+    let store_path = temp_dir.path().join("rdf_store");
+
+    // Create store and insert triples
+    {
+        let store = GraphicaRdfStore::new(&store_path).unwrap();
+
+        // Insert test triples
+        for i in 1..=5 {
+            let triple = AnnotatedTriple::new(
+                &format!("http://example.org/entity/{}", i),
+                "http://example.org/prop/name",
+                &format!("Entity {}", i),
+            );
+            store.insert_rdf_star_triple(&triple, None).unwrap();
+        }
+
+        println!("✓ Inserted 5 triples");
+
+        // Save to disk
+        let quad_count = store.save_to_disk().unwrap();
+        println!("✓ Saved {} quads to disk", quad_count);
+        assert!(quad_count >= 5, "Should have saved at least 5 quads");
+    }
+
+    // Verify backup file exists
+    let backup_file = store_path.join("rdf_store_backup.nq");
+    assert!(backup_file.exists(), "Backup file should exist");
+    println!("✓ Backup file created at: {}", backup_file.display());
+
+    // Create new store from same path - should auto-load
+    {
+        let store2 = GraphicaRdfStore::new(&store_path).unwrap();
+        println!("✓ Created new store instance");
+
+        // Count triples directly using Oxigraph API
+        let triple_count = store2.count_triples(None).unwrap();
+        assert!(triple_count >= 5, "Should have loaded at least 5 triples, got {}", triple_count);
+        println!("✓ Loaded {} triples from backup", triple_count);
+    }
+
+    println!("\n🎉 RDF PERSISTENCE TEST PASSED!");
+}
+
+#[test]
+fn test_rdf_persistence_atomic_write() {
+    println!("\n=== TEST: RDF Persistence Atomic Write ===");
+
+    let temp_dir = TempDir::new().unwrap();
+    let store_path = temp_dir.path().join("rdf_store");
+
+    let store = GraphicaRdfStore::new(&store_path).unwrap();
+
+    // Insert initial data
+    for i in 1..=3 {
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/value",
+            &format!("value_{}", i),
+        );
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    // First save
+    store.save_to_disk().unwrap();
+    println!("✓ First save completed");
+
+    // Add more data
+    for i in 4..=6 {
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/value",
+            &format!("value_{}", i),
+        );
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    // Second save (should atomically replace first)
+    let quad_count = store.save_to_disk().unwrap();
+    println!("✓ Second save completed: {} quads", quad_count);
+
+    // Verify no temp files left behind
+    let backup_file = store_path.join("rdf_store_backup.nq");
+    assert!(backup_file.exists(), "Backup file should exist");
+
+    let temp_file = store_path.join("rdf_store_backup.nq.tmp");
+    assert!(!temp_file.exists(), "Temp file should be cleaned up");
+    println!("✓ No temporary files left behind");
+
+    // Reload and verify all data present
+    let store2 = GraphicaRdfStore::new(&store_path).unwrap();
+    let triple_count = store2.count_triples(None).unwrap();
+    assert!(triple_count >= 6, "Should have all 6 triples after reload, got {}", triple_count);
+    println!("✓ All {} triples present after atomic write", triple_count);
+
+    println!("\n🎉 ATOMIC WRITE TEST PASSED!");
+}
+
+#[test]
+fn test_in_memory_no_persistence() {
+    println!("\n=== TEST: In-Memory Store No Persistence ===");
+
+    let store = GraphicaRdfStore::new_in_memory().unwrap();
+
+    // Insert data
+    for i in 1..=3 {
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/test",
+            &format!("test_{}", i),
+        );
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+    println!("✓ Inserted 3 triples");
+
+    // save_to_disk should be a no-op
+    let quad_count = store.save_to_disk().unwrap();
+    assert_eq!(quad_count, 0, "In-memory store should not save");
+    println!("✓ save_to_disk was no-op for in-memory store");
+
+    println!("\n🎉 IN-MEMORY NO PERSISTENCE TEST PASSED!");
+}

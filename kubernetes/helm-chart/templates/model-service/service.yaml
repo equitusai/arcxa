@@ -1,0 +1,15 @@
+{{- if .Values.graphica.modelService.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: graphica-model-service
+  namespace: {{ .Release.namespace }}
+spec:
+  ports:
+  - port: 50051
+    name: data
+  clusterIP: None
+  selector:
+    app: graphica
+    component: model
+{{- end }}

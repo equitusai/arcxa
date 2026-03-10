@@ -1,0 +1,699 @@
+//! Comprehensive Authentication Integration Tests
+//!
+//! Tests the full security stack: setup tokens, user auth, JWT, RBAC, rate limiting
+
+use anyhow::Result;
+use graphica_coordinator::api::{
+    auth::{AuthConfig, Role},
+    setup_token::SetupTokenManager,
+    users::UserService,
+};
+use graphica_coordinator::storage::kv_store::KvStore;
+use std::sync::Arc;
+
+/// Test harness with real middleware and temporary storage
+struct TestHarness {
+    kv_store: Arc<KvStore>,
+    auth_config: Arc<AuthConfig>,
+    user_service: Arc<UserService>,
+    setup_token_manager: Arc<SetupTokenManager>,
+}
+
+impl TestHarness {
+    /// Create new test harness with in-memory database
+    async fn new() -> Result<Self> {
+        let kv_store = Arc::new(KvStore::new_in_memory()?);
+
+        // Create auth config with test secret
+        let test_secret: [u8; 32] = [
+            0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
+            0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
+            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        ];
+        let auth_config = Arc::new(AuthConfig::from_secret_bytes(&test_secret)?);
+
+        let user_service = Arc::new(UserService::new(kv_store.clone()));
+        let setup_token_manager = Arc::new(SetupTokenManager::new());
+
+        Ok(Self {
+            kv_store,
+            auth_config,
+            user_service,
+            setup_token_manager,
+        })
+    }
+
+    /// Generate setup token for admin creation
+    async fn generate_setup_token(&self) -> String {
+        self.setup_token_manager
+            .generate_token()
+            .await
+            .expect("Failed to generate setup token")
+            .token
+    }
+
+    /// Create admin user via setup endpoint
+    async fn create_admin_with_setup_token(
+        &self,
+        setup_token: &str,
+        password: &str,
+    ) -> Result<String> {
+        // Validate and consume setup token
+        self.setup_token_manager
+            .validate_and_consume(setup_token)
+            .await?;
+
+        // Create admin user
+        let user = self
+            .user_service
+            .create_default_admin(password)
+            .await?;
+
+        Ok(user.id)
+    }
+
+    /// Create user with specific role (admin operation)
+    async fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<String> {
+        let user = self
+            .user_service
+            .create_user(graphica_coordinator::api::users::CreateUserRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+                role,
+            })
+            .await?;
+
+        Ok(user.id)
+    }
+
+    /// Login and get JWT token
+    async fn login(&self, username: &str, password: &str) -> Result<String> {
+        let user = self
+            .user_service
+            .validate_credentials(username, password)
+            .await
+            .map_err(|e| anyhow::anyhow!("Login failed: {:?}", e))?;
+
+        self.auth_config
+            .generate_token(&user.id, user.role)
+            .map_err(|e| anyhow::anyhow!("Token generation failed: {:?}", e))
+    }
+
+    /// Validate JWT token
+    fn validate_token(&self, token: &str) -> Result<graphica_coordinator::api::auth::Claims> {
+        self.auth_config
+            .validate_token(token)
+            .map_err(|e| anyhow::anyhow!("Token validation failed: {:?}", e))
+    }
+}
+
+// ============================================================================
+// PRIORITY 1: Authentication Lifecycle Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_setup_token_creates_admin() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Generate setup token
+    let setup_token = harness.generate_setup_token().await;
+    assert!(!setup_token.is_empty());
+
+    // Create admin with setup token
+    let password = "SecureAdminPass123!";
+    let admin_id = harness
+        .create_admin_with_setup_token(&setup_token, password)
+        .await?;
+
+    assert!(!admin_id.is_empty());
+
+    // Verify admin can login
+    let jwt = harness.login("admin", password).await?;
+    assert!(!jwt.is_empty());
+
+    // Verify JWT contains admin role
+    let claims = harness.validate_token(&jwt)?;
+    assert_eq!(claims.role, Role::Admin);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_setup_token_single_use() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    let setup_token = harness.generate_setup_token().await;
+    let password = "SecureAdminPass123!";
+
+    // First use should succeed
+    harness
+        .create_admin_with_setup_token(&setup_token, password)
+        .await?;
+
+    // Second use should fail (token already consumed)
+    let result = harness
+        .create_admin_with_setup_token(&setup_token, password)
+        .await;
+
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalid_password_increments_failures() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Create test user
+    let username = "testuser";
+    let password = "ValidPassword123!";
+    harness
+        .create_user(username, password, Role::Operator)
+        .await?;
+
+    // First failed attempt
+    let result1 = harness.login(username, "WrongPassword123!").await;
+    assert!(result1.is_err());
+
+    // Second failed attempt
+    let result2 = harness.login(username, "AnotherWrong123!").await;
+    assert!(result2.is_err());
+
+    // Verify correct password still works (not locked yet)
+    let jwt = harness.login(username, password).await?;
+    assert!(!jwt.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_account_lockout_after_5_failures() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    let username = "locktest";
+    let password = "ValidPassword123!";
+    harness
+        .create_user(username, password, Role::Viewer)
+        .await?;
+
+    // Attempt 5 failed logins
+    for i in 0..5 {
+        let result = harness
+            .login(username, &format!("WrongPassword{}!", i))
+            .await;
+        assert!(result.is_err(), "Attempt {} should fail", i + 1);
+    }
+
+    // 6th attempt (even with correct password) should fail due to lockout
+    let result = harness.login(username, password).await;
+    assert!(result.is_err());
+
+    // Verify error is specifically about account lockout
+    match result {
+        Err(e) => {
+            let err_msg = e.to_string();
+            assert!(
+                err_msg.contains("locked") || err_msg.contains("Account locked"),
+                "Error should indicate lockout: {}",
+                err_msg
+            );
+        }
+        Ok(_) => panic!("Should be locked out"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_jwt_validation() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    let username = "jwttest";
+    let password = "ValidPassword123!";
+    harness
+        .create_user(username, password, Role::Admin)
+        .await?;
+
+    // Login to get valid JWT
+    let jwt = harness.login(username, password).await?;
+
+    // Validate JWT
+    let claims = harness.validate_token(&jwt)?;
+    assert_eq!(claims.role, Role::Admin);
+    assert!(claims.sub.contains("jwttest") || !claims.sub.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalid_jwt_rejected() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Try to validate completely invalid token
+    let result = harness.validate_token("invalid.jwt.token");
+    assert!(result.is_err());
+
+    // Try to validate JWT with wrong signature
+    let fake_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    let result = harness.validate_token(fake_jwt);
+    assert!(result.is_err());
+
+    Ok(())
+}
+
+// ============================================================================
+// PRIORITY 2: RBAC Enforcement Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_role_permissions() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Create users with different roles
+    let admin_password = "AdminPass123!";
+    let operator_password = "OperatorPass123!";
+    let viewer_password = "ViewerPass123!";
+
+    harness
+        .create_user("admin_user", admin_password, Role::Admin)
+        .await?;
+    harness
+        .create_user("operator_user", operator_password, Role::Operator)
+        .await?;
+    harness
+        .create_user("viewer_user", viewer_password, Role::Viewer)
+        .await?;
+
+    // Get JWTs
+    let admin_jwt = harness.login("admin_user", admin_password).await?;
+    let operator_jwt = harness.login("operator_user", operator_password).await?;
+    let viewer_jwt = harness.login("viewer_user", viewer_password).await?;
+
+    // Validate role claims
+    let admin_claims = harness.validate_token(&admin_jwt)?;
+    assert_eq!(admin_claims.role, Role::Admin);
+    assert!(admin_claims.role.can_admin());
+    assert!(admin_claims.role.can_write());
+    assert!(admin_claims.role.can_read());
+
+    let operator_claims = harness.validate_token(&operator_jwt)?;
+    assert_eq!(operator_claims.role, Role::Operator);
+    assert!(!operator_claims.role.can_admin());
+    assert!(operator_claims.role.can_write());
+    assert!(operator_claims.role.can_read());
+
+    let viewer_claims = harness.validate_token(&viewer_jwt)?;
+    assert_eq!(viewer_claims.role, Role::Viewer);
+    assert!(!viewer_claims.role.can_admin());
+    assert!(!viewer_claims.role.can_write());
+    assert!(viewer_claims.role.can_read());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_service_role_permissions() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    let service_password = "ServicePass123!";
+    harness
+        .create_user("service_bot", service_password, Role::Service)
+        .await?;
+
+    let service_jwt = harness.login("service_bot", service_password).await?;
+    let claims = harness.validate_token(&service_jwt)?;
+
+    assert_eq!(claims.role, Role::Service);
+    assert!(!claims.role.can_admin());
+    assert!(claims.role.can_write());
+    assert!(claims.role.can_read());
+
+    Ok(())
+}
+
+// ============================================================================
+// PRIORITY 3: Rate Limiting Tests (Conceptual - actual rate limits need time)
+// ============================================================================
+
+#[tokio::test]
+async fn test_password_strength_validation() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Too short
+    let result = harness
+        .create_user("user1", "Short1!", Role::Viewer)
+        .await;
+    assert!(result.is_err());
+
+    // No uppercase
+    let result = harness
+        .create_user("user2", "nouppercase123!", Role::Viewer)
+        .await;
+    assert!(result.is_err());
+
+    // No digit
+    let result = harness
+        .create_user("user3", "NoDigitsHere!", Role::Viewer)
+        .await;
+    assert!(result.is_err());
+
+    // No special char
+    let result = harness
+        .create_user("user4", "NoSpecial123", Role::Viewer)
+        .await;
+    assert!(result.is_err());
+
+    // Valid password
+    let result = harness
+        .create_user("user5", "ValidPassword123!", Role::Viewer)
+        .await;
+    assert!(result.is_ok());
+
+    Ok(())
+}
+
+// ============================================================================
+// PRIORITY 4: Security Edge Cases
+// ============================================================================
+
+#[tokio::test]
+async fn test_username_injection_attempts() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // SQL injection-style usernames (even though we use RocksDB)
+    let malicious_usernames = vec![
+        "admin' OR '1'='1",
+        "admin'--",
+        "admin' /*",
+        "'; DROP TABLE users--",
+    ];
+
+    for username in malicious_usernames {
+        // Should either fail creation or create safely
+        let _ = harness
+            .create_user(username, "ValidPassword123!", Role::Viewer)
+            .await;
+
+        // Login should not bypass auth
+        let result = harness.login(username, "any_password").await;
+        if result.is_ok() {
+            // If user was created, verify it's the actual user
+            let jwt = result.unwrap();
+            let claims = harness.validate_token(&jwt)?;
+            assert_eq!(claims.role, Role::Viewer);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_jwt_signature_tampering() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    harness
+        .create_user("tamper_test", "ValidPassword123!", Role::Viewer)
+        .await?;
+
+    let jwt = harness.login("tamper_test", "ValidPassword123!").await?;
+
+    // Decode JWT parts
+    let parts: Vec<&str> = jwt.split('.').collect();
+    assert_eq!(parts.len(), 3);
+
+    // Tamper with payload (try to change role to admin)
+    let tampered_payload = base64::encode(r#"{"sub":"user","role":"admin","exp":9999999999}"#);
+    let tampered_jwt = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+
+    // Tampered JWT should be rejected
+    let result = harness.validate_token(&tampered_jwt);
+    assert!(result.is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_concurrent_login_attempts() -> Result<()> {
+    let harness = Arc::new(TestHarness::new().await?);
+
+    let username = "concurrent_test";
+    let password = "ValidPassword123!";
+    harness
+        .create_user(username, password, Role::Operator)
+        .await?;
+
+    // Spawn multiple concurrent login attempts
+    let mut handles = vec![];
+    for _ in 0..10 {
+        let harness_clone = harness.clone();
+        let username = username.to_string();
+        let password = password.to_string();
+
+        let handle = tokio::spawn(async move {
+            harness_clone.login(&username, &password).await
+        });
+
+        handles.push(handle);
+    }
+
+    // All should succeed
+    for handle in handles {
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "Concurrent login should succeed");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_setup_token_entropy() -> Result<()> {
+    // Generate multiple tokens from different managers and verify uniqueness
+    // This tests that the random number generator produces unique tokens
+    let mut tokens = std::collections::HashSet::new();
+
+    for _ in 0..100 {
+        let manager = SetupTokenManager::new();
+        let token = manager.generate_token().await?.token;
+        assert_eq!(token.len(), 44); // 32 bytes base64 encoded = 44 chars
+        assert!(tokens.insert(token), "Tokens should be unique");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_password_storage_never_plaintext() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    let username = "storage_test";
+    let password = "MySecretPassword123!";
+
+    let user_id = harness
+        .create_user(username, password, Role::Viewer)
+        .await?;
+
+    // Retrieve user from storage
+    let key = format!("user:id:{}", user_id);
+    let user_data = harness
+        .kv_store
+        .get(key.as_bytes())?
+        .expect("User should exist");
+
+    let user_json = String::from_utf8(user_data)?;
+
+    // Verify password is NOT stored in plaintext
+    assert!(
+        !user_json.contains(password),
+        "Password should never be stored in plaintext"
+    );
+
+    // Verify it contains argon2 hash
+    assert!(
+        user_json.contains("$argon2"),
+        "Should contain argon2 password hash"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Performance Tests
+// ============================================================================
+
+use std::time::Instant;
+use graphica_coordinator::api::audit::{AuditLogger, RocksAuditSink};
+
+#[tokio::test]
+async fn perf_jwt_operations() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // JWT Generation Performance
+    let iterations = 1000;
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        harness.auth_config.generate_token("user123", Role::Admin)?;
+    }
+
+    let gen_duration = start.elapsed();
+    let gen_avg_us = gen_duration.as_micros() / iterations;
+
+    // JWT Validation Performance
+    let token = harness.auth_config.generate_token("user456", Role::Operator)?;
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        harness.auth_config.validate_token(&token)?;
+    }
+
+    let val_duration = start.elapsed();
+    let val_avg_us = val_duration.as_micros() / iterations;
+
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║              JWT PERFORMANCE                             ║");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Generation: {:>6} μs/op  ({:>6.0} ops/sec)            ║", 
+        gen_avg_us, 1_000_000.0 / gen_avg_us as f64);
+    println!("║  Validation: {:>6} μs/op  ({:>6.0} ops/sec)            ║", 
+        val_avg_us, 1_000_000.0 / val_avg_us as f64);
+    println!("╚══════════════════════════════════════════════════════════╝");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn perf_password_operations() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Setup token and create admin
+    let setup_token = harness.generate_setup_token().await;
+    harness.create_admin_with_setup_token(&setup_token, "SecurePass123!").await?;
+
+    // Password Verification Performance  
+    let iterations = 5;  // Argon2id is intentionally slow
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        harness.login("admin", "SecurePass123!").await?;
+    }
+
+    let duration = start.elapsed();
+    let avg_ms = duration.as_millis() / iterations;
+
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║         PASSWORD VERIFICATION (Argon2id)                 ║");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Average:    {:>6} ms/op                                ║", avg_ms);
+    println!("║  Throughput: {:>6.2} ops/sec                            ║", 1000.0 / avg_ms as f64);
+    println!("║                                                          ║");
+    println!("║  NOTE: Argon2id is designed to be slow for security.    ║");
+    println!("║        ~50-200ms is expected and secure.                 ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+
+    // Verify performance is reasonable (not too slow, not suspiciously fast)
+    assert!(avg_ms > 10, "Password hashing suspiciously fast ({}ms) - check security settings", avg_ms);
+    assert!(avg_ms < 1000, "Password hashing too slow ({}ms)", avg_ms);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn perf_audit_logging() -> Result<()> {
+    let kv_store = Arc::new(KvStore::new_in_memory()?);
+    let audit_sink = Arc::new(RocksAuditSink::new(kv_store));
+    let audit_logger = Arc::new(AuditLogger::new(audit_sink));
+
+    let iterations = 500;
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        audit_logger
+            .log_login_success(
+                "user123",
+                "testuser",
+                Role::Admin,
+                Some("192.168.1.1".parse().unwrap()),
+                Some("Mozilla/5.0".to_string()),
+            )
+            .await?;
+    }
+
+    let duration = start.elapsed();
+    let avg_us = duration.as_micros() / iterations;
+
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║            AUDIT LOG WRITE (RocksDB)                     ║");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Iterations: {:>6}                                       ║", iterations);
+    println!("║  Average:    {:>6} μs/op                                ║", avg_us);
+    println!("║  Throughput: {:>6.0} ops/sec                            ║", 1_000_000.0 / avg_us as f64);
+    println!("╚══════════════════════════════════════════════════════════╝");
+
+    // Audit logging should be fast (under 5ms)
+    assert!(avg_us < 5000, "Audit logging too slow ({} μs)", avg_us);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn perf_concurrent_load() -> Result<()> {
+    let harness = TestHarness::new().await?;
+
+    // Create test users
+    for i in 0..5 {
+        harness.create_user(
+            &format!("loadtest_{}", i),
+            "SecurePassword123!",
+            Role::Operator,
+        ).await?;
+    }
+
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║           CONCURRENT AUTHENTICATION LOAD                 ║");
+    println!("╠══════════════════════════════════════════════════════════╣");
+
+    for concurrency in [1, 3, 5, 10] {
+        let start = Instant::now();
+
+        let mut handles = vec![];
+        for i in 0..concurrency {
+            let user_service = harness.user_service.clone();
+            let auth_config = harness.auth_config.clone();
+
+            let handle = tokio::spawn(async move {
+                let user_idx = i % 5;
+                let username = format!("loadtest_{}", user_idx);
+
+                let user = user_service
+                    .validate_credentials(&username, "SecurePassword123!")
+                    .await
+                    .unwrap();
+
+                auth_config
+                    .generate_token(&user.id, user.role)
+                    .unwrap();
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let duration = start.elapsed();
+        let ops_per_sec = concurrency as f64 / duration.as_secs_f64();
+
+        println!("║  Concurrency {:>2}: {:>6.0} ops/sec  ({:>7.2?} total)     ║", 
+            concurrency, ops_per_sec, duration);
+    }
+
+    println!("╚══════════════════════════════════════════════════════════╝");
+
+    Ok(())
+}

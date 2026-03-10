@@ -1,0 +1,437 @@
+//! # Streaming Pipeline Metrics
+//!
+//! Comprehensive Prometheus metrics for production observability
+
+use once_cell::sync::Lazy;
+use prometheus::{
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
+    Counter, CounterVec, Gauge, GaugeVec, HistogramVec,
+};
+
+/// Records processed by the streaming pipeline
+pub static RECORDS_PROCESSED: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_records_processed_total",
+        "Total number of records processed by the pipeline",
+        &["worker_id", "stage"]
+    )
+    .expect("Failed to create RECORDS_PROCESSED metric")
+});
+
+/// Records dropped due to errors or quality issues
+pub static RECORDS_DROPPED: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_records_dropped_total",
+        "Total number of records dropped",
+        &["worker_id", "reason"]
+    )
+    .expect("Failed to create RECORDS_DROPPED metric")
+});
+
+/// Processing latency histogram (in milliseconds)
+pub static PROCESSING_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_processing_latency_ms",
+        "Processing latency in milliseconds",
+        &["worker_id", "stage"],
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+    )
+    .expect("Failed to create PROCESSING_LATENCY metric")
+});
+
+/// Deduplication state size
+pub static DEDUP_MAP_SIZE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "graphica_dedup_map_size",
+        "Number of entries in deduplication map",
+        &["worker_id"]
+    )
+    .expect("Failed to create DEDUP_MAP_SIZE metric")
+});
+
+/// Deduplication hits (records filtered as duplicates)
+pub static DEDUP_HITS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_dedup_hits_total",
+        "Number of duplicate records filtered",
+        &["worker_id"]
+    )
+    .expect("Failed to create DEDUP_HITS metric")
+});
+
+/// Quality violations by severity
+pub static QUALITY_VIOLATIONS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_quality_violations_total",
+        "Total number of quality violations detected",
+        &["worker_id", "severity"]
+    )
+    .expect("Failed to create QUALITY_VIOLATIONS metric")
+});
+
+/// Kafka offset lag per partition
+pub static KAFKA_OFFSET_LAG: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "graphica_kafka_offset_lag",
+        "Kafka consumer offset lag",
+        &["partition"]
+    )
+    .expect("Failed to create KAFKA_OFFSET_LAG metric")
+});
+
+/// Kafka messages consumed
+pub static KAFKA_MESSAGES_CONSUMED: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_kafka_messages_consumed_total",
+        "Total Kafka messages consumed",
+        &["partition"]
+    )
+    .expect("Failed to create KAFKA_MESSAGES_CONSUMED metric")
+});
+
+/// Kafka commit failures
+pub static KAFKA_COMMIT_FAILURES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_kafka_commit_failures_total",
+        "Total Kafka offset commit failures",
+        &["partition"]
+    )
+    .expect("Failed to create KAFKA_COMMIT_FAILURES metric")
+});
+
+/// Storage channel backpressure events
+pub static STORAGE_BACKPRESSURE: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_storage_backpressure_total",
+        "Number of times storage channel was full",
+        &["worker_id"]
+    )
+    .expect("Failed to create STORAGE_BACKPRESSURE metric")
+});
+
+/// Storage write latency
+pub static STORAGE_WRITE_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_storage_write_latency_ms",
+        "Storage write latency in milliseconds",
+        &["storage_type"],
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+    )
+    .expect("Failed to create STORAGE_WRITE_LATENCY metric")
+});
+
+/// Storage write failures
+pub static STORAGE_WRITE_FAILURES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_storage_write_failures_total",
+        "Total storage write failures",
+        &["storage_type", "error_type"]
+    )
+    .expect("Failed to create STORAGE_WRITE_FAILURES metric")
+});
+
+/// Worker thread health (1 = healthy, 0 = unhealthy)
+pub static WORKER_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "graphica_worker_health",
+        "Worker thread health status (1 = healthy, 0 = unhealthy)",
+        &["worker_id", "worker_type"]
+    )
+    .expect("Failed to create WORKER_HEALTH metric")
+});
+
+/// Governance bridge lineage events sent successfully
+pub static LINEAGE_EVENTS_SENT: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "graphica_lineage_events_sent_total",
+        "Total lineage events successfully materialized to RDF"
+    )
+    .expect("Failed to create LINEAGE_EVENTS_SENT metric")
+});
+
+/// Governance bridge lineage events failed (after all retries)
+pub static LINEAGE_EVENTS_FAILED: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "graphica_lineage_events_failed_total",
+        "Total lineage events that failed to materialize after retries"
+    )
+    .expect("Failed to create LINEAGE_EVENTS_FAILED metric")
+});
+
+/// Governance bridge batch size
+pub static LINEAGE_BATCH_SIZE: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_lineage_batch_size",
+        "Size of lineage event batches flushed to RDF",
+        &["flush_reason"],
+        vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]
+    )
+    .expect("Failed to create LINEAGE_BATCH_SIZE metric")
+});
+
+/// Governance bridge batch flush latency
+pub static LINEAGE_FLUSH_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_lineage_flush_latency_ms",
+        "Latency to flush lineage batch to RDF in milliseconds",
+        &["batch_size_bucket"],
+        vec![10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]
+    )
+    .expect("Failed to create LINEAGE_FLUSH_LATENCY metric")
+});
+
+/// Governance bridge retry attempts
+pub static LINEAGE_RETRY_ATTEMPTS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_lineage_retry_attempts",
+        "Number of retry attempts per lineage event",
+        &["success"],
+        vec![0.0, 1.0, 2.0, 3.0]
+    )
+    .expect("Failed to create LINEAGE_RETRY_ATTEMPTS metric")
+});
+
+/// Governance bridge channel utilization (0.0-1.0)
+pub static LINEAGE_CHANNEL_UTILIZATION: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "graphica_lineage_channel_utilization",
+        "Governance bridge channel utilization (0.0-1.0)"
+    )
+    .expect("Failed to create LINEAGE_CHANNEL_UTILIZATION metric")
+});
+
+/// Governance bridge channel drops (events lost due to full channel)
+pub static LINEAGE_CHANNEL_DROPS: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "graphica_lineage_channel_drops_total",
+        "Total lineage events dropped due to full channel"
+    )
+    .expect("Failed to create LINEAGE_CHANNEL_DROPS metric")
+});
+
+/// Governance bridge back-pressure events (send blocked due to full channel)
+pub static LINEAGE_BACKPRESSURE_EVENTS: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "graphica_lineage_backpressure_total",
+        "Total back-pressure events (send blocked waiting for channel space)"
+    )
+    .expect("Failed to create LINEAGE_BACKPRESSURE_EVENTS metric")
+});
+
+/// Governance bridge send latency (including back-pressure waits)
+pub static LINEAGE_SEND_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_lineage_send_latency_us",
+        "Lineage event send latency in microseconds (including back-pressure)",
+        &["outcome"],  // "success", "backpressure", "dropped"
+        vec![10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0]
+    )
+    .expect("Failed to create LINEAGE_SEND_LATENCY metric")
+});
+
+/// Timely dataflow progress (frontier)
+pub static DATAFLOW_FRONTIER: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "graphica_dataflow_frontier",
+        "Timely dataflow frontier timestamp",
+        &["worker_id"]
+    )
+    .expect("Failed to create DATAFLOW_FRONTIER metric")
+});
+
+/// End-to-end latency (Kafka ingestion → storage write)
+pub static E2E_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_e2e_latency_ms",
+        "End-to-end latency from Kafka to storage in milliseconds",
+        &["worker_id"],
+        vec![10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0]
+    )
+    .expect("Failed to create E2E_LATENCY metric")
+});
+
+/// Deduplication latency per worker (in microseconds)
+pub static DEDUP_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_dedup_latency_us",
+        "Deduplication latency per batch in microseconds",
+        &["worker_id"],
+        vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]
+    )
+    .expect("Failed to create DEDUP_LATENCY metric")
+});
+
+/// Batch sizes for storage writes
+pub static STORAGE_BATCH_SIZE: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_storage_batch_size",
+        "Number of records per storage batch",
+        &["storage_type"],
+        vec![1.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+    )
+    .expect("Failed to create STORAGE_BATCH_SIZE metric")
+});
+
+/// Memory usage estimation (dedup map + buffers)
+pub static MEMORY_USAGE_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "graphica_memory_usage_bytes",
+        "Estimated memory usage in bytes",
+        &["worker_id", "component"]
+    )
+    .expect("Failed to create MEMORY_USAGE_BYTES metric")
+});
+
+/// Storage write retries (retry attempts and successes)
+pub static STORAGE_RETRIES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_storage_retries_total",
+        "Storage write retry attempts and successes",
+        &["outcome"]  // "retry" or "success"
+    )
+    .expect("Failed to create STORAGE_RETRIES metric")
+});
+
+/// Dead letter queue writes (permanent failures)
+pub static DLQ_WRITES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_dlq_writes_total",
+        "Total writes to dead letter queue",
+        &["reason"]
+    )
+    .expect("Failed to create DLQ_WRITES metric")
+});
+
+/// DLQ file size in bytes
+pub static DLQ_FILE_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "graphica_dlq_file_size_bytes",
+        "Current DLQ file size in bytes"
+    )
+    .expect("Failed to create DLQ_FILE_SIZE_BYTES metric")
+});
+
+/// DLQ record count
+pub static DLQ_RECORD_COUNT: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "graphica_dlq_record_count",
+        "Current number of records in DLQ"
+    )
+    .expect("Failed to create DLQ_RECORD_COUNT metric")
+});
+
+/// Correlation ID propagation success rate
+pub static CORRELATION_ID_PROPAGATION: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_correlation_id_propagation_total",
+        "Correlation ID propagation success/failure",
+        &["status"]
+    )
+    .expect("Failed to create CORRELATION_ID_PROPAGATION metric")
+});
+
+// === PHASE 2: Enhanced Metrics ===
+
+// Checkpointing metrics
+pub static CHECKPOINT_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "graphica_checkpoint_size_bytes",
+        "Size of last checkpoint in bytes"
+    )
+    .expect("Failed to create CHECKPOINT_SIZE_BYTES metric")
+});
+
+pub static CHECKPOINT_WRITE_DURATION_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_checkpoint_write_duration_ms",
+        "Time taken to write checkpoint in milliseconds",
+        &["type"]
+    )
+    .expect("Failed to create CHECKPOINT_WRITE_DURATION_MS metric")
+});
+
+pub static CHECKPOINT_ERRORS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_checkpoint_errors_total",
+        "Total checkpoint write errors",
+        &["reason"]
+    )
+    .expect("Failed to create CHECKPOINT_ERRORS metric")
+});
+
+// Circuit breaker metrics
+pub static CIRCUIT_BREAKER_OPEN: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_circuit_breaker_open_total",
+        "Circuit breaker fail-fast count while open",
+        &["breaker"]
+    )
+    .expect("Failed to create CIRCUIT_BREAKER_OPEN metric")
+});
+
+pub static CIRCUIT_BREAKER_OPENED: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_circuit_breaker_opened_total",
+        "Circuit breaker state transitions to open",
+        &["breaker"]
+    )
+    .expect("Failed to create CIRCUIT_BREAKER_OPENED metric")
+});
+
+pub static CIRCUIT_BREAKER_CLOSED: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "graphica_circuit_breaker_closed_total",
+        "Circuit breaker state transitions to closed",
+        &["breaker"]
+    )
+    .expect("Failed to create CIRCUIT_BREAKER_CLOSED metric")
+});
+
+// Worker utilization (new Phase 2 metrics)
+pub static WORKER_IDLE_TIME_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "graphica_worker_idle_time_ms",
+        "Worker idle time in milliseconds",
+        &["worker"]
+    )
+    .expect("Failed to create WORKER_IDLE_TIME_MS metric")
+});
+
+pub static WORKER_ACTIVE_RECORDS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "graphica_worker_active_records",
+        "Number of records actively being processed by worker",
+        &["worker"]
+    )
+    .expect("Failed to create WORKER_ACTIVE_RECORDS metric")
+});
+
+// Tiered DLQ metrics (Phase 2 WP2.4)
+pub static DLQ_MEMORY_SIZE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "graphica_dlq_memory_size",
+        "Number of events in secondary memory-based DLQ"
+    )
+    .expect("Failed to create DLQ_MEMORY_SIZE metric")
+});
+
+pub static DATA_LOSS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "graphica_data_loss_total",
+        "Total events lost due to both primary and secondary DLQ full"
+    )
+    .expect("Failed to create DATA_LOSS_TOTAL metric")
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metrics_registration() {
+        // Just verify metrics can be accessed
+        RECORDS_PROCESSED.with_label_values(&["0", "dedup"]).inc();
+        DEDUP_HITS.with_label_values(&["0"]).inc();
+        assert!(true);
+    }
+}

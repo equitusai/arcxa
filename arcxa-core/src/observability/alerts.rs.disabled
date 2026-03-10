@@ -1,0 +1,280 @@
+//! # Alert Management Module
+//!
+//! Configurable alerting rules for production monitoring.
+
+use crate::ingestion::metrics;
+use once_cell::sync::Lazy;
+use prometheus::core::Collector;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tracing::{error, warn};
+
+/// Alert severity levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// Alert condition types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertCondition {
+    /// Metric exceeds threshold
+    Threshold {
+        metric: String,
+        operator: ThresholdOperator,
+        value: f64,
+    },
+    /// Rate of change exceeds threshold
+    RateOfChange {
+        metric: String,
+        window_secs: u64,
+        threshold: f64,
+    },
+    /// Metric anomaly detection
+    Anomaly {
+        metric: String,
+        sensitivity: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThresholdOperator {
+    GreaterThan,
+    LessThan,
+    Equals,
+}
+
+/// Alert rule configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRule {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub condition: AlertCondition,
+    pub severity: AlertSeverity,
+    pub enabled: bool,
+}
+
+/// Alert manager for evaluating rules
+pub struct AlertManager {
+    rules: Arc<Mutex<HashMap<String, AlertRule>>>,
+    fired_alerts: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+}
+
+impl AlertManager {
+    pub fn new() -> Self {
+        Self {
+            rules: Arc::new(Mutex::new(HashMap::new())),
+            fired_alerts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Add alert rule
+    pub fn add_rule(&self, rule: AlertRule) {
+        let mut rules = self.rules.lock().unwrap();
+        rules.insert(rule.id.clone(), rule);
+    }
+
+    /// Remove alert rule
+    pub fn remove_rule(&self, rule_id: &str) {
+        let mut rules = self.rules.lock().unwrap();
+        rules.remove(rule_id);
+    }
+
+    /// Evaluate all rules (called periodically)
+    pub fn evaluate(&self) {
+        let rules = self.rules.lock().unwrap();
+
+        for (rule_id, rule) in rules.iter() {
+            if !rule.enabled {
+                continue;
+            }
+
+            if self.check_condition(&rule.condition) {
+                self.fire_alert(rule);
+            }
+        }
+    }
+
+    /// Check if condition is met
+    fn check_condition(&self, condition: &AlertCondition) -> bool {
+        match condition {
+            AlertCondition::Threshold { metric, operator, value } => {
+                if let Some(current_value) = self.get_metric_value(metric) {
+                    match operator {
+                        ThresholdOperator::GreaterThan => current_value > *value,
+                        ThresholdOperator::LessThan => current_value < *value,
+                        ThresholdOperator::Equals => (current_value - value).abs() < 0.001,
+                    }
+                } else {
+                    false
+                }
+            }
+            AlertCondition::RateOfChange { metric, window_secs, threshold } => {
+                // Simplified: would need time-series storage for real implementation
+                false
+            }
+            AlertCondition::Anomaly { metric, sensitivity } => {
+                // Simplified: would need ML-based anomaly detection
+                false
+            }
+        }
+    }
+
+    /// Get current metric value (simplified implementation)
+    fn get_metric_value(&self, metric: &str) -> Option<f64> {
+        // In real implementation, would query Prometheus metrics
+        // For now, return None
+        None
+    }
+
+    /// Fire alert
+    fn fire_alert(&self, rule: &AlertRule) {
+        let mut fired = self.fired_alerts.lock().unwrap();
+
+        // Check if alert was recently fired (debouncing)
+        if let Some(last_fired) = fired.get(&rule.id) {
+            let since_last = chrono::Utc::now() - *last_fired;
+            if since_last.num_seconds() < 300 {
+                // Don't fire again within 5 minutes
+                return;
+            }
+        }
+
+        match rule.severity {
+            AlertSeverity::Critical => {
+                error!(
+                    alert_id = %rule.id,
+                    alert_name = %rule.name,
+                    severity = "critical",
+                    "ALERT FIRED: {}",
+                    rule.description
+                );
+            }
+            AlertSeverity::Warning => {
+                warn!(
+                    alert_id = %rule.id,
+                    alert_name = %rule.name,
+                    severity = "warning",
+                    "ALERT FIRED: {}",
+                    rule.description
+                );
+            }
+            AlertSeverity::Info => {
+                tracing::info!(
+                    alert_id = %rule.id,
+                    alert_name = %rule.name,
+                    severity = "info",
+                    "ALERT FIRED: {}",
+                    rule.description
+                );
+            }
+        }
+
+        fired.insert(rule.id.clone(), chrono::Utc::now());
+    }
+}
+
+impl Default for AlertManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global alert manager instance
+pub static ALERT_MANAGER: Lazy<AlertManager> = Lazy::new(|| {
+    let manager = AlertManager::new();
+
+    // Register default alert rules
+    manager.add_rule(AlertRule {
+        id: "high_dlq_rate".to_string(),
+        name: "High DLQ Write Rate".to_string(),
+        description: "DLQ write rate exceeds 10 events/minute".to_string(),
+        condition: AlertCondition::Threshold {
+            metric: "graphica_dlq_writes_total".to_string(),
+            operator: ThresholdOperator::GreaterThan,
+            value: 10.0,
+        },
+        severity: AlertSeverity::Critical,
+        enabled: true,
+    });
+
+    manager.add_rule(AlertRule {
+        id: "storage_retry_storm".to_string(),
+        name: "Storage Retry Storm".to_string(),
+        description: "Storage retry rate exceeds 100/minute".to_string(),
+        condition: AlertCondition::Threshold {
+            metric: "graphica_storage_retries_total".to_string(),
+            operator: ThresholdOperator::GreaterThan,
+            value: 100.0,
+        },
+        severity: AlertSeverity::Warning,
+        enabled: true,
+    });
+
+    manager.add_rule(AlertRule {
+        id: "high_dedup_hit_rate".to_string(),
+        name: "High Deduplication Hit Rate".to_string(),
+        description: "Dedup hit rate exceeds 50%".to_string(),
+        condition: AlertCondition::Threshold {
+            metric: "graphica_dedup_hit_rate".to_string(),
+            operator: ThresholdOperator::GreaterThan,
+            value: 0.5,
+        },
+        severity: AlertSeverity::Info,
+        enabled: true,
+    });
+
+    manager
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alert_rule_creation() {
+        let rule = AlertRule {
+            id: "test".to_string(),
+            name: "Test Alert".to_string(),
+            description: "Test description".to_string(),
+            condition: AlertCondition::Threshold {
+                metric: "test_metric".to_string(),
+                operator: ThresholdOperator::GreaterThan,
+                value: 100.0,
+            },
+            severity: AlertSeverity::Warning,
+            enabled: true,
+        };
+
+        assert_eq!(rule.id, "test");
+        assert_eq!(rule.severity, AlertSeverity::Warning);
+    }
+
+    #[test]
+    fn test_alert_manager() {
+        let manager = AlertManager::new();
+
+        let rule = AlertRule {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            description: "Test".to_string(),
+            condition: AlertCondition::Threshold {
+                metric: "test".to_string(),
+                operator: ThresholdOperator::GreaterThan,
+                value: 1.0,
+            },
+            severity: AlertSeverity::Info,
+            enabled: true,
+        };
+
+        manager.add_rule(rule);
+        assert_eq!(manager.rules.lock().unwrap().len(), 1);
+
+        manager.remove_rule("test");
+        assert_eq!(manager.rules.lock().unwrap().len(), 0);
+    }
+}

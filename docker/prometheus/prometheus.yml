@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'arcxa'
+    environment: '${GRAPHICA_ENV}'
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'arcxa-coordinator'
+    static_configs:
+      - targets: ['coordinator:8080']  # ARCXA coordinator metrics endpoint
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  - job_name: 'arcxa-shards'
+    static_configs:
+      - targets: ['shard-0:8080', 'shard-1:8080']  # RDF shard metrics (if exposed)
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka:9092']
+    scrape_interval: 30s

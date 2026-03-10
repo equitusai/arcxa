@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # PostgreSQL test database for Phase 2 integration tests
+  postgres-test:
+    image: postgres:16
+    container_name: arcxa-postgres-test
+    environment:
+      POSTGRES_DB: graphica_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # Performance tuning for tests
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - graphica-test-network
+
+  # DB2 test database (optional, for future integration)
+  # db2-test:
+  #   image: icr.io/db2_community/db2:11.5.8.0
+  #   container_name: arcxa-db2-test
+  #   privileged: true
+  #   environment:
+  #     LICENSE: accept
+  #     DB2INST1_PASSWORD: db2inst1
+  #     DBNAME: TESTDB
+  #   ports:
+  #     - "50000:50000"
+  #   volumes:
+  #     - db2-test-data:/database
+  #   networks:
+  #     - graphica-test-network
+
+networks:
+  graphica-test-network:
+    driver: bridge
+
+volumes:
+  postgres-test-data:
+    driver: local
+  # db2-test-data:
+  #   driver: local

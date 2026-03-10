@@ -1,0 +1,277 @@
+//! Coordinator LineageTracker Implementation
+//!
+//! Implements the LineageTracker trait to generate RDF triples for workflow execution lineage.
+//! Bridges the workflow executor (graphica-core) to the RDF store (graphica-coordinator).
+
+use crate::storage::row_lineage_store::RowLineageStore;
+use crate::workflows::lineage::rdf::{
+    FieldModification, ModelPrediction, WorkflowLineageGenerator,
+};
+use anyhow::Result;
+use graphica_core::core::lineage::row_level::{RowId, RowJourney, RowLineageEvent};
+use graphica_core::orchestration::workflow::{
+    FieldModificationRecord, LineageTracker, MLPredictionStepRecord, PredictionRecord,
+    RowTransformationEvent, StepExecutionRecord, WorkflowExecutionRecord,
+};
+use std::sync::Arc;
+
+/// Coordinator implementation of LineageTracker
+///
+/// Converts workflow execution events into RDF triples via WorkflowLineageGenerator.
+/// Also handles row-level lineage tracking via RowLineageStore.
+pub struct CoordinatorLineageTracker {
+    lineage_generator: Arc<WorkflowLineageGenerator>,
+    row_lineage_store: Option<Arc<RowLineageStore>>,
+}
+
+impl CoordinatorLineageTracker {
+    /// Create a new lineage tracker
+    pub fn new(lineage_generator: Arc<WorkflowLineageGenerator>) -> Self {
+        Self {
+            lineage_generator,
+            row_lineage_store: None,
+        }
+    }
+
+    /// Create a lineage tracker with row-level lineage support
+    pub fn with_row_lineage_store(
+        lineage_generator: Arc<WorkflowLineageGenerator>,
+        row_lineage_store: Arc<RowLineageStore>,
+    ) -> Self {
+        Self {
+            lineage_generator,
+            row_lineage_store: Some(row_lineage_store),
+        }
+    }
+
+    /// Convert FieldModificationRecord to FieldModification
+    fn convert_modification(&self, record: &FieldModificationRecord) -> FieldModification {
+        FieldModification {
+            field_name: record.field_name.clone(),
+            old_value: record.old_value.clone(),
+            new_value: record.new_value.clone(),
+            confidence: if record.is_reversible { 1.0 } else { 0.95 },
+            is_reversible: record.is_reversible,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LineageTracker for CoordinatorLineageTracker {
+    /// Record the start of a workflow execution
+    async fn record_workflow_start(&self, record: WorkflowExecutionRecord) -> Result<()> {
+        tracing::debug!(
+            "Recording workflow start: execution_id={}, workflow_id={}",
+            record.execution_id,
+            record.workflow_id
+        );
+
+        // Generate RDF triples for workflow start
+        self.lineage_generator.record_workflow_start(
+            &record.execution_id,
+            &record.workflow_id,
+            record.started_at,
+        )
+    }
+
+    /// Record a completed step execution with field modifications
+    async fn record_step_execution(&self, record: StepExecutionRecord) -> Result<()> {
+        tracing::warn!(
+            "✓ COORDINATOR_LINEAGE: record_step_execution called - execution_id={}, step_id={}, step_type={}, modifications={}",
+            record.execution_id,
+            record.step_id,
+            record.step_type,
+            record.modifications.len()
+        );
+
+        // Convert modifications
+        let modifications: Vec<FieldModification> = record
+            .modifications
+            .iter()
+            .map(|m| self.convert_modification(m))
+            .collect();
+
+        tracing::warn!(
+            "✓ COORDINATOR_LINEAGE: Converted {} modifications, calling lineage_generator.record_step_execution",
+            modifications.len()
+        );
+
+        // Generate RDF triples for step execution
+        let result = self.lineage_generator.record_step_execution(
+            &record.execution_id,
+            &record.step_id,
+            &record.step_type,
+            modifications,
+            record.started_at,
+            record.completed_at,
+        );
+
+        match &result {
+            Ok(_) => tracing::warn!(
+                "✓ RDF_LINEAGE: Successfully generated RDF for step '{}'",
+                record.step_id
+            ),
+            Err(e) => tracing::error!(
+                "✗ RDF_LINEAGE: Failed to generate RDF for step '{}': {}",
+                record.step_id,
+                e
+            ),
+        }
+
+        result
+    }
+
+    /// Record ML predictions from workflow step
+    async fn record_ml_predictions(&self, record: MLPredictionStepRecord) -> Result<()> {
+        tracing::debug!(
+            "Recording ML predictions: execution_id={}, model_id={}, count={}",
+            record.execution_id,
+            record.model_id,
+            record.predictions.len()
+        );
+
+        // Convert predictions to ModelPrediction format
+        let predictions: Vec<ModelPrediction> = record
+            .predictions
+            .iter()
+            .map(|p| ModelPrediction {
+                attribute_id: String::new(), // Will be generated by RDF generator
+                attribute_name: p.attribute_name.clone(),
+                value: p.value.clone(),
+                confidence: p.confidence,
+                model_id: record.model_id.clone(),
+                model_version: record.model_version.clone(),
+            })
+            .collect();
+
+        // Generate RDF triples for predictions
+        self.lineage_generator.record_ml_predictions(
+            &record.execution_id,
+            &record.step_id,
+            &record.model_id,
+            &record.model_version,
+            predictions,
+            record.started_at,
+            record.completed_at,
+        )
+    }
+
+    /// Record the completion of a workflow execution
+    async fn record_workflow_complete(
+        &self,
+        execution_id: String,
+        success: bool,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        tracing::debug!(
+            "Recording workflow completion: execution_id={}, success={}",
+            execution_id,
+            success
+        );
+
+        // Generate RDF triples for workflow completion
+        self.lineage_generator
+            .record_workflow_complete(&execution_id, success, completed_at)
+    }
+
+    // Row-Level Lineage Tracking Methods
+
+    /// Record row-level lineage events for ETL steps
+    async fn record_row_lineage_batch(&self, events: Vec<RowLineageEvent>) -> Result<()> {
+        use graphica_core::core::lineage::row_level::RowLevelLineageSink;
+
+        if events.is_empty() {
+            tracing::info!("record_row_lineage_batch called with 0 events, skipping");
+            return Ok(());
+        }
+
+        tracing::info!("===> RECORDING {} row lineage events", events.len());
+
+        if let Some(store) = &self.row_lineage_store {
+            tracing::info!("Writing to row lineage store...");
+            store.write_rows_batch(events).await?;
+            tracing::info!("Row lineage events written successfully");
+        } else {
+            tracing::warn!("Row lineage store not configured, events will not be persisted");
+        }
+
+        Ok(())
+    }
+
+    /// Record row transformation (e.g., deduplication, merge)
+    async fn record_row_transformation(
+        &self,
+        transformation: RowTransformationEvent,
+    ) -> Result<()> {
+        tracing::debug!(
+            "Recording row transformation: step_id={}, type={:?}",
+            transformation.step_id,
+            transformation.transformation_type
+        );
+
+        // For now, we log transformations but don't persist them separately
+        // Future: Store in a transforms column family for auditing
+        if let Some(_store) = &self.row_lineage_store {
+            // Transformation events could be stored separately for journey reconstruction
+            // For now, the individual row lineage events track the provenance
+            tracing::debug!(
+                "Transformation recorded: {} source rows -> {:?} output",
+                transformation.source_rows.len(),
+                transformation.output_row.as_ref().map(|r| r.to_key())
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Query row journey for debugging and auditing
+    async fn get_row_journey(&self, row_id: &RowId) -> Result<Option<RowJourney>> {
+        use graphica_core::core::lineage::row_level::RowLevelLineageSink;
+
+        if let Some(store) = &self.row_lineage_store {
+            let journey = store.trace_row_journey(row_id).await?;
+            Ok(Some(journey))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::governance::rdf_store::GraphicaRdfStore;
+
+    #[tokio::test]
+    async fn test_lineage_tracker_creation() {
+        let store = GraphicaRdfStore::new_in_memory().unwrap();
+        let generator = Arc::new(WorkflowLineageGenerator::new(Arc::new(store)));
+        let tracker = CoordinatorLineageTracker::new(generator);
+
+        // Just verify it constructs
+        assert!(true);
+    }
+
+    #[tokio::test]
+    async fn test_modification_conversion() {
+        let store = GraphicaRdfStore::new_in_memory().unwrap();
+        let generator = Arc::new(WorkflowLineageGenerator::new(Arc::new(store)));
+        let tracker = CoordinatorLineageTracker::new(generator);
+
+        let record = FieldModificationRecord {
+            field_name: "email".to_string(),
+            old_value: serde_json::json!("OLD@EXAMPLE.COM"),
+            new_value: serde_json::json!("old@example.com"),
+            is_reversible: false,
+            operation_count: 2,
+        };
+
+        let modification = tracker.convert_modification(&record);
+
+        assert_eq!(modification.field_name, "email");
+        assert_eq!(modification.old_value, serde_json::json!("OLD@EXAMPLE.COM"));
+        assert_eq!(modification.new_value, serde_json::json!("old@example.com"));
+        assert_eq!(modification.is_reversible, false);
+        assert_eq!(modification.confidence, 0.95); // Irreversible = 0.95 confidence
+    }
+}

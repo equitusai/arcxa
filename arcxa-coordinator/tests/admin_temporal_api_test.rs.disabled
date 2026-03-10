@@ -1,0 +1,205 @@
+//! Tests for temporal index admin API endpoints
+
+use graphica_coordinator::governance::rdf_store::GraphicaRdfStore;
+use graphica_coordinator::governance::rdf_star::AnnotatedTriple;
+use graphica_coordinator::governance::bitemporal::TransactionId;
+use tempfile::TempDir;
+use chrono::Utc;
+
+#[tokio::test]
+async fn test_temporal_admin_operations() {
+    println!("\n=== TEST: Temporal Admin Operations ===");
+
+    let temp_dir = TempDir::new().unwrap();
+    let checkpoint_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    println!("✓ Created RDF store with temporal indexes");
+
+    // Insert some test versions
+    let tx_id = TransactionId::new(1, Utc::now(), 1);
+
+    for i in 1..=5 {
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/value",
+            &format!("value_{}", i),
+        )
+        .with_valid_time(Utc::now(), None)
+        .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    println!("✓ Inserted 5 test versions");
+
+    // Test 1: Get statistics
+    println!("\n--- Test 1: Get Statistics ---");
+    let indexes = store.temporal_indexes().unwrap();
+    let stats = indexes.as_ref().get_statistics().unwrap();
+
+    println!("Statistics:");
+    println!("  Total versions: {}", stats.total_versions);
+    println!("  Cache size: {}", stats.cache_size);
+    println!("  Cache capacity: {}", stats.cache_capacity);
+    println!("  Disk usage: {} bytes", stats.disk_usage_bytes);
+
+    assert_eq!(stats.total_versions, 5, "Should have 5 versions indexed");
+    assert_eq!(stats.cache_capacity, 1000, "Cache capacity should be 1000");
+
+    // Test 2: Analyze version chains
+    println!("\n--- Test 2: Analyze Version Chains ---");
+    let analysis = indexes.as_ref().analyze_version_chains(10).unwrap();
+
+    println!("Version chain analysis:");
+    println!("  Total chains: {}", analysis.total_chains);
+    println!("  Total versions: {}", analysis.total_versions);
+    println!("  Avg versions/chain: {:.2}", analysis.avg_versions_per_chain);
+    println!("  Max versions: {}", analysis.max_versions);
+    println!("  Long chains (>10): {}", analysis.long_chains.len());
+    println!("  Analysis duration: {}ms", analysis.analysis_duration_ms);
+
+    assert_eq!(analysis.total_chains, 5, "Should have 5 version chains");
+    assert_eq!(analysis.total_versions, 5, "Should have 5 total versions");
+    assert_eq!(analysis.max_versions, 1, "Max should be 1 version per chain");
+    assert_eq!(analysis.long_chains.len(), 0, "No long chains should exist");
+
+    // Test 3: Create checkpoint
+    println!("\n--- Test 3: Create Checkpoint ---");
+    let checkpoint_path = indexes.as_ref().create_checkpoint(checkpoint_dir.path().join("checkpoint")).unwrap();
+
+    println!("Checkpoint created at: {}", checkpoint_path);
+    assert!(std::path::Path::new(&checkpoint_path).exists(), "Checkpoint directory should exist");
+
+    // Test 4: Compact database
+    println!("\n--- Test 4: Compact Database ---");
+    indexes.as_ref().compact_database().unwrap();
+    println!("✓ Compaction completed successfully");
+
+    // Test 5: Clear cache
+    println!("\n--- Test 5: Clear Cache ---");
+    indexes.as_ref().clear_cache();
+    let stats_after_clear = indexes.as_ref().get_statistics().unwrap();
+    assert_eq!(stats_after_clear.cache_size, 0, "Cache should be empty after clear");
+    println!("✓ Cache cleared successfully");
+
+    println!("\n🎉 ALL TEMPORAL ADMIN OPERATIONS TESTS PASSED!");
+}
+
+#[tokio::test]
+async fn test_version_chain_analysis_with_long_chains() {
+    println!("\n=== TEST: Version Chain Analysis with Long Chains ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    // Create a long version chain (15 versions for same subject/predicate)
+    let subject = "http://example.org/entity/customer_123";
+    let predicate = "http://example.org/prop/balance";
+
+    for i in 1..=15 {
+        let tx_id = TransactionId::new(i, Utc::now(), 1);
+        let triple = AnnotatedTriple::new(subject, predicate, &format!("balance_{}", i * 1000))
+            .with_valid_time(Utc::now(), None)
+            .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+
+        // Supersede previous version (except first one)
+        if i > 1 {
+            let indexes = store.temporal_indexes().unwrap();
+            // The store should auto-supersede, but let's verify the chain grows
+            let chain = indexes.get_version_chain(subject, predicate).unwrap();
+            assert_eq!(chain.len(), i as usize, "Chain should have {} versions", i);
+        }
+    }
+
+    println!("✓ Created long version chain with 15 versions");
+
+    // Analyze with threshold of 10
+    let indexes = store.temporal_indexes().unwrap();
+    let analysis = indexes.as_ref().analyze_version_chains(10).unwrap();
+
+    println!("Analysis results:");
+    println!("  Total chains: {}", analysis.total_chains);
+    println!("  Total versions: {}", analysis.total_versions);
+    println!("  Max versions: {}", analysis.max_versions);
+    println!("  Long chains (>10): {}", analysis.long_chains.len());
+
+    assert_eq!(analysis.total_chains, 1, "Should have 1 version chain");
+    assert_eq!(analysis.max_versions, 15, "Max should be 15 versions");
+    assert_eq!(analysis.long_chains.len(), 1, "Should have 1 long chain");
+    assert_eq!(analysis.long_chains[0].version_count, 15, "Long chain should have 15 versions");
+
+    println!("Long chain details:");
+    for chain in &analysis.long_chains {
+        println!("  Key: {}, Versions: {}", chain.sp_key, chain.version_count);
+    }
+
+    println!("\n🎉 LONG CHAIN ANALYSIS TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_checkpoint_restore() {
+    println!("\n=== TEST: Checkpoint and Restore ===");
+
+    let temp_dir = TempDir::new().unwrap();
+    let checkpoint_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    // Insert test data
+    for i in 1..=3 {
+        let tx_id = TransactionId::new(i, Utc::now(), 1);
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/name",
+            &format!("Entity {}", i),
+        )
+        .with_valid_time(Utc::now(), None)
+        .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    println!("✓ Inserted 3 test versions");
+
+    // Create checkpoint
+    let indexes = store.temporal_indexes().unwrap();
+    let checkpoint_path = indexes.as_ref().create_checkpoint(checkpoint_dir.path().join("backup")).unwrap();
+
+    println!("✓ Checkpoint created at: {}", checkpoint_path);
+
+    // Verify checkpoint directory exists
+    assert!(std::path::Path::new(&checkpoint_path).exists());
+
+    // Verify checkpoint contains RocksDB files
+    let checkpoint_files: Vec<_> = std::fs::read_dir(&checkpoint_path)
+        .unwrap()
+        .collect();
+
+    assert!(checkpoint_files.len() > 0, "Checkpoint should contain files");
+    println!("✓ Checkpoint contains {} files/directories", checkpoint_files.len());
+
+    // In a real restore scenario, we would:
+    // 1. Stop the service
+    // 2. Replace the temporal index directory with the checkpoint
+    // 3. Restart the service
+    // 4. Verify data integrity
+
+    println!("\n🎉 CHECKPOINT/RESTORE TEST PASSED!");
+}

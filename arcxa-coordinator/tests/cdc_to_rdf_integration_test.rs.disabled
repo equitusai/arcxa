@@ -1,0 +1,283 @@
+//! Integration Test: CDC to RDF Pipeline
+//!
+//! Tests the complete flow from CDC events to RDF triple storage:
+//! 1. Create mock CDC events with lineage
+//! 2. Send through governance bridge
+//! 3. Verify RDF triples in governance brain
+//! 4. Query lineage via SPARQL
+
+use graphica_core::core::lineage::{CdcPosition, DataRef, LineageEvent};
+use graphica_coordinator::governance::{
+    AsyncGovernanceConfig, SharedGovernanceBrain, GovernanceBrain,
+    LineageConverter,
+};
+use graphica_core::ingestion::GovernanceBridge;
+
+use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
+
+#[test]
+fn test_cdc_to_rdf_direct() {
+    // Test direct materialization without bridge first
+    let temp_dir = TempDir::new().unwrap();
+    let store_path = temp_dir.path().join("rdf");
+    std::fs::create_dir_all(&store_path).unwrap();
+
+    let brain = GovernanceBrain::new(store_path.to_str().unwrap()).unwrap();
+    let shared_brain = SharedGovernanceBrain::new_sync(brain);
+
+    // Create a simple event
+    let event = create_cdc_event_with_position(
+        "test_dataset",
+        "rec_1",
+        "test.topic",
+        0,
+        100,
+    );
+
+    // First, test the converter directly
+    println!("Testing LineageConverter...");
+    let triples = LineageConverter::to_rdf_triples_detailed(&event).expect("Failed to generate triples");
+    println!("Generated {} triples", triples.len());
+    assert!(!triples.is_empty(), "Should generate triples");
+
+    // Materialize directly
+    println!("Materializing event directly...");
+    match shared_brain.materialize_event(&event) {
+        Ok(_) => println!("Materialization succeeded"),
+        Err(e) => {
+            eprintln!("Materialization failed: {}", e);
+            panic!("Failed to materialize");
+        }
+    }
+
+    // Query to verify triples were inserted
+    let sparql = "SELECT * WHERE { ?s ?p ?o } LIMIT 100";
+    let results = shared_brain.query(sparql).expect("Failed to query");
+    println!("Query returned {} triples", results.len());
+
+    assert!(
+        !results.is_empty(),
+        "Should have inserted RDF triples via direct materialization"
+    );
+
+    println!("✅ Direct CDC-to-RDF test passed with {} RDF triples", results.len());
+}
+
+#[test]
+fn test_cdc_to_rdf_integration() {
+    // Now test with the bridge
+    let temp_dir = TempDir::new().unwrap();
+    let store_path = temp_dir.path().join("rdf");
+    std::fs::create_dir_all(&store_path).unwrap();
+
+    let brain = GovernanceBrain::new(store_path.to_str().unwrap()).unwrap();
+    let shared_brain = Arc::new(SharedGovernanceBrain::new_sync(brain));
+
+    // Create governance bridge
+    let config = AsyncGovernanceConfig {
+        batch_size: 2,
+        batch_timeout: Duration::from_millis(10),
+        num_processors: 1,
+        channel_capacity: 100,
+        max_retries: 3,
+        enable_metrics: false,
+    };
+
+    let bridge = GovernanceBridge::new(shared_brain.clone(), config).unwrap();
+
+    // Create and send events
+    let events = create_mock_cdc_events(10);
+    println!("Sending {} events to governance bridge", events.len());
+    for event in &events {
+        bridge.send_lineage_event(event.clone());
+    }
+
+    // Wait for processing
+    println!("Waiting for background processing...");
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Query to verify triples
+    let sparql = "SELECT * WHERE { ?s ?p ?o } LIMIT 100";
+    let results = shared_brain.query(sparql).expect("Failed to query");
+    println!("Query returned {} triples after bridge processing", results.len());
+
+    assert!(
+        !results.is_empty(),
+        "Should have inserted RDF triples via bridge, got {} triples",
+        results.len()
+    );
+
+    println!("✅ CDC-to-RDF integration test passed");
+    println!("   - {} RDF triples created", results.len());
+}
+
+#[test]
+fn test_cdc_position_preservation() {
+    // Setup
+    let temp_dir = TempDir::new().unwrap();
+    let store_path = temp_dir.path().join("rdf");
+    std::fs::create_dir_all(&store_path).unwrap();
+
+    let brain = GovernanceBrain::new(store_path.to_str().unwrap()).unwrap();
+    let shared_brain = Arc::new(SharedGovernanceBrain::new_sync(brain));
+
+    let config = AsyncGovernanceConfig {
+        batch_size: 1, // Process immediately
+        batch_timeout: Duration::from_millis(10),
+        num_processors: 1,
+        channel_capacity: 100,
+        max_retries: 3,
+        enable_metrics: false,
+    };
+
+    let bridge = GovernanceBridge::new(shared_brain.clone(), config).unwrap();
+
+    // Create event with CDC position
+    let event = create_cdc_event_with_position(
+        "customers",
+        "rec_123",
+        "dbserver1.inventory.customers",
+        0,
+        12345,
+    );
+
+    println!("Sending event with CDC position to bridge");
+    bridge.send_lineage_event(event);
+
+    // Wait for processing
+    println!("Waiting for processing...");
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Query for CDC position
+    let sparql = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+
+        SELECT ?topic ?partition ?offset ?lsn
+        WHERE {
+            ?cdcPos a gph:CdcPosition ;
+                    gph:topic ?topic ;
+                    gph:partition ?partition ;
+                    gph:offset ?offset .
+            OPTIONAL { ?cdcPos gph:lsn ?lsn }
+        }
+    "#;
+
+    let results = shared_brain.query(sparql).unwrap();
+    assert!(!results.is_empty(), "Should find CDC position in RDF store");
+
+    // Verify CDC position values
+    let first_result = &results[0];
+    assert!(
+        first_result.get("topic").is_some(),
+        "Should have CDC topic in results"
+    );
+    assert!(
+        first_result.get("partition").is_some(),
+        "Should have CDC partition in results"
+    );
+    assert!(
+        first_result.get("offset").is_some(),
+        "Should have CDC offset in results"
+    );
+
+    println!("✅ CDC position preservation test passed");
+}
+
+#[test]
+fn test_lineage_converter_triples() {
+    // Test that LineageConverter generates correct RDF structure
+    let event = create_cdc_event_with_position(
+        "products",
+        "prod_456",
+        "dbserver1.inventory.products",
+        1,
+        67890,
+    );
+
+    let triples = LineageConverter::to_rdf_triples_detailed(&event).unwrap();
+
+    // Verify triple structure
+    assert!(!triples.is_empty(), "Should generate triples");
+
+    // Check for required triple types
+    let has_activity = triples
+        .iter()
+        .any(|(_, p, o)| p.contains("type") && o.contains("Activity"));
+    assert!(has_activity, "Should have prov:Activity type");
+
+    let has_entity = triples
+        .iter()
+        .any(|(_, p, o)| p.contains("type") && o.contains("Entity"));
+    assert!(has_entity, "Should have prov:Entity type");
+
+    let has_dataset = triples
+        .iter()
+        .any(|(_, p, o)| p.contains("dataset") && o.contains("products"));
+    assert!(has_dataset, "Should have dataset triple");
+
+    let has_cdc_position = triples.iter().any(|(_, p, _)| p.contains("cdcPosition"));
+    assert!(has_cdc_position, "Should have CDC position triple");
+
+    println!("✅ LineageConverter triple generation test passed");
+    println!("   - Generated {} triples", triples.len());
+}
+
+// Helper functions
+
+fn create_mock_cdc_events(count: usize) -> Vec<LineageEvent> {
+    (0..count)
+        .map(|i| {
+            let dataset = format!("dataset_{}", i % 3); // 3 different datasets
+            let record_id = format!("rec_{}", i);
+            let topic = format!("dbserver1.inventory.{}", dataset);
+            let partition = (i % 4) as i32; // 4 partitions
+            let offset = (i * 100) as i64;
+
+            create_cdc_event_with_position(&dataset, &record_id, &topic, partition, offset)
+        })
+        .collect()
+}
+
+fn create_cdc_event_with_position(
+    dataset: &str,
+    record_id: &str,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> LineageEvent {
+    LineageEvent {
+        id: uuid::Uuid::new_v4(),
+        dataset: dataset.to_string(),
+        record_id: record_id.to_string(),
+        source_refs: vec![DataRef {
+            system: "postgres".to_string(),
+            path: format!("public.{}", dataset),
+            version: Some("v1".to_string()),
+            extracted_at: Utc::now(),
+            cdc_position: Some(CdcPosition {
+                topic: topic.to_string(),
+                partition,
+                offset,
+                lsn: Some(format!("0/{}", offset)),
+            }),
+        }],
+        transforms: vec![],
+        model_refs: vec![],
+        output_ref: DataRef {
+            system: "graphica".to_string(),
+            path: "governance.lineage".to_string(),
+            version: None,
+            extracted_at: Utc::now(),
+            cdc_position: None,
+        },
+        ts: Utc::now(),
+        run_id: "test_run".to_string(),
+        tenant_id: "test_tenant".to_string(),
+        correlation_id: Some(format!("corr_{}", record_id)),
+        metadata: HashMap::new(),
+    }
+}

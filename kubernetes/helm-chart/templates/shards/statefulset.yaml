@@ -1,0 +1,60 @@
+{{- if .Values.graphica.shards.enabled }}
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: graphica-shard
+  namespace: {{ .Release.namespace }}
+spec:
+  serviceName: graphica
+  replicas: {{ .Values.graphica.shards.replicas }}
+  selector:
+    matchLabels:
+      app: graphica
+      component: shard
+  template:
+    metadata:
+      labels:
+        app: graphica
+        component: shard
+      annotations:
+        prometheus.io/path: /metrics
+        prometheus.io/scrape: 'true'
+    spec:
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
+      imagePullSecrets:
+        - name: graphica-pull
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: graphica-shard
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          volumeMounts:
+            - name: graphica-shard
+              mountPath: /data
+          image: {{ .Values.graphica.shards.imageTag }}
+          args:
+            - ./graphica-shard
+            - '--coordinator-url'
+            - 'http://graphica-coordinator:9090'
+            - --data-path
+            - /data/
+            - --port
+            - '9100'
+      serviceAccount: graphica
+      volumes:
+        - name: graphica-shard
+          persistentVolumeClaim:
+            claimName: graphica-shard
+  volumeClaimTemplates:
+    - metadata:
+        name: graphica-shard
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.graphica.shards.storage.size }}
+        storageClassName: {{ .Values.global.storageClassName }}
+        volumeMode: Filesystem
+{{- end }}

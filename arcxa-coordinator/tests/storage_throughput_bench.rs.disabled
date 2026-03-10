@@ -1,0 +1,319 @@
+//! Storage Throughput Baseline Benchmarks
+//!
+//! Measures current performance before optimization:
+//! - Events/sec throughput (expected: 86-370/sec)
+//! - RocksDB write latencies
+//! - Index update overhead
+//! - Failure mode behavior
+//!
+//! Run with: cargo test --test storage_throughput --release -- --nocapture
+
+use graphica_core::core::lineage::{CdcPosition, DataRef, LineageEvent, ModelMetrics, ModelRef, TransformRef};
+use graphica_core::storage::rocks::RocksDbStorage;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use uuid::Uuid;
+
+/// Create a realistic test lineage event
+fn create_test_event(record_id: &str) -> LineageEvent {
+    LineageEvent {
+        id: Uuid::new_v4(),
+        dataset: "benchmark_dataset".to_string(),
+        record_id: record_id.to_string(),
+        source_refs: vec![DataRef {
+            system: "source_db".to_string(),
+            path: "customers.transactions".to_string(),
+            version: Some("v1.2.3".to_string()),
+            extracted_at: chrono::Utc::now(),
+            cdc_position: Some(CdcPosition {
+                topic: "customers.transactions".to_string(),
+                partition: 0,
+                offset: 12345678,
+                lsn: Some("lsn:12345678".to_string()),
+            }),
+        }],
+        transforms: vec![
+            TransformRef {
+                id: Uuid::new_v4(),
+                transform_type: "standardize".to_string(),
+                rule_id: "std_001".to_string(),
+                version: "1.0".to_string(),
+                parameters: HashMap::new(),
+                applied_at: chrono::Utc::now(),
+                fields_modified: vec!["email".to_string(), "phone".to_string()],
+            },
+            TransformRef {
+                id: Uuid::new_v4(),
+                transform_type: "enrich".to_string(),
+                rule_id: "enr_002".to_string(),
+                version: "1.0".to_string(),
+                parameters: HashMap::new(),
+                applied_at: chrono::Utc::now(),
+                fields_modified: vec!["customer_segment".to_string()],
+            },
+        ],
+        model_refs: vec![ModelRef {
+            model_id: "churn_predictor".to_string(),
+            version: "2.1.0".to_string(),
+            model_type: "sklearn.RandomForest".to_string(),
+            params_hash: "sha256:abc123def456".to_string(),
+            training_data: vec![DataRef {
+                system: "training_warehouse".to_string(),
+                path: "ml/training_data/churn_v2".to_string(),
+                version: Some("snapshot_20250101".to_string()),
+                extracted_at: chrono::Utc::now() - chrono::Duration::days(30),
+                cdc_position: None,
+            }],
+            metrics: ModelMetrics {
+                accuracy: Some(0.94),
+                precision: Some(0.92),
+                recall: Some(0.89),
+                f1_score: Some(0.905),
+                rmse: None,
+                custom_metrics: HashMap::from([
+                    ("auc_roc".to_string(), 0.96),
+                    ("lift_top_decile".to_string(), 3.2),
+                ]),
+            },
+            registry_uri: "mlflow://models/churn_predictor/2.1.0".to_string(),
+            inference_at: chrono::Utc::now(),
+            features_used: vec![
+                "tenure_days".to_string(),
+                "avg_transaction_value".to_string(),
+                "contact_frequency".to_string(),
+            ],
+            outputs: vec!["churn_probability".to_string(), "churn_risk_segment".to_string()],
+        }],
+        output_ref: DataRef {
+            system: "analytics_warehouse".to_string(),
+            path: "gold/customer_360".to_string(),
+            version: Some("v2.0".to_string()),
+            extracted_at: chrono::Utc::now(),
+            cdc_position: None,
+        },
+        ts: chrono::Utc::now(),
+        run_id: "benchmark_run_001".to_string(),
+        tenant_id: "benchmark_tenant".to_string(),
+        correlation_id: Some(Uuid::new_v4().to_string()),
+        metadata: HashMap::from([
+            ("job_id".to_string(), "daily_etl_001".to_string()),
+            ("environment".to_string(), "production".to_string()),
+        ]),
+    }
+}
+
+/// Benchmark: Single-threaded write throughput
+#[test]
+fn benchmark_single_threaded_write_throughput() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::new(temp_dir.path()).unwrap();
+
+    println!("\n=== Single-Threaded Write Throughput Benchmark ===");
+
+    // Warm-up: 100 events
+    println!("Warming up with 100 events...");
+    for i in 0..100 {
+        let event = create_test_event(&format!("warmup_{}", i));
+        storage.write_all(event).unwrap();
+    }
+
+    // Benchmark: 1000 events
+    let num_events = 1000;
+    println!("\nWriting {} events...", num_events);
+
+    let start = Instant::now();
+    let mut individual_latencies = Vec::with_capacity(num_events);
+
+    for i in 0..num_events {
+        let event = create_test_event(&format!("bench_{}", i));
+
+        let write_start = Instant::now();
+        storage.write_all(event).unwrap();
+        let write_duration = write_start.elapsed();
+
+        individual_latencies.push(write_duration);
+
+        // Progress indicator every 100 events
+        if (i + 1) % 100 == 0 {
+            println!("  Completed: {}/{}", i + 1, num_events);
+        }
+    }
+
+    let total_duration = start.elapsed();
+
+    // Calculate statistics
+    let throughput = num_events as f64 / total_duration.as_secs_f64();
+    let avg_latency_ms = individual_latencies.iter().map(|d| d.as_micros()).sum::<u128>() as f64
+        / individual_latencies.len() as f64 / 1000.0;
+
+    individual_latencies.sort();
+    let p50_latency_ms = individual_latencies[num_events / 2].as_micros() as f64 / 1000.0;
+    let p95_latency_ms = individual_latencies[num_events * 95 / 100].as_micros() as f64 / 1000.0;
+    let p99_latency_ms = individual_latencies[num_events * 99 / 100].as_micros() as f64 / 1000.0;
+    let max_latency_ms = individual_latencies.last().unwrap().as_micros() as f64 / 1000.0;
+
+    println!("\n--- Results ---");
+    println!("Total Duration: {:.2}s", total_duration.as_secs_f64());
+    println!("Throughput: {:.2} events/sec", throughput);
+    println!("\nLatency Distribution:");
+    println!("  Average: {:.2}ms", avg_latency_ms);
+    println!("  P50: {:.2}ms", p50_latency_ms);
+    println!("  P95: {:.2}ms", p95_latency_ms);
+    println!("  P99: {:.2}ms", p99_latency_ms);
+    println!("  Max: {:.2}ms", max_latency_ms);
+
+    // Expected baseline: 86-370 events/sec (from critical analysis)
+    println!("\n--- Baseline Comparison ---");
+    if throughput < 86.0 {
+        println!("⚠️  BELOW EXPECTED: {:.2} events/sec < 86 events/sec (worst case)", throughput);
+    } else if throughput > 370.0 {
+        println!("✅ ABOVE EXPECTED: {:.2} events/sec > 370 events/sec (best case)", throughput);
+    } else {
+        println!("✅ WITHIN EXPECTED: 86-370 events/sec (measured: {:.2})", throughput);
+    }
+
+    println!("\n--- Phase 2 Target ---");
+    println!("Current: {:.2} events/sec", throughput);
+    println!("Phase 2 Target: 2,000-3,000 events/sec");
+    println!("Phase 3 Target: 10,000 events/sec");
+    println!("Required Improvement: {:.1}×", 10000.0 / throughput);
+}
+
+/// Benchmark: Write throughput degradation with increasing index size
+#[test]
+fn benchmark_index_degradation() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::new(temp_dir.path()).unwrap();
+
+    println!("\n=== Index Size Degradation Benchmark ===");
+    println!("Testing how performance degrades as indexes grow...\n");
+
+    let test_sizes = vec![100, 500, 1000, 2000, 5000];
+
+    for &size in &test_sizes {
+        // Write events
+        for i in 0..size {
+            let event = create_test_event(&format!("rec_{}", i));
+            storage.write_all(event).unwrap();
+        }
+
+        // Measure write latency at this index size
+        let num_samples = 100;
+        let mut latencies = Vec::with_capacity(num_samples);
+
+        for i in 0..num_samples {
+            let event = create_test_event(&format!("sample_{}_{}", size, i));
+
+            let start = Instant::now();
+            storage.write_all(event).unwrap();
+            latencies.push(start.elapsed());
+        }
+
+        latencies.sort();
+        let p50 = latencies[num_samples / 2].as_micros() as f64 / 1000.0;
+        let p95 = latencies[num_samples * 95 / 100].as_micros() as f64 / 1000.0;
+
+        println!("Index Size: {:5} events → P50: {:6.2}ms, P95: {:6.2}ms", size, p50, p95);
+    }
+
+    println!("\nNote: Expect degradation due to read-modify-write index updates");
+    println!("Phase 2 will eliminate this with inverted indexes");
+}
+
+/// Benchmark: Batch write throughput
+#[test]
+fn benchmark_batch_write_throughput() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::new(temp_dir.path()).unwrap();
+
+    println!("\n=== Batch Write Throughput Benchmark ===");
+
+    let batch_sizes = vec![1, 10, 50, 100];
+
+    for &batch_size in &batch_sizes {
+        let num_batches = 100;
+        let total_events = num_batches * batch_size;
+
+        let start = Instant::now();
+
+        for batch_idx in 0..num_batches {
+            for i in 0..batch_size {
+                let event = create_test_event(&format!("batch_{}_{}", batch_idx, i));
+                storage.write_all(event).unwrap();
+            }
+        }
+
+        let duration = start.elapsed();
+        let throughput = total_events as f64 / duration.as_secs_f64();
+
+        println!("Batch Size: {:3} → {:7.2} events/sec ({:.2}s total)",
+                 batch_size, throughput, duration.as_secs_f64());
+    }
+
+    println!("\nNote: No batching optimization currently implemented");
+    println!("Phase 2 will add proper batch writes");
+}
+
+/// Benchmark: Query performance by record ID
+#[test]
+fn benchmark_query_by_record() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::new(temp_dir.path()).unwrap();
+
+    println!("\n=== Query by Record ID Benchmark ===");
+
+    // Write 1000 events
+    println!("Writing 1000 events...");
+    for i in 0..1000 {
+        let event = create_test_event(&format!("query_test_{}", i));
+        storage.write_all(event).unwrap();
+    }
+
+    // Measure query latency
+    let num_queries = 100;
+    let mut latencies = Vec::with_capacity(num_queries);
+
+    println!("Running {} queries...", num_queries);
+    for i in 0..num_queries {
+        let record_id = format!("query_test_{}", i * 10); // Query every 10th record
+
+        let start = Instant::now();
+        let results = storage.get_by_record(&record_id).unwrap();
+        latencies.push(start.elapsed());
+
+        assert!(!results.is_empty(), "Expected results for {}", record_id);
+    }
+
+    latencies.sort();
+    let avg = latencies.iter().map(|d| d.as_micros()).sum::<u128>() as f64 / latencies.len() as f64 / 1000.0;
+    let p50 = latencies[num_queries / 2].as_micros() as f64 / 1000.0;
+    let p95 = latencies[num_queries * 95 / 100].as_micros() as f64 / 1000.0;
+    let p99 = latencies[num_queries * 99 / 100].as_micros() as f64 / 1000.0;
+
+    println!("\n--- Query Latency ---");
+    println!("Average: {:.2}ms", avg);
+    println!("P50: {:.2}ms", p50);
+    println!("P95: {:.2}ms", p95);
+    println!("P99: {:.2}ms", p99);
+}
+
+#[test]
+fn benchmark_summary() {
+    println!("\n╔════════════════════════════════════════════════════════════════╗");
+    println!("║              STORAGE THROUGHPUT BASELINE SUMMARY               ║");
+    println!("╚════════════════════════════════════════════════════════════════╝");
+    println!("\nRun individual benchmarks with:");
+    println!("  cargo test --test storage_throughput --release -- --nocapture benchmark_single_threaded_write_throughput");
+    println!("  cargo test --test storage_throughput --release -- --nocapture benchmark_index_degradation");
+    println!("  cargo test --test storage_throughput --release -- --nocapture benchmark_batch_write_throughput");
+    println!("  cargo test --test storage_throughput --release -- --nocapture benchmark_query_by_record");
+    println!("\nExpected Baseline (from critical analysis):");
+    println!("  - Throughput: 86-370 events/sec");
+    println!("  - Write Latency: ~3-12ms per event");
+    println!("  - Index Overhead: Degrades with size (read-modify-write)");
+    println!("\nOptimization Targets:");
+    println!("  - Phase 2 (Week 2-3): 2,000-3,000 events/sec (5-8× improvement)");
+    println!("  - Phase 3 (Week 4-6): 10,000 events/sec (27-116× improvement)");
+    println!();
+}

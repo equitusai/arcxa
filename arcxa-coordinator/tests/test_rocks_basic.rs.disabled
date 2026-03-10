@@ -1,0 +1,16 @@
+use graphica_core::storage::rocks::RocksLineageStore;
+use anyhow::Result;
+
+#[test]
+fn test_rocks_open_close() -> Result<()> {
+    eprintln!("Creating temp directory...");
+    let temp_dir = tempfile::tempdir()?;
+    eprintln!("Temp dir: {:?}", temp_dir.path());
+
+    eprintln!("Opening RocksDB...");
+    let _store = RocksLineageStore::new(temp_dir.path().to_str().unwrap())?;
+    eprintln!("RocksDB opened successfully");
+
+    eprintln!("Test passed!");
+    Ok(())
+}

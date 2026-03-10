@@ -1,0 +1,320 @@
+// RDF-star Integration Test for Bitemporal MVCC
+//
+// This test verifies the complete end-to-end workflow:
+// 1. Insert AnnotatedTriple with bitemporal metadata
+// 2. Store using RDF-star quoted triples (Subject::Triple)
+// 3. Query using SPARQL-star syntax
+// 4. Verify all annotations are retrievable
+
+use chrono::Utc;
+use graphica_coordinator::governance::bitemporal::TransactionId;
+use graphica_coordinator::governance::rdf_star::AnnotatedTriple;
+use graphica_coordinator::governance::rdf_store::{GraphicaRdfStore, RdfStore};
+
+#[test]
+fn test_rdf_star_bitemporal_insert_and_query() {
+    // Create in-memory store
+    let store = GraphicaRdfStore::new_in_memory().unwrap();
+
+    // Create a transaction ID for bitemporal tracking
+    let tx_id = TransactionId::new(1, Utc::now(), 1);
+
+    // Create a bitemporal annotated triple with all metadata
+    let valid_from = Utc::now();
+    let triple = AnnotatedTriple::new(
+        "http://graphica.io/entity/cust_123",
+        "http://graphica.io/ontology#revenue",
+        "1000000",
+    )
+    .with_confidence(0.95)
+    .with_provenance("http://graphica.io/model/revenue_predictor_v2")
+    .with_valid_time(valid_from, None) // None = still valid ("MAX")
+    .with_transaction_time(&tx_id, None); // None = current version ("MAX")
+
+    // Insert using RDF-star implementation (use default graph for testing)
+    store
+        .insert_rdf_star_triple(&triple, None)
+        .unwrap();
+
+    println!("✅ Inserted RDF-star triple with bitemporal annotations");
+
+    // Query 1: Verify base triple exists
+    let base_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        SELECT ?revenue WHERE {
+            <http://graphica.io/entity/cust_123> gph:revenue ?revenue .
+        }
+    "#;
+
+    let base_results = store.query(base_query).unwrap();
+    assert_eq!(
+        base_results.len(),
+        1,
+        "Base triple should exist in the store"
+    );
+    println!("✅ Base triple query successful");
+
+    // Query 2: Verify confidence annotation using RDF-star syntax
+    let confidence_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        SELECT ?conf WHERE {
+            << <http://graphica.io/entity/cust_123> gph:revenue "1000000" >>
+                gph:confidence ?conf .
+        }
+    "#;
+
+    let conf_results = store.query(confidence_query).unwrap();
+    assert_eq!(
+        conf_results.len(),
+        1,
+        "Confidence annotation should be retrievable"
+    );
+    println!("✅ Confidence annotation query successful: {:?}", conf_results);
+
+    // Query 3: Verify provenance annotation
+    let prov_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        PREFIX prov: <http://www.w3.org/ns/prov#>
+        SELECT ?model WHERE {
+            << <http://graphica.io/entity/cust_123> gph:revenue "1000000" >>
+                prov:wasGeneratedBy ?model .
+        }
+    "#;
+
+    let prov_results = store.query(prov_query).unwrap();
+    assert_eq!(
+        prov_results.len(),
+        1,
+        "Provenance annotation should be retrievable"
+    );
+    println!("✅ Provenance annotation query successful: {:?}", prov_results);
+
+    // Query 4: Verify valid time annotations (bitemporal - business time)
+    let valid_time_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        SELECT ?vf ?vt WHERE {
+            << <http://graphica.io/entity/cust_123> gph:revenue "1000000" >>
+                gph:validFrom ?vf ;
+                gph:validTo ?vt .
+        }
+    "#;
+
+    let valid_results = store.query(valid_time_query).unwrap();
+    assert_eq!(
+        valid_results.len(),
+        1,
+        "Valid time annotations should be retrievable"
+    );
+    println!(
+        "✅ Valid time annotations query successful: {:?}",
+        valid_results
+    );
+
+    // Verify validTo is "MAX" (still valid)
+    let valid_to = &valid_results[0]["vt"];
+    let valid_to_str = valid_to
+        .as_str()
+        .expect("validTo should be a string or literal");
+    assert!(
+        valid_to_str.contains("MAX"),
+        "validTo should be MAX for current valid data"
+    );
+    println!("✅ Verified validTo = MAX (still valid)");
+
+    // Query 5: Verify transaction time annotations (bitemporal - system time)
+    let tx_time_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        SELECT ?txId ?txFrom ?txTo ?nodeId WHERE {
+            << <http://graphica.io/entity/cust_123> gph:revenue "1000000" >>
+                gph:txId ?txId ;
+                gph:txFrom ?txFrom ;
+                gph:txTo ?txTo ;
+                gph:nodeId ?nodeId .
+        }
+    "#;
+
+    let tx_results = store.query(tx_time_query).unwrap();
+    assert_eq!(
+        tx_results.len(),
+        1,
+        "Transaction time annotations should be retrievable"
+    );
+    println!(
+        "✅ Transaction time annotations query successful: {:?}",
+        tx_results
+    );
+
+    // Verify transaction metadata
+    let tx_seq = &tx_results[0]["txId"];
+    assert!(
+        tx_seq.is_number() || tx_seq.is_string(),
+        "txId should be a number"
+    );
+
+    let tx_to = &tx_results[0]["txTo"];
+    let tx_to_str = tx_to.as_str().expect("txTo should be a string or literal");
+    assert!(
+        tx_to_str.contains("MAX"),
+        "txTo should be MAX for current version"
+    );
+    println!("✅ Verified txTo = MAX (current version)");
+
+    let node_id = &tx_results[0]["nodeId"];
+    assert!(
+        node_id.is_number() || node_id.is_string(),
+        "nodeId should be present"
+    );
+
+    // Query 6: Complex query combining all annotations
+    let combined_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        PREFIX prov: <http://www.w3.org/ns/prov#>
+        SELECT ?conf ?model ?vf ?vt ?txFrom ?txTo WHERE {
+            << <http://graphica.io/entity/cust_123> gph:revenue "1000000" >>
+                gph:confidence ?conf ;
+                prov:wasGeneratedBy ?model ;
+                gph:validFrom ?vf ;
+                gph:validTo ?vt ;
+                gph:txFrom ?txFrom ;
+                gph:txTo ?txTo .
+        }
+    "#;
+
+    let combined_results = store.query(combined_query).unwrap();
+    assert_eq!(
+        combined_results.len(),
+        1,
+        "Combined query should retrieve all annotations"
+    );
+    println!(
+        "✅ Combined query successful, all annotations present: {:?}",
+        combined_results
+    );
+
+    println!("\n🎉 WP1 SUCCESS: RDF-star integration with bitemporal annotations fully working!");
+}
+
+#[test]
+fn test_rdf_star_multiple_versions() {
+    // Create in-memory store
+    let store = GraphicaRdfStore::new_in_memory().unwrap();
+
+    // Insert version 1 (old revenue value)
+    let tx1 = TransactionId::new(1, Utc::now(), 1);
+    let triple_v1 = AnnotatedTriple::new(
+        "http://graphica.io/entity/cust_123",
+        "http://graphica.io/ontology#revenue",
+        "500000",
+    )
+    .with_confidence(0.85)
+    .with_valid_time(Utc::now(), None)
+    .with_transaction_time(&tx1, None);
+
+    store
+        .insert_rdf_star_triple(&triple_v1, None)
+        .unwrap();
+
+    // Insert version 2 (updated revenue value)
+    let tx2 = TransactionId::new(2, Utc::now(), 1);
+    let triple_v2 = AnnotatedTriple::new(
+        "http://graphica.io/entity/cust_123",
+        "http://graphica.io/ontology#revenue",
+        "1000000",
+    )
+    .with_confidence(0.95)
+    .with_valid_time(Utc::now(), None)
+    .with_transaction_time(&tx2, None);
+
+    store
+        .insert_rdf_star_triple(&triple_v2, None)
+        .unwrap();
+
+    println!("✅ Inserted 2 versions of the same triple");
+
+    // Query to retrieve all versions (both should exist as separate annotated triples)
+    let versions_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        SELECT ?revenue ?conf ?txId WHERE {
+            << <http://graphica.io/entity/cust_123> gph:revenue ?revenue >>
+                gph:confidence ?conf ;
+                gph:txId ?txId .
+        }
+        ORDER BY ?txId
+    "#;
+
+    let results = store.query(versions_query).unwrap();
+    assert_eq!(
+        results.len(),
+        2,
+        "Both versions should exist as separate annotated triples"
+    );
+
+    println!(
+        "✅ Retrieved {} versions with different transaction IDs",
+        results.len()
+    );
+    println!("   Version 1: {:?}", results[0]);
+    println!("   Version 2: {:?}", results[1]);
+
+    println!("\n🎉 Multi-version test successful!");
+}
+
+#[test]
+fn test_rdf_star_sparql_update() {
+    // Test SPARQL UPDATE functionality required for version superseding
+    let store = GraphicaRdfStore::new_in_memory().unwrap();
+
+    // Insert initial data using SPARQL UPDATE
+    let insert_update = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        INSERT DATA {
+            <http://graphica.io/entity/test_1> gph:value "initial" .
+        }
+    "#;
+
+    store.update(insert_update).unwrap();
+    println!("✅ SPARQL UPDATE INSERT successful");
+
+    // Verify the data was inserted
+    let verify_query = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        SELECT ?value WHERE {
+            <http://graphica.io/entity/test_1> gph:value ?value .
+        }
+    "#;
+
+    let results = store.query(verify_query).unwrap();
+    assert_eq!(results.len(), 1, "Inserted data should be queryable");
+    println!("✅ Verified INSERT DATA: {:?}", results);
+
+    // Update the value using DELETE/INSERT
+    let update_value = r#"
+        PREFIX gph: <http://graphica.io/ontology#>
+        DELETE {
+            <http://graphica.io/entity/test_1> gph:value "initial" .
+        }
+        INSERT {
+            <http://graphica.io/entity/test_1> gph:value "updated" .
+        }
+        WHERE {
+            <http://graphica.io/entity/test_1> gph:value "initial" .
+        }
+    "#;
+
+    store.update(update_value).unwrap();
+    println!("✅ SPARQL UPDATE DELETE/INSERT successful");
+
+    // Verify the update
+    let results_updated = store.query(verify_query).unwrap();
+    assert_eq!(results_updated.len(), 1, "Updated data should exist");
+    let updated_val = results_updated[0]["value"]
+        .as_str()
+        .expect("value should be a string");
+    assert!(
+        updated_val.contains("updated"),
+        "Value should be updated to 'updated'"
+    );
+    println!("✅ Verified UPDATE: {:?}", results_updated);
+
+    println!("\n🎉 SPARQL UPDATE test successful - ready for version superseding!");
+}

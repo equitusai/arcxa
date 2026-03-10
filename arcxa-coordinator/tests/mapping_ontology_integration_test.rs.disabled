@@ -1,0 +1,453 @@
+//! Integration tests for ontology registry integration with mapping engine
+//!
+//! These tests verify that:
+//! 1. Custom ontologies uploaded via API are used in field mapping
+//! 2. Namespace filtering works correctly
+//! 3. Multiple ontologies can be registered and all their terms are used
+//! 4. Default terms are used when no custom ontologies exist
+
+use graphica_coordinator::mapping::{MappingEngine, types::*};
+use graphica_core::catalog::OntologyRegistry;
+use std::sync::Arc;
+use parking_lot::RwLock;
+use anyhow::Result;
+
+/// Helper to create a test RDF store
+fn create_test_rdf_store() -> Arc<graphica_coordinator::governance::rdf_store::GraphicaRdfStore> {
+    use graphica_coordinator::governance::rdf_store::GraphicaRdfStore;
+
+    Arc::new(GraphicaRdfStore::new_in_memory().expect("Failed to create test RDF store"))
+}
+
+/// Helper to create a test mapping engine with ontology registry
+async fn create_test_engine_with_registry() -> Result<(MappingEngine, Arc<RwLock<OntologyRegistry>>)> {
+    let temp_dir = tempfile::tempdir()?;
+    let rdf_store = create_test_rdf_store();
+
+    let mut engine = MappingEngine::new(
+        temp_dir.path().to_str().unwrap(),
+        rdf_store, // PRE-EXISTING ISSUE: semantic_matcher parameter removed
+    ).await?;
+
+    // Create and wire ontology registry
+    let registry = Arc::new(RwLock::new(OntologyRegistry::new()));
+    engine.with_ontology_registry(registry.clone());
+
+    Ok((engine, registry))
+}
+
+#[tokio::test]
+async fn test_mapping_uses_uploaded_custom_ontology() -> Result<()> {
+    let (engine, registry) = create_test_engine_with_registry().await?;
+
+    // Register a custom e-commerce ontology
+    let ecommerce_ontology = r#"
+        @prefix : <http://example.com/ecommerce#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+        :Product a owl:Class ;
+            rdfs:label "Product" .
+
+        :Customer a owl:Class ;
+            rdfs:label "Customer" .
+
+        :productSKU a owl:DatatypeProperty ;
+            rdfs:label "Product SKU" ;
+            rdfs:domain :Product .
+
+        :customerEmail a owl:DatatypeProperty ;
+            rdfs:label "Customer Email" ;
+            rdfs:domain :Customer .
+    "#;
+
+    {
+        let mut reg = registry.write();
+        reg.register_custom_ontology(
+            "ecommerce_v1",
+            ecommerce_ontology,
+            Some("http://example.com/ecommerce#".to_string()),
+        )?;
+    }
+
+    // Analyze a schema with fields that should map to custom ontology
+    let request = AnalyzeSchemaRequest {
+        source_id: "test_source".to_string(),
+        table_name: "products".to_string(),
+        fields: vec![
+            SchemaFieldInput {
+                name: "sku".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["SKU12345".to_string()]),
+                description: None,
+            },
+        ],
+        sample_size: Some(100),
+    };
+
+    let analyzed = engine.analyze_schema(request).await?;
+    let field_id = &analyzed.fields[0].id;
+
+    // Get candidates - should include our custom ontology term
+    let candidates = engine.get_candidates(field_id, 10, 0.0, None).await?;
+
+    // Verify that productSKU from our custom ontology is in the candidates
+    let has_product_sku = candidates.candidates.iter().any(|c| {
+        c.ontology_term_uri.contains("ecommerce#productSKU")
+    });
+
+    assert!(has_product_sku,
+        "Expected productSKU from custom ontology in candidates, got: {:?}",
+        candidates.candidates.iter().map(|c| &c.ontology_term_uri).collect::<Vec<_>>()
+    );
+
+    // The custom term should rank high due to name similarity
+    if let Some(top_candidate) = candidates.candidates.first() {
+        assert!(top_candidate.ontology_term_uri.contains("ecommerce"),
+            "Top candidate should be from custom ontology, got: {}",
+            top_candidate.ontology_term_uri
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_namespace_filtering_limits_to_specific_ontology() -> Result<()> {
+    let (engine, registry) = create_test_engine_with_registry().await?;
+
+    // Register TWO ontologies with different namespaces
+    let ecommerce_ontology = r#"
+        @prefix : <http://example.com/ecommerce#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+        :productSKU a owl:DatatypeProperty ;
+            rdfs:label "Product SKU" .
+    "#;
+
+    let healthcare_ontology = r#"
+        @prefix : <http://example.com/healthcare#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+        :patientId a owl:DatatypeProperty ;
+            rdfs:label "Patient ID" .
+    "#;
+
+    {
+        let mut reg = registry.write();
+        reg.register_custom_ontology(
+            "ecommerce_v1",
+            ecommerce_ontology,
+            Some("http://example.com/ecommerce#".to_string()),
+        )?;
+        reg.register_custom_ontology(
+            "healthcare_v1",
+            healthcare_ontology,
+            Some("http://example.com/healthcare#".to_string()),
+        )?;
+    }
+
+    // Analyze a field
+    let request = AnalyzeSchemaRequest {
+        source_id: "test_source".to_string(),
+        table_name: "data".to_string(),
+        fields: vec![
+            SchemaFieldInput {
+                name: "identifier".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["ID123".to_string()]),
+                description: None,
+            },
+        ],
+        sample_size: Some(100),
+    };
+
+    let analyzed = engine.analyze_schema(request).await?;
+    let field_id = &analyzed.fields[0].id;
+
+    // Get candidates filtered to ONLY ecommerce namespace
+    let ecommerce_candidates = engine.get_candidates(
+        field_id,
+        10,
+        0.0,
+        Some(&["http://example.com/ecommerce#".to_string()]),
+    ).await?;
+
+    // Should ONLY have ecommerce terms, NO healthcare terms
+    for candidate in &ecommerce_candidates.candidates {
+        assert!(candidate.ontology_term_uri.contains("ecommerce"),
+            "Expected only ecommerce terms, found: {}", candidate.ontology_term_uri);
+        assert!(!candidate.ontology_term_uri.contains("healthcare"),
+            "Should not include healthcare terms, found: {}", candidate.ontology_term_uri);
+    }
+
+    // Get candidates filtered to ONLY healthcare namespace
+    let healthcare_candidates = engine.get_candidates(
+        field_id,
+        10,
+        0.0,
+        Some(&["http://example.com/healthcare#".to_string()]),
+    ).await?;
+
+    // Should ONLY have healthcare terms, NO ecommerce terms
+    for candidate in &healthcare_candidates.candidates {
+        assert!(candidate.ontology_term_uri.contains("healthcare"),
+            "Expected only healthcare terms, found: {}", candidate.ontology_term_uri);
+        assert!(!candidate.ontology_term_uri.contains("ecommerce"),
+            "Should not include ecommerce terms, found: {}", candidate.ontology_term_uri);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_ontologies_all_terms_available() -> Result<()> {
+    let (engine, registry) = create_test_engine_with_registry().await?;
+
+    // Register multiple ontologies
+    let retail_ontology = r#"
+        @prefix : <http://acme.com/retail#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+        :productPrice a owl:DatatypeProperty ;
+            rdfs:label "Product Price" .
+    "#;
+
+    let customer_ontology = r#"
+        @prefix : <http://acme.com/customer#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+        :customerName a owl:DatatypeProperty ;
+            rdfs:label "Customer Name" .
+    "#;
+
+    {
+        let mut reg = registry.write();
+        reg.register_custom_ontology(
+            "retail_v1",
+            retail_ontology,
+            Some("http://acme.com/retail#".to_string()),
+        )?;
+        reg.register_custom_ontology(
+            "customer_v1",
+            customer_ontology,
+            Some("http://acme.com/customer#".to_string()),
+        )?;
+    }
+
+    // Analyze fields that could match either ontology
+    let request = AnalyzeSchemaRequest {
+        source_id: "test_source".to_string(),
+        table_name: "sales".to_string(),
+        fields: vec![
+            SchemaFieldInput {
+                name: "price".to_string(),
+                data_type: "DECIMAL".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["29.99".to_string()]),
+                description: None,
+            },
+            SchemaFieldInput {
+                name: "customer_name".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["John Doe".to_string()]),
+                description: None,
+            },
+        ],
+        sample_size: Some(100),
+    };
+
+    let analyzed = engine.analyze_schema(request).await?;
+
+    // Check price field - should find retail ontology term
+    let price_candidates = engine.get_candidates(&analyzed.fields[0].id, 10, 0.0, None).await?;
+    let has_retail_term = price_candidates.candidates.iter().any(|c| {
+        c.ontology_term_uri.contains("retail#productPrice")
+    });
+    assert!(has_retail_term, "Should find productPrice from retail ontology");
+
+    // Check customer_name field - should find customer ontology term
+    let name_candidates = engine.get_candidates(&analyzed.fields[1].id, 10, 0.0, None).await?;
+    let has_customer_term = name_candidates.candidates.iter().any(|c| {
+        c.ontology_term_uri.contains("customer#customerName")
+    });
+    assert!(has_customer_term, "Should find customerName from customer ontology");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fallback_to_defaults_when_no_ontologies() -> Result<()> {
+    let (engine, _registry) = create_test_engine_with_registry().await?;
+
+    // Don't register any ontologies - should use defaults
+
+    let request = AnalyzeSchemaRequest {
+        source_id: "test_source".to_string(),
+        table_name: "users".to_string(),
+        fields: vec![
+            SchemaFieldInput {
+                name: "email".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["user@example.com".to_string()]),
+                description: None,
+            },
+        ],
+        sample_size: Some(100),
+    };
+
+    let analyzed = engine.analyze_schema(request).await?;
+    let field_id = &analyzed.fields[0].id;
+
+    // Get candidates - should use default schema.org terms
+    let candidates = engine.get_candidates(field_id, 10, 0.0, None).await?;
+
+    // Should have schema.org email as a candidate
+    let has_schema_org_email = candidates.candidates.iter().any(|c| {
+        c.ontology_term_uri.contains("schema.org/email")
+    });
+
+    assert!(has_schema_org_email,
+        "Should fall back to schema.org defaults when no custom ontologies, got: {:?}",
+        candidates.candidates.iter().map(|c| &c.ontology_term_uri).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rdfxml_ontology_parsing() -> Result<()> {
+    let (engine, registry) = create_test_engine_with_registry().await?;
+
+    // Register an RDF/XML ontology (not Turtle)
+    let rdfxml_ontology = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+         xmlns:owl="http://www.w3.org/2002/07/owl#"
+         xmlns="http://example.com/retail#">
+
+  <owl:Ontology rdf:about="http://example.com/retail">
+    <rdfs:label>Retail Ontology</rdfs:label>
+  </owl:Ontology>
+
+  <owl:Class rdf:about="http://example.com/retail#Product">
+    <rdfs:label>Product</rdfs:label>
+  </owl:Class>
+
+  <owl:DatatypeProperty rdf:about="http://example.com/retail#itemCode">
+    <rdfs:label>Item Code</rdfs:label>
+    <rdfs:domain rdf:resource="http://example.com/retail#Product"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
+  </owl:DatatypeProperty>
+
+</rdf:RDF>"#;
+
+    {
+        let mut reg = registry.write();
+        reg.register_custom_ontology(
+            "retail_rdfxml",
+            rdfxml_ontology,
+            Some("http://example.com/retail#".to_string()),
+        )?;
+    }
+
+    // Analyze a field that should match the RDF/XML ontology
+    let request = AnalyzeSchemaRequest {
+        source_id: "test_source".to_string(),
+        table_name: "products".to_string(),
+        fields: vec![
+            SchemaFieldInput {
+                name: "item_code".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["ITEM-001".to_string()]),
+                description: None,
+            },
+        ],
+        sample_size: Some(100),
+    };
+
+    let analyzed = engine.analyze_schema(request).await?;
+    let field_id = &analyzed.fields[0].id;
+
+    // Get candidates - should include itemCode from RDF/XML ontology
+    let candidates = engine.get_candidates(field_id, 10, 0.0, None).await?;
+
+    let has_item_code = candidates.candidates.iter().any(|c| {
+        c.ontology_term_uri.contains("retail#itemCode")
+    });
+
+    assert!(has_item_code,
+        "Should parse RDF/XML ontology and find itemCode term, got: {:?}",
+        candidates.candidates.iter().map(|c| &c.ontology_term_uri).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_inactive_ontologies_not_used() -> Result<()> {
+    let (engine, registry) = create_test_engine_with_registry().await?;
+
+    // Register an ontology
+    let ontology = r#"
+        @prefix : <http://example.com/test#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+        :testProperty a owl:DatatypeProperty ;
+            rdfs:label "Test Property" .
+    "#;
+
+    {
+        let mut reg = registry.write();
+        reg.register_custom_ontology(
+            "test_ontology",
+            ontology,
+            Some("http://example.com/test#".to_string()),
+        )?;
+
+        // Deactivate it
+        reg.deactivate_ontology("test_ontology")?;
+    }
+
+    // Analyze a field
+    let request = AnalyzeSchemaRequest {
+        source_id: "test_source".to_string(),
+        table_name: "data".to_string(),
+        fields: vec![
+            SchemaFieldInput {
+                name: "test_property".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+                sample_values: Some(vec!["value".to_string()]),
+                description: None,
+            },
+        ],
+        sample_size: Some(100),
+    };
+
+    let analyzed = engine.analyze_schema(request).await?;
+    let field_id = &analyzed.fields[0].id;
+
+    // Get candidates - should NOT include the inactive ontology's terms
+    let candidates = engine.get_candidates(field_id, 10, 0.0, None).await?;
+
+    let has_test_property = candidates.candidates.iter().any(|c| {
+        c.ontology_term_uri.contains("test#testProperty")
+    });
+
+    assert!(!has_test_property,
+        "Inactive ontologies should not be used in mapping, but found testProperty"
+    );
+
+    Ok(())
+}

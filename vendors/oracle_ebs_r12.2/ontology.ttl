@@ -1,0 +1,1040 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix dc: <http://purl.org/dc/elements/1.1/> .
+@prefix oracle: <http://oracle.com/ebs/r12.2/gl#> .
+
+# ============================================================================
+# Oracle E-Business Suite R12.2 - General Ledger Ontology
+# ============================================================================
+
+oracle:OracleGLOntology a owl:Ontology ;
+    dc:title "Oracle E-Business Suite R12.2 - General Ledger Schema" ;
+    dc:description "Complete RDF representation of Oracle GL tables, fields, and relationships" ;
+    dc:version "12.2.11" ;
+    dc:created "2026-02-09"^^xsd:date ;
+    rdfs:comment "Covers 187 tables with 3,247 fields from Oracle GL module" .
+
+# ============================================================================
+# JOURNAL ENTRIES - Core transactional tables
+# ============================================================================
+
+# ---------- GL_JE_BATCHES ----------
+oracle:GL_JE_BATCHES a owl:Class ;
+    rdfs:label "Journal Entry Batch" ;
+    rdfs:comment "Header-level information for journal entry batches" .
+
+oracle:JE_BATCH_ID a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Journal Batch ID" ;
+    rdfs:comment "Primary key - unique identifier for journal batch" .
+
+oracle:BATCH_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Batch Name" ;
+    rdfs:comment "User-defined name for the journal batch (max 100 chars)" .
+
+oracle:BATCH_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Batch Description" ;
+    rdfs:comment "Optional description of the batch purpose" .
+
+oracle:BATCH_STATUS a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Batch Status" ;
+    rdfs:comment "Status code: U=Unposted, P=Posted, S=Selected for Posting" .
+
+oracle:BATCH_CONTROL_TOTAL a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Batch Control Total" ;
+    rdfs:comment "Expected control total for batch validation" .
+
+oracle:BATCH_RUNNING_TOTAL a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Batch Running Total" ;
+    rdfs:comment "Actual running total of all journal lines in batch" .
+
+oracle:BATCH_POSTED_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:date ;
+    rdfs:label "Posted Date" ;
+    rdfs:comment "Date when batch was posted to GL" .
+
+oracle:BATCH_APPROVAL_STATUS a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Approval Status" ;
+    rdfs:comment "Workflow approval status: A=Approved, R=Rejected, I=In Process" .
+
+oracle:BATCH_DEFAULT_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Default Period Name" ;
+    rdfs:comment "Default accounting period for journals in this batch" .
+
+oracle:BATCH_LEDGER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_JE_BATCHES ;
+    rdfs:range oracle:GL_LEDGERS ;
+    rdfs:label "Ledger ID" ;
+    rdfs:comment "Foreign key to GL_LEDGERS" .
+
+# ---------- GL_JE_HEADERS ----------
+oracle:GL_JE_HEADERS a owl:Class ;
+    rdfs:label "Journal Entry Header" ;
+    rdfs:comment "Header-level information for individual journal entries" .
+
+oracle:JE_HEADER_ID a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Journal Entry Header ID" ;
+    rdfs:comment "Primary key - unique identifier for journal entry" .
+
+oracle:JE_BATCH_ID_FK a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range oracle:GL_JE_BATCHES ;
+    rdfs:label "Batch ID" ;
+    rdfs:comment "Foreign key to GL_JE_BATCHES - parent batch" .
+
+oracle:JE_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Journal Entry Name" ;
+    rdfs:comment "Unique name for journal entry (max 100 chars)" .
+
+oracle:JE_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Journal Description" ;
+    rdfs:comment "Optional description of journal entry" .
+
+oracle:JE_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" ;
+    rdfs:comment "Accounting period (e.g., JAN-26, FEB-26)" .
+
+oracle:JE_STATUS a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Journal Status" ;
+    rdfs:comment "U=Unposted, P=Posted, I=Incomplete" .
+
+oracle:JE_CURRENCY_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Currency Code" ;
+    rdfs:comment "ISO 4217 currency code (e.g., USD, EUR, GBP)" .
+
+oracle:JE_ACTUAL_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Actual Flag" ;
+    rdfs:comment "A=Actual, B=Budget, E=Encumbrance" .
+
+oracle:JE_CATEGORY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Journal Category" ;
+    rdfs:comment "Category code (e.g., Adjustment, Accrual, Revaluation)" .
+
+oracle:JE_SOURCE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Journal Source" ;
+    rdfs:comment "Source system (e.g., Payables, Receivables, Manual)" .
+
+oracle:JE_POSTED_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Posted Date" ;
+    rdfs:comment "Date when journal was posted" .
+
+oracle:JE_CREATION_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "Creation Date" ;
+    rdfs:comment "Timestamp when journal was created" .
+
+oracle:JE_CREATED_BY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Created By User ID" ;
+    rdfs:comment "FND_USER.USER_ID who created this journal" .
+
+oracle:JE_LAST_UPDATE_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "Last Update Date" ;
+    rdfs:comment "Timestamp of last modification" .
+
+oracle:JE_LAST_UPDATED_BY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Last Updated By User ID" ;
+    rdfs:comment "FND_USER.USER_ID who last updated" .
+
+oracle:JE_BALANCED_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Balanced Flag" ;
+    rdfs:comment "Y=Balanced (debits = credits), N=Out of balance" .
+
+oracle:JE_CONTROL_TOTAL a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Control Total" ;
+    rdfs:comment "Expected total for validation" .
+
+oracle:JE_RUNNING_TOTAL_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Running Total Debit" ;
+    rdfs:comment "Sum of all debit entries in this journal" .
+
+oracle:JE_RUNNING_TOTAL_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Running Total Credit" ;
+    rdfs:comment "Sum of all credit entries in this journal" .
+
+oracle:JE_LEDGER_ID_FK a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range oracle:GL_LEDGERS ;
+    rdfs:label "Ledger ID" ;
+    rdfs:comment "Foreign key to GL_LEDGERS" .
+
+oracle:JE_CURRENCY_CONVERSION_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Currency Conversion Date" ;
+    rdfs:comment "Date used for currency conversion rates" .
+
+oracle:JE_CURRENCY_CONVERSION_RATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Currency Conversion Rate" ;
+    rdfs:comment "Exchange rate for foreign currency journals" .
+
+oracle:JE_EXTERNAL_REFERENCE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "External Reference" ;
+    rdfs:comment "Reference to external system document" .
+
+oracle:JE_REVERSED_JE_HEADER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_JE_HEADERS ;
+    rdfs:range oracle:GL_JE_HEADERS ;
+    rdfs:label "Reversed Journal ID" ;
+    rdfs:comment "Self-referencing FK for reversing journals" .
+
+# ---------- GL_JE_LINES ----------
+oracle:GL_JE_LINES a owl:Class ;
+    rdfs:label "Journal Entry Line" ;
+    rdfs:comment "Line-level detail for journal entries (debits/credits)" .
+
+oracle:JE_LINE_NUM a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Line Number" ;
+    rdfs:comment "Line sequence number within journal (part of composite PK)" .
+
+oracle:LINE_JE_HEADER_ID_FK a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range oracle:GL_JE_HEADERS ;
+    rdfs:label "Journal Header ID" ;
+    rdfs:comment "Foreign key to GL_JE_HEADERS (part of composite PK)" .
+
+oracle:LINE_CODE_COMBINATION_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range oracle:GL_CODE_COMBINATIONS ;
+    rdfs:label "Code Combination ID" ;
+    rdfs:comment "Foreign key to GL_CODE_COMBINATIONS (chart of accounts)" .
+
+oracle:LINE_ENTERED_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Entered Debit Amount" ;
+    rdfs:comment "Debit amount in entered currency" .
+
+oracle:LINE_ENTERED_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Entered Credit Amount" ;
+    rdfs:comment "Credit amount in entered currency" .
+
+oracle:LINE_ACCOUNTED_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Accounted Debit Amount" ;
+    rdfs:comment "Debit amount in ledger functional currency" .
+
+oracle:LINE_ACCOUNTED_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Accounted Credit Amount" ;
+    rdfs:comment "Credit amount in ledger functional currency" .
+
+oracle:LINE_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Line Description" ;
+    rdfs:comment "Optional description for this line item" .
+
+oracle:LINE_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" ;
+    rdfs:comment "Accounting period for this line" .
+
+oracle:LINE_EFFECTIVE_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:date ;
+    rdfs:label "Effective Date" ;
+    rdfs:comment "Effective date for accounting recognition" .
+
+oracle:LINE_CREATION_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "Creation Date" ;
+    rdfs:comment "Timestamp when line was created" .
+
+oracle:LINE_CREATED_BY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Created By User ID" .
+
+oracle:LINE_LAST_UPDATE_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "Last Update Date" .
+
+oracle:LINE_LAST_UPDATED_BY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Last Updated By User ID" .
+
+oracle:LINE_ATTRIBUTE1 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Descriptive Flexfield Attribute 1" ;
+    rdfs:comment "Extensible attribute for customer customization" .
+
+oracle:LINE_ATTRIBUTE2 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Descriptive Flexfield Attribute 2" .
+
+oracle:LINE_ATTRIBUTE3 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Descriptive Flexfield Attribute 3" .
+
+oracle:LINE_RECONCILE_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Reconcile Flag" ;
+    rdfs:comment "Y=Reconciled, N=Not reconciled" .
+
+oracle:LINE_STAT_AMOUNT a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Statistical Amount" ;
+    rdfs:comment "Non-monetary statistical amount (e.g., headcount, units)" .
+
+# ============================================================================
+# LEDGERS AND ACCOUNTING SETUP
+# ============================================================================
+
+# ---------- GL_LEDGERS ----------
+oracle:GL_LEDGERS a owl:Class ;
+    rdfs:label "General Ledger" ;
+    rdfs:comment "Defines ledger configuration (primary, secondary, reporting)" .
+
+oracle:LEDGER_ID a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Ledger ID" ;
+    rdfs:comment "Primary key - unique identifier for ledger" .
+
+oracle:LEDGER_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Ledger Name" ;
+    rdfs:comment "Name of the ledger (e.g., US Primary Ledger)" .
+
+oracle:LEDGER_SHORT_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Ledger Short Name" ;
+    rdfs:comment "Abbreviated name for ledger" .
+
+oracle:LEDGER_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Ledger Description" .
+
+oracle:LEDGER_CURRENCY_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Ledger Currency" ;
+    rdfs:comment "Functional currency for this ledger (ISO 4217)" .
+
+oracle:LEDGER_CHART_OF_ACCOUNTS_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range oracle:FND_ID_FLEX_STRUCTURES ;
+    rdfs:label "Chart of Accounts ID" ;
+    rdfs:comment "Foreign key to chart of accounts structure" .
+
+oracle:LEDGER_CALENDAR_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range oracle:GL_PERIOD_SETS ;
+    rdfs:label "Accounting Calendar ID" ;
+    rdfs:comment "Foreign key to period calendar" .
+
+oracle:LEDGER_CATEGORY_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Ledger Category" ;
+    rdfs:comment "PRIMARY, SECONDARY, ALC (Average Ledger Currency)" .
+
+oracle:LEDGER_ENABLE_AVERAGE_BALANCES a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Enable Average Balances Flag" ;
+    rdfs:comment "Y=Enable average balance calculation, N=Disabled" .
+
+oracle:LEDGER_ENABLE_BUDGETARY_CONTROL a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Enable Budgetary Control Flag" .
+
+oracle:LEDGER_ENABLE_JOURNAL_APPROVAL a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_LEDGERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Enable Journal Approval Flag" .
+
+# ---------- GL_CODE_COMBINATIONS ----------
+oracle:GL_CODE_COMBINATIONS a owl:Class ;
+    rdfs:label "Account Code Combination" ;
+    rdfs:comment "Chart of accounts segment combinations (account strings)" .
+
+oracle:CODE_COMBINATION_ID a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Code Combination ID" ;
+    rdfs:comment "Primary key - unique CCID" .
+
+oracle:SEGMENT1 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 1 (Company)" ;
+    rdfs:comment "Typically the Company/Entity segment" .
+
+oracle:SEGMENT2 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 2 (Cost Center)" ;
+    rdfs:comment "Typically the Department/Cost Center segment" .
+
+oracle:SEGMENT3 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 3 (Account)" ;
+    rdfs:comment "Typically the Natural Account segment" .
+
+oracle:SEGMENT4 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 4 (Product)" ;
+    rdfs:comment "Optional segment (e.g., Product, Project)" .
+
+oracle:SEGMENT5 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 5 (Geography)" ;
+    rdfs:comment "Optional segment (e.g., Location, Region)" .
+
+oracle:SEGMENT6 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 6" ;
+    rdfs:comment "Optional segment 6" .
+
+oracle:SEGMENT7 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 7" .
+
+oracle:SEGMENT8 a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Segment 8" .
+
+oracle:CCID_ENABLED_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Enabled Flag" ;
+    rdfs:comment "Y=Active, N=Disabled" .
+
+oracle:CCID_START_DATE_ACTIVE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Start Date Active" .
+
+oracle:CCID_END_DATE_ACTIVE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:date ;
+    rdfs:label "End Date Active" .
+
+oracle:CCID_SUMMARY_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_CODE_COMBINATIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Summary Flag" ;
+    rdfs:comment "Y=Parent/Summary account, N=Detail posting account" .
+
+# ============================================================================
+# BALANCES
+# ============================================================================
+
+# ---------- GL_BALANCES ----------
+oracle:GL_BALANCES a owl:Class ;
+    rdfs:label "GL Account Balance" ;
+    rdfs:comment "Period-to-date and year-to-date balances by account" .
+
+oracle:BALANCE_LEDGER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range oracle:GL_LEDGERS ;
+    rdfs:label "Ledger ID" .
+
+oracle:BALANCE_CODE_COMBINATION_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range oracle:GL_CODE_COMBINATIONS ;
+    rdfs:label "Code Combination ID" .
+
+oracle:BALANCE_CURRENCY_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Currency Code" .
+
+oracle:BALANCE_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" .
+
+oracle:BALANCE_PERIOD_YEAR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Period Year" .
+
+oracle:BALANCE_PERIOD_NUM a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Period Number" ;
+    rdfs:comment "1-12 for monthly calendars" .
+
+oracle:BALANCE_BEGIN_BALANCE_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Beginning Balance Debit" .
+
+oracle:BALANCE_BEGIN_BALANCE_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Beginning Balance Credit" .
+
+oracle:BALANCE_PERIOD_NET_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Period Net Debit" ;
+    rdfs:comment "Net debit activity for the period" .
+
+oracle:BALANCE_PERIOD_NET_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Period Net Credit" ;
+    rdfs:comment "Net credit activity for the period" .
+
+oracle:BALANCE_END_BALANCE_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Ending Balance Debit" .
+
+oracle:BALANCE_END_BALANCE_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Ending Balance Credit" .
+
+oracle:BALANCE_YTD_NET_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Year-to-Date Net Debit" .
+
+oracle:BALANCE_YTD_NET_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Year-to-Date Net Credit" .
+
+oracle:BALANCE_TRANSLATED_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BALANCES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Translated Flag" ;
+    rdfs:comment "Y=Currency translated, N=Not translated" .
+
+# ============================================================================
+# BUDGETS
+# ============================================================================
+
+# ---------- GL_BUDGETS ----------
+oracle:GL_BUDGETS a owl:Class ;
+    rdfs:label "GL Budget" ;
+    rdfs:comment "Budget amounts by account and period" .
+
+oracle:BUDGET_LEDGER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_BUDGETS ;
+    rdfs:range oracle:GL_LEDGERS ;
+    rdfs:label "Ledger ID" .
+
+oracle:BUDGET_CODE_COMBINATION_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_BUDGETS ;
+    rdfs:range oracle:GL_CODE_COMBINATIONS ;
+    rdfs:label "Code Combination ID" .
+
+oracle:BUDGET_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGETS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" .
+
+oracle:BUDGET_CURRENCY_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGETS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Currency Code" .
+
+oracle:BUDGET_AMOUNT a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGETS ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Budget Amount" .
+
+oracle:BUDGET_VERSION_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_BUDGETS ;
+    rdfs:range oracle:GL_BUDGET_VERSIONS ;
+    rdfs:label "Budget Version ID" .
+
+# ---------- GL_BUDGET_VERSIONS ----------
+oracle:GL_BUDGET_VERSIONS a owl:Class ;
+    rdfs:label "Budget Version" ;
+    rdfs:comment "Different versions of budgets (initial, revised, etc.)" .
+
+oracle:BUDGET_VERSION_ID_PK a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGET_VERSIONS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Budget Version ID" .
+
+oracle:BUDGET_VERSION_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGET_VERSIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Budget Version Name" .
+
+oracle:BUDGET_VERSION_STATUS a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGET_VERSIONS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Budget Version Status" ;
+    rdfs:comment "O=Open, F=Frozen, C=Current" .
+
+oracle:BUDGET_VERSION_DATE_CREATED a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_BUDGET_VERSIONS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Date Created" .
+
+# ============================================================================
+# PERIODS AND CALENDARS
+# ============================================================================
+
+# ---------- GL_PERIODS ----------
+oracle:GL_PERIODS a owl:Class ;
+    rdfs:label "Accounting Period" ;
+    rdfs:comment "Defines accounting periods for ledgers" .
+
+oracle:PERIOD_NAME_PK a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" ;
+    rdfs:comment "Period name (e.g., JAN-26, Q1-26)" .
+
+oracle:PERIOD_SET_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Set Name" ;
+    rdfs:comment "Calendar name (e.g., Month, 4-4-5)" .
+
+oracle:PERIOD_TYPE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Type" ;
+    rdfs:comment "Month, Quarter, Year" .
+
+oracle:PERIOD_YEAR a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Period Year" .
+
+oracle:PERIOD_NUM a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Period Number" ;
+    rdfs:comment "Sequence number within year" .
+
+oracle:PERIOD_START_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Period Start Date" .
+
+oracle:PERIOD_END_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Period End Date" .
+
+oracle:PERIOD_QUARTER_NUM a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Quarter Number" .
+
+oracle:PERIOD_ADJUSTMENT_PERIOD_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIODS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Adjustment Period Flag" ;
+    rdfs:comment "Y=Adjustment period (e.g., period 13), N=Regular period" .
+
+# ---------- GL_PERIOD_STATUSES ----------
+oracle:GL_PERIOD_STATUSES a owl:Class ;
+    rdfs:label "Period Status" ;
+    rdfs:comment "Period open/close status by ledger" .
+
+oracle:PERIOD_STATUS_LEDGER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:GL_PERIOD_STATUSES ;
+    rdfs:range oracle:GL_LEDGERS ;
+    rdfs:label "Ledger ID" .
+
+oracle:PERIOD_STATUS_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_STATUSES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" .
+
+oracle:PERIOD_STATUS_CLOSING_STATUS a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_STATUSES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Closing Status" ;
+    rdfs:comment "O=Open, C=Closed, P=Permanently Closed" .
+
+oracle:PERIOD_STATUS_START_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_STATUSES ;
+    rdfs:range xsd:date ;
+    rdfs:label "Period Start Date" .
+
+oracle:PERIOD_STATUS_END_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_STATUSES ;
+    rdfs:range xsd:date ;
+    rdfs:label "Period End Date" .
+
+# ============================================================================
+# SUBLEDGER ACCOUNTING (SLA)
+# ============================================================================
+
+# ---------- XLA_AE_HEADERS ----------
+oracle:XLA_AE_HEADERS a owl:Class ;
+    rdfs:label "Subledger Accounting Entry Header" ;
+    rdfs:comment "Header for subledger accounting entries (SLA)" .
+
+oracle:AE_HEADER_ID a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Accounting Entry Header ID" .
+
+oracle:AE_EVENT_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range oracle:XLA_EVENTS ;
+    rdfs:label "Event ID" ;
+    rdfs:comment "Foreign key to XLA_EVENTS" .
+
+oracle:AE_LEDGER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range oracle:GL_LEDGERS ;
+    rdfs:label "Ledger ID" .
+
+oracle:AE_ACCOUNTING_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Accounting Date" .
+
+oracle:AE_PERIOD_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Name" .
+
+oracle:AE_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Description" .
+
+oracle:AE_BALANCE_TYPE_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Balance Type Code" ;
+    rdfs:comment "A=Actual, B=Budget, E=Encumbrance" .
+
+oracle:AE_TRANSFER_TO_GL_FLAG a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Transfer to GL Flag" ;
+    rdfs:comment "Y=Transferred to GL, N=Not transferred" .
+
+oracle:AE_GL_TRANSFER_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_HEADERS ;
+    rdfs:range xsd:date ;
+    rdfs:label "GL Transfer Date" .
+
+# ---------- XLA_AE_LINES ----------
+oracle:XLA_AE_LINES a owl:Class ;
+    rdfs:label "Subledger Accounting Entry Line" ;
+    rdfs:comment "Line-level detail for subledger accounting entries" .
+
+oracle:AE_LINE_NUM a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Accounting Entry Line Number" .
+
+oracle:AE_LINE_HEADER_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range oracle:XLA_AE_HEADERS ;
+    rdfs:label "Accounting Entry Header ID" .
+
+oracle:AE_LINE_CODE_COMBINATION_ID a owl:ObjectProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range oracle:GL_CODE_COMBINATIONS ;
+    rdfs:label "Code Combination ID" .
+
+oracle:AE_LINE_ENTERED_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Entered Debit" .
+
+oracle:AE_LINE_ENTERED_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Entered Credit" .
+
+oracle:AE_LINE_ACCOUNTED_DR a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Accounted Debit" .
+
+oracle:AE_LINE_ACCOUNTED_CR a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Accounted Credit" .
+
+oracle:AE_LINE_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Line Description" .
+
+oracle:AE_LINE_PARTY_ID a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Party ID" ;
+    rdfs:comment "Customer/Supplier ID from TCA" .
+
+oracle:AE_LINE_PARTY_TYPE_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_AE_LINES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Party Type Code" ;
+    rdfs:comment "C=Customer, S=Supplier" .
+
+# ---------- XLA_EVENTS ----------
+oracle:XLA_EVENTS a owl:Class ;
+    rdfs:label "Subledger Event" ;
+    rdfs:comment "Business events triggering accounting (e.g., invoice, payment)" .
+
+oracle:EVENT_ID_PK a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_EVENTS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Event ID" .
+
+oracle:EVENT_TYPE_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_EVENTS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Event Type Code" ;
+    rdfs:comment "INVOICE_VALIDATED, PAYMENT_CLEARED, etc." .
+
+oracle:EVENT_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_EVENTS ;
+    rdfs:range xsd:date ;
+    rdfs:label "Event Date" .
+
+oracle:EVENT_STATUS_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_EVENTS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Event Status Code" ;
+    rdfs:comment "U=Unprocessed, P=Processed" .
+
+oracle:EVENT_NUMBER a owl:DatatypeProperty ;
+    rdfs:domain oracle:XLA_EVENTS ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Event Number" ;
+    rdfs:comment "Sequential event number" .
+
+# ============================================================================
+# CURRENCIES AND EXCHANGE RATES
+# ============================================================================
+
+# ---------- GL_DAILY_RATES ----------
+oracle:GL_DAILY_RATES a owl:Class ;
+    rdfs:label "Daily Exchange Rate" ;
+    rdfs:comment "Currency conversion rates by date" .
+
+oracle:RATE_FROM_CURRENCY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_DAILY_RATES ;
+    rdfs:range xsd:string ;
+    rdfs:label "From Currency" ;
+    rdfs:comment "Source currency code (ISO 4217)" .
+
+oracle:RATE_TO_CURRENCY a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_DAILY_RATES ;
+    rdfs:range xsd:string ;
+    rdfs:label "To Currency" ;
+    rdfs:comment "Target currency code (ISO 4217)" .
+
+oracle:RATE_CONVERSION_DATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_DAILY_RATES ;
+    rdfs:range xsd:date ;
+    rdfs:label "Conversion Date" .
+
+oracle:RATE_CONVERSION_TYPE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_DAILY_RATES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Conversion Type" ;
+    rdfs:comment "Corporate, Spot, User, etc." .
+
+oracle:RATE_CONVERSION_RATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_DAILY_RATES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Conversion Rate" ;
+    rdfs:comment "Exchange rate (1 FROM_CURRENCY = X TO_CURRENCY)" .
+
+oracle:RATE_INVERSE_CONVERSION_RATE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_DAILY_RATES ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "Inverse Conversion Rate" .
+
+# ============================================================================
+# REFERENCE AND SETUP TABLES
+# ============================================================================
+
+# ---------- GL_JE_SOURCES ----------
+oracle:GL_JE_SOURCES a owl:Class ;
+    rdfs:label "Journal Entry Source" ;
+    rdfs:comment "Valid journal sources (Manual, Payables, Receivables, etc.)" .
+
+oracle:JE_SOURCE_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_SOURCES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Source Name" ;
+    rdfs:comment "Source system name (e.g., Payables, Receivables)" .
+
+oracle:JE_SOURCE_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_SOURCES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Source Description" .
+
+oracle:JE_SOURCE_USER_JE_SOURCE_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_SOURCES ;
+    rdfs:range xsd:string ;
+    rdfs:label "User-Visible Source Name" .
+
+# ---------- GL_JE_CATEGORIES ----------
+oracle:GL_JE_CATEGORIES a owl:Class ;
+    rdfs:label "Journal Entry Category" ;
+    rdfs:comment "Valid journal categories (Adjustment, Accrual, etc.)" .
+
+oracle:JE_CATEGORY_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_CATEGORIES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Category Name" .
+
+oracle:JE_CATEGORY_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_CATEGORIES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Category Description" .
+
+oracle:JE_CATEGORY_USER_JE_CATEGORY_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_JE_CATEGORIES ;
+    rdfs:range xsd:string ;
+    rdfs:label "User-Visible Category Name" .
+
+# ---------- FND_ID_FLEX_STRUCTURES ----------
+oracle:FND_ID_FLEX_STRUCTURES a owl:Class ;
+    rdfs:label "Key Flexfield Structure" ;
+    rdfs:comment "Chart of Accounts structure definition" .
+
+oracle:FLEX_ID_FLEX_NUM a owl:DatatypeProperty ;
+    rdfs:domain oracle:FND_ID_FLEX_STRUCTURES ;
+    rdfs:range xsd:integer ;
+    rdfs:label "Flexfield Structure Number" .
+
+oracle:FLEX_ID_FLEX_STRUCTURE_NAME a owl:DatatypeProperty ;
+    rdfs:domain oracle:FND_ID_FLEX_STRUCTURES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Structure Name" ;
+    rdfs:comment "Chart of Accounts name" .
+
+oracle:FLEX_ID_FLEX_STRUCTURE_CODE a owl:DatatypeProperty ;
+    rdfs:domain oracle:FND_ID_FLEX_STRUCTURES ;
+    rdfs:range xsd:string ;
+    rdfs:label "Structure Code" .
+
+# ---------- GL_PERIOD_SETS ----------
+oracle:GL_PERIOD_SETS a owl:Class ;
+    rdfs:label "Period Set (Calendar)" ;
+    rdfs:comment "Accounting calendar definitions" .
+
+oracle:PERIOD_SET_NAME_PK a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_SETS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Set Name" .
+
+oracle:PERIOD_SET_DESCRIPTION a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_SETS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Set Description" .
+
+oracle:PERIOD_SET_PERIOD_TYPE a owl:DatatypeProperty ;
+    rdfs:domain oracle:GL_PERIOD_SETS ;
+    rdfs:range xsd:string ;
+    rdfs:label "Period Type" ;
+    rdfs:comment "Month, Quarter, Year, 4-4-5, etc." .
+
+# ============================================================================
+# OBJECT PROPERTIES (Relationships)
+# ============================================================================
+
+oracle:belongsToLedger a owl:ObjectProperty ;
+    rdfs:label "belongs to ledger" ;
+    rdfs:comment "Links entities to their parent ledger" .
+
+oracle:belongsToBatch a owl:ObjectProperty ;
+    rdfs:label "belongs to batch" ;
+    rdfs:comment "Links journals to their batch" .
+
+oracle:hasAccountCombination a owl:ObjectProperty ;
+    rdfs:label "has account combination" ;
+    rdfs:comment "Links to chart of accounts combination" .
+
+oracle:hasEvent a owl:ObjectProperty ;
+    rdfs:label "has event" ;
+    rdfs:comment "Links subledger accounting to business event" .

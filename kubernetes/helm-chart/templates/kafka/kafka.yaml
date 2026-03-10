@@ -1,0 +1,131 @@
+{{ if .Values.openshiftMode.enabled }}
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: 'graphica-kafka-anyuid'
+  namespace: {{ .Release.namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+subjects:
+  - kind: ServiceAccount
+    name: graphica-kafka
+    namespace: {{ .Release.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: 'system:openshift:scc:anyuid'
+{{end}}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  labels:
+    strimzi.io/cluster: graphica
+  name: kafka
+  namespace: {{ .Release.namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-4"
+spec:
+  replicas: {{ .Values.kafka.replicas }}
+  roles:
+    - controller
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - class: {{ .Values.global.storageClassName }}
+        deleteClaim: false
+        id: 0
+        kraftMetadata: shared
+        size: {{ .Values.kafka.storage.size }}
+        type: persistent-claim
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  annotations:
+    strimzi.io/kraft: enabled
+    strimzi.io/node-pools: enabled
+  name: graphica
+  namespace: {{ .Release.namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-4"
+spec:
+  entityOperator:
+    userOperator: {}
+  kafka:
+    config:
+      auto.create.topics.enable: false
+      controller.quorum.fetch.timeout.ms: 4000
+      default.replication.factor: {{if .Values.kafka.topicReplication.enabled}}3{{else}}1{{end}}
+      message.max.bytes: 20971520
+      min.insync.replicas: {{if .Values.kafka.topicReplication.enabled}}2{{else}}1{{end}}
+      offsets.topic.replication.factor: {{if .Values.kafka.topicReplication.enabled}}3{{else}}1{{end}}
+      transaction.state.log.min.isr: {{if .Values.kafka.topicReplication.enabled}}2{{else}}1{{end}}
+      transaction.state.log.replication.factor: {{if .Values.kafka.topicReplication.enabled}}3{{else}}1{{end}}
+    # authorization:
+    #   type: simple
+    jvmOptions:
+      '-Xms': 8192m
+      '-Xmx': 8192m
+    listeners:
+      - name: plain
+        port: 9092
+        tls: false
+        type: internal
+      - name: tls
+        port: 9093
+        tls: true
+        type: internal
+    resources:
+      limits:
+        cpu: 8
+        memory: 24Gi
+      requests:
+        cpu: 4
+        memory: 8Gi
+    template:
+      pod:
+        securityContext:
+          fsGroup: 1001
+          runAsUser: 1001
+    version: {{ .Values.kafka.version }}
+---
+kind: KafkaTopic
+apiVersion: kafka.strimzi.io/v1beta2
+metadata:
+  name: kafkasql-journal
+  labels:
+    strimzi.io/cluster: graphica
+  namespace: {{ .Release.namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-3"
+spec:
+  partitions: {{if .Values.kafka.topicReplication.enabled}}3{{else}}1{{end}}
+  replicas: {{if .Values.kafka.topicReplication.enabled}}3{{else}}1{{end}}
+  config:
+    cleanup.policy: compact
+---
+kind: ApicurioRegistry3
+apiVersion: registry.apicur.io/v1
+metadata:
+  name: apicurio
+  namespace: {{ .Release.namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-2"
+spec:
+  app:
+    ingress:
+      enabled: false
+    storage:
+      kafkasql:
+        bootstrapServers: 'graphica-kafka-bootstrap.graphica.svc:9092'
+      type: 'kafkasql'
+    podTemplateSpec:
+      spec:
+        serviceAccountName: graphica-kafka

@@ -1,0 +1,607 @@
+//! Checkpoint Manager - Coordinates state persistence between coordinator and shard
+//!
+//! Manages checkpoint creation, storage to shard, and recovery operations.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::{debug, error, info, warn};
+
+use crate::workflows::domain::{ExecutionStatus, WorkflowExecution};
+use crate::workflows::storage::rocksdb_store::{
+    ExecutionCheckpoint, ExecutionEvent, EventType, RocksDbExecutionStore,
+};
+
+/// Checkpoint manager configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckpointConfig {
+    /// Interval between automatic checkpoints (seconds)
+    pub interval_seconds: u64,
+
+    /// Number of steps between checkpoints (for batch jobs)
+    pub step_interval: u64,
+
+    /// Maximum checkpoint size before compression (bytes)
+    pub max_size_bytes: usize,
+
+    /// Compression algorithm (lz4, zstd, none)
+    pub compression: CompressionType,
+
+    /// Maximum checkpoints to retain per execution
+    pub max_checkpoints_per_execution: usize,
+
+    /// Enable async checkpointing to shard
+    pub async_to_shard: bool,
+
+    /// Batch size for shard writes
+    pub shard_batch_size: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: 30,
+            step_interval: 10,
+            max_size_bytes: 10 * 1024 * 1024, // 10MB
+            compression: CompressionType::Lz4,
+            max_checkpoints_per_execution: 10,
+            async_to_shard: true,
+            shard_batch_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionType {
+    None,
+    Lz4,
+    Zstd,
+}
+
+/// Manages checkpointing for workflow executions
+pub struct CheckpointManager {
+    config: CheckpointConfig,
+    rocksdb_store: Arc<RocksDbExecutionStore>,
+    shard_client: Arc<dyn ShardClient>,
+    active_executions: Arc<RwLock<HashMap<String, CheckpointState>>>,
+    metrics: Arc<CheckpointMetrics>,
+}
+
+/// Per-execution checkpoint state
+struct CheckpointState {
+    execution_id: String,
+    last_checkpoint: DateTime<Utc>,
+    last_step_number: u64,
+    checkpoint_sequence: u64,
+    pending_shard_write: bool,
+}
+
+/// Metrics for monitoring
+struct CheckpointMetrics {
+    checkpoints_created: prometheus::IntCounter,
+    checkpoints_failed: prometheus::IntCounter,
+    checkpoint_duration: prometheus::Histogram,
+    checkpoint_size_bytes: prometheus::Histogram,
+    shard_writes_pending: prometheus::IntGauge,
+}
+
+/// Trait for shard communication
+#[async_trait::async_trait]
+pub trait ShardClient: Send + Sync {
+    /// Store checkpoint to shard as RDF triples
+    async fn store_checkpoint(&self, checkpoint: &CheckpointRdf) -> Result<()>;
+
+    /// Query latest checkpoint from shard
+    async fn get_latest_checkpoint(&self, execution_id: &str) -> Result<Option<CheckpointRdf>>;
+
+    /// Query incomplete executions from shard
+    async fn query_incomplete_executions(&self) -> Result<Vec<String>>;
+
+    /// Archive completed execution to shard
+    async fn archive_execution(&self, execution: &WorkflowExecution) -> Result<()>;
+}
+
+/// Checkpoint in RDF format for shard storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRdf {
+    pub execution_id: String,
+    pub checkpoint_id: String,
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub status: String,
+    pub step_number: u64,
+    pub context_hash: String,
+    pub compressed_state: Vec<u8>,
+    pub metadata: HashMap<String, String>,
+}
+
+impl CheckpointManager {
+    /// Create a new checkpoint manager
+    pub fn new(
+        config: CheckpointConfig,
+        rocksdb_store: Arc<RocksDbExecutionStore>,
+        shard_client: Arc<dyn ShardClient>,
+    ) -> Self {
+        Self {
+            config,
+            rocksdb_store,
+            shard_client,
+            active_executions: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(CheckpointMetrics::default()),
+        }
+    }
+
+    /// Start background checkpoint worker
+    pub async fn start_background_worker(&self) -> Result<()> {
+        let manager = self.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(tokio::time::Duration::from_secs(
+                manager.config.interval_seconds,
+            ));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                if let Err(e) = manager.checkpoint_active_executions().await {
+                    error!("Background checkpoint failed: {}", e);
+                }
+            }
+        });
+
+        info!("Started checkpoint background worker");
+        Ok(())
+    }
+
+    /// Register execution for checkpointing
+    pub async fn register_execution(&self, execution_id: String) -> Result<()> {
+        let mut active = self.active_executions.write().await;
+
+        let state = CheckpointState {
+            execution_id: execution_id.clone(),
+            last_checkpoint: Utc::now(),
+            last_step_number: 0,
+            checkpoint_sequence: 0,
+            pending_shard_write: false,
+        };
+
+        active.insert(execution_id.clone(), state);
+        info!("Registered execution {} for checkpointing", execution_id);
+
+        Ok(())
+    }
+
+    /// Unregister execution (on completion)
+    pub async fn unregister_execution(&self, execution_id: &str) -> Result<()> {
+        let mut active = self.active_executions.write().await;
+        active.remove(execution_id);
+
+        info!("Unregistered execution {} from checkpointing", execution_id);
+        Ok(())
+    }
+
+    /// Create checkpoint for specific execution
+    pub async fn create_checkpoint(&self, execution_id: &str) -> Result<()> {
+        let timer = self.metrics.checkpoint_duration.start_timer();
+
+        // Get execution from RocksDB
+        let execution = self
+            .rocksdb_store
+            .get(execution_id)?
+            .ok_or_else(|| anyhow::anyhow!("Execution {} not found", execution_id))?;
+
+        // Update checkpoint state
+        let mut active = self.active_executions.write().await;
+        let state = active
+            .get_mut(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution {} not registered", execution_id))?;
+
+        state.checkpoint_sequence += 1;
+        state.last_checkpoint = Utc::now();
+        state.last_step_number = execution.step_results.len() as u64;
+
+        // Create checkpoint
+        let checkpoint = self.build_checkpoint(&execution, state.checkpoint_sequence)?;
+
+        // Store to RocksDB
+        self.rocksdb_store.store_checkpoint(&checkpoint)?;
+
+        // Record event
+        let event = ExecutionEvent {
+            execution_id: execution_id.to_string(),
+            timestamp: Utc::now(),
+            event_type: EventType::CheckpointCreated {
+                sequence: state.checkpoint_sequence,
+            },
+            payload: vec![],
+        };
+        self.rocksdb_store.append_event(&event)?;
+
+        // Async write to shard if configured
+        if self.config.async_to_shard {
+            state.pending_shard_write = true;
+            let checkpoint_rdf = self.checkpoint_to_rdf(&checkpoint)?;
+            let shard_client = Arc::clone(&self.shard_client);
+
+            tokio::spawn(async move {
+                if let Err(e) = shard_client.store_checkpoint(&checkpoint_rdf).await {
+                    error!("Failed to write checkpoint to shard: {}", e);
+                }
+            });
+        }
+
+        self.metrics.checkpoints_created.inc();
+        self.metrics
+            .checkpoint_size_bytes
+            .observe(checkpoint.context_snapshot.len() as f64);
+        timer.stop_and_record();
+
+        info!(
+            "Created checkpoint {} for execution {}",
+            state.checkpoint_sequence, execution_id
+        );
+
+        Ok(())
+    }
+
+    /// Checkpoint all active executions
+    async fn checkpoint_active_executions(&self) -> Result<()> {
+        let active = self.active_executions.read().await;
+        let execution_ids: Vec<String> = active.keys().cloned().collect();
+        drop(active); // Release read lock
+
+        for execution_id in execution_ids {
+            // Check if checkpoint needed
+            if self.should_checkpoint(&execution_id).await? {
+                if let Err(e) = self.create_checkpoint(&execution_id).await {
+                    warn!("Failed to checkpoint {}: {}", execution_id, e);
+                    self.metrics.checkpoints_failed.inc();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if execution needs checkpoint
+    async fn should_checkpoint(&self, execution_id: &str) -> Result<bool> {
+        let active = self.active_executions.read().await;
+        let state = active
+            .get(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution {} not registered", execution_id))?;
+
+        // Time-based trigger
+        let elapsed = Utc::now() - state.last_checkpoint;
+        if elapsed > Duration::seconds(self.config.interval_seconds as i64) {
+            return Ok(true);
+        }
+
+        // Step-based trigger (check current step count)
+        if let Ok(Some(execution)) = self.rocksdb_store.get(execution_id) {
+            let current_steps = execution.step_results.len() as u64;
+            if current_steps - state.last_step_number >= self.config.step_interval {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Build checkpoint from execution
+    fn build_checkpoint(
+        &self,
+        execution: &WorkflowExecution,
+        sequence: u64,
+    ) -> Result<ExecutionCheckpoint> {
+        // Serialize execution state
+        let state_bytes = rmp_serde::to_vec(&execution.context)
+            .context("Failed to serialize execution context")?;
+
+        // Compress if needed
+        let compressed = self.compress_data(&state_bytes)?;
+
+        // Calculate checksum
+        let checksum = self.calculate_checksum(&compressed);
+
+        Ok(ExecutionCheckpoint {
+            execution_id: execution.execution_id.clone(),
+            sequence,
+            timestamp: Utc::now(),
+            step_number: execution.step_results.len() as u64,
+            status: execution.status,
+            context_snapshot: compressed,
+            step_results_count: execution.step_results.len(),
+            checksum,
+        })
+    }
+
+    /// Convert checkpoint to RDF format
+    fn checkpoint_to_rdf(&self, checkpoint: &ExecutionCheckpoint) -> Result<CheckpointRdf> {
+        Ok(CheckpointRdf {
+            execution_id: checkpoint.execution_id.clone(),
+            checkpoint_id: format!("checkpoint_{}", uuid::Uuid::new_v4()),
+            sequence: checkpoint.sequence,
+            timestamp: checkpoint.timestamp,
+            status: format!("{:?}", checkpoint.status),
+            step_number: checkpoint.step_number,
+            context_hash: checkpoint.checksum.clone(),
+            compressed_state: checkpoint.context_snapshot.clone(),
+            metadata: HashMap::new(),
+        })
+    }
+
+    /// Compress data based on configuration
+    fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match self.config.compression {
+            CompressionType::None => Ok(data.to_vec()),
+            CompressionType::Lz4 => {
+                lz4::block::compress(data, Some(lz4::block::CompressionMode::DEFAULT), true)
+                    .context("LZ4 compression failed")
+            }
+            CompressionType::Zstd => {
+                zstd::encode_all(data, 3).context("Zstd compression failed")
+            }
+        }
+    }
+
+    /// Calculate SHA-256 checksum
+    fn calculate_checksum(&self, data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Recover executions after coordinator restart
+    pub async fn recover_executions(&self) -> Result<RecoveryReport> {
+        info!("Starting execution recovery");
+        let start_time = Utc::now();
+
+        let mut report = RecoveryReport {
+            total_executions: 0,
+            recovered: 0,
+            failed: 0,
+            stale: 0,
+            errors: Vec::new(),
+        };
+
+        // Get incomplete executions from RocksDB
+        let local_incomplete = self.rocksdb_store.get_incomplete_executions()?;
+        report.total_executions = local_incomplete.len();
+
+        // Get incomplete executions from shard
+        let shard_incomplete = self.shard_client.query_incomplete_executions().await?;
+
+        // Merge and deduplicate
+        let mut all_incomplete: HashMap<String, WorkflowExecution> = local_incomplete
+            .into_iter()
+            .map(|e| (e.execution_id.clone(), e))
+            .collect();
+
+        // For shard-only executions, try to recover from checkpoint
+        for execution_id in shard_incomplete {
+            if !all_incomplete.contains_key(&execution_id) {
+                if let Some(checkpoint) = self
+                    .shard_client
+                    .get_latest_checkpoint(&execution_id)
+                    .await?
+                {
+                    // Restore from checkpoint
+                    if let Ok(execution) = self.restore_from_checkpoint(&checkpoint).await {
+                        all_incomplete.insert(execution_id.clone(), execution);
+                        info!("Restored {} from shard checkpoint", execution_id);
+                    }
+                }
+            }
+        }
+
+        // Process each incomplete execution
+        for (execution_id, mut execution) in all_incomplete {
+            // Check for staleness
+            if self.is_stale(&execution) {
+                warn!("Execution {} is stale", execution_id);
+                execution.status = ExecutionStatus::Failed;
+                execution.error = Some("Execution stale after coordinator restart".to_string());
+                self.rocksdb_store.save(&execution)?;
+                report.stale += 1;
+                continue;
+            }
+
+            // Get latest checkpoint
+            if let Some(checkpoint) = self.rocksdb_store.get_latest_checkpoint(&execution_id)? {
+                // Replay events since checkpoint
+                let events = self
+                    .rocksdb_store
+                    .replay_events(&execution_id, checkpoint.timestamp)?;
+
+                if !events.is_empty() {
+                    info!(
+                        "Replaying {} events for {} since checkpoint",
+                        events.len(),
+                        execution_id
+                    );
+                    // Apply events to execution state
+                    // (Implementation depends on event processing logic)
+                }
+            }
+
+            // Re-register for checkpointing
+            self.register_execution(execution_id.clone()).await?;
+            report.recovered += 1;
+        }
+
+        let duration = (Utc::now() - start_time).num_seconds();
+        info!(
+            "Recovery completed in {}s: {} recovered, {} stale, {} failed",
+            duration, report.recovered, report.stale, report.failed
+        );
+
+        Ok(report)
+    }
+
+    /// Check if execution is stale
+    fn is_stale(&self, execution: &WorkflowExecution) -> bool {
+        if execution.status != ExecutionStatus::Running {
+            return false;
+        }
+
+        // Check last update time
+        let elapsed = Utc::now() - execution.updated_at;
+        elapsed > Duration::seconds(60) // 60 second threshold
+    }
+
+    /// Restore execution from checkpoint
+    async fn restore_from_checkpoint(
+        &self,
+        checkpoint: &CheckpointRdf,
+    ) -> Result<WorkflowExecution> {
+        // Decompress state
+        let decompressed = self.decompress_data(&checkpoint.compressed_state)?;
+
+        // Deserialize context
+        let context: serde_json::Value = rmp_serde::from_slice(&decompressed)
+            .context("Failed to deserialize checkpoint context")?;
+
+        // Reconstruct execution (partial - would need full state)
+        let execution = WorkflowExecution {
+            execution_id: checkpoint.execution_id.clone(),
+            workflow_id: String::new(), // Would need to query from shard
+            workflow_name: String::new(),
+            status: ExecutionStatus::Running, // Parse from checkpoint
+            context,
+            step_results: Vec::new(), // Would need to restore
+            logs: Vec::new(),
+            started_at: checkpoint.timestamp,
+            updated_at: Utc::now(),
+            completed_at: None,
+            triggered_by: None,
+            output: None,
+            error: None,
+        };
+
+        Ok(execution)
+    }
+
+    /// Decompress data
+    fn decompress_data(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match self.config.compression {
+            CompressionType::None => Ok(data.to_vec()),
+            CompressionType::Lz4 => {
+                lz4::block::decompress(data, None).context("LZ4 decompression failed")
+            }
+            CompressionType::Zstd => {
+                zstd::decode_all(data).context("Zstd decompression failed")
+            }
+        }
+    }
+
+    /// Archive completed execution to shard
+    pub async fn archive_execution(&self, execution_id: &str) -> Result<()> {
+        // Get final execution state
+        let execution = self
+            .rocksdb_store
+            .get(execution_id)?
+            .ok_or_else(|| anyhow::anyhow!("Execution {} not found", execution_id))?;
+
+        // Archive to shard
+        self.shard_client.archive_execution(&execution).await?;
+
+        // Clean up local storage after successful archive
+        // Keep for 24 hours for recent access
+        info!("Archived execution {} to shard", execution_id);
+
+        Ok(())
+    }
+}
+
+impl Clone for CheckpointManager {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            rocksdb_store: Arc::clone(&self.rocksdb_store),
+            shard_client: Arc::clone(&self.shard_client),
+            active_executions: Arc::clone(&self.active_executions),
+            metrics: Arc::clone(&self.metrics),
+        }
+    }
+}
+
+impl Default for CheckpointMetrics {
+    fn default() -> Self {
+        Self {
+            checkpoints_created: prometheus::register_int_counter!(
+                "checkpoint_created_total",
+                "Total checkpoints created"
+            )
+            .unwrap(),
+            checkpoints_failed: prometheus::register_int_counter!(
+                "checkpoint_failed_total",
+                "Total checkpoint failures"
+            )
+            .unwrap(),
+            checkpoint_duration: prometheus::register_histogram!(
+                "checkpoint_duration_seconds",
+                "Checkpoint creation duration"
+            )
+            .unwrap(),
+            checkpoint_size_bytes: prometheus::register_histogram!(
+                "checkpoint_size_bytes",
+                "Checkpoint size in bytes"
+            )
+            .unwrap(),
+            shard_writes_pending: prometheus::register_int_gauge!(
+                "shard_writes_pending",
+                "Pending checkpoint writes to shard"
+            )
+            .unwrap(),
+        }
+    }
+}
+
+/// Recovery report
+#[derive(Debug)]
+pub struct RecoveryReport {
+    pub total_executions: usize,
+    pub recovered: usize,
+    pub failed: usize,
+    pub stale: usize,
+    pub errors: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mock shard client for testing
+    struct MockShardClient;
+
+    #[async_trait::async_trait]
+    impl ShardClient for MockShardClient {
+        async fn store_checkpoint(&self, _checkpoint: &CheckpointRdf) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_latest_checkpoint(&self, _execution_id: &str) -> Result<Option<CheckpointRdf>> {
+            Ok(None)
+        }
+
+        async fn query_incomplete_executions(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn archive_execution(&self, _execution: &WorkflowExecution) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_creation() {
+        // Test would require proper setup with RocksDB
+        // Placeholder for actual tests
+    }
+}

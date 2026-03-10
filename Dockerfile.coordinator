@@ -1,0 +1,64 @@
+# Dockerfile for ARCXA Coordinator
+# Multi-stage build for optimal image size
+
+# Stage 1: Build
+FROM rust:1.75-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    unixodbc-dev \
+    protobuf-compiler \
+    cmake \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace files (proto files needed for graphica_core build.rs)
+COPY Cargo.toml ./Cargo.toml
+COPY proto ./proto
+COPY arcxa-core ./arcxa-core
+COPY arcxa-coordinator ./arcxa-coordinator
+
+# Build coordinator (release mode)
+WORKDIR /build/arcxa-coordinator
+RUN cargo build --release --bin arcxa-coordinator
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    unixodbc \
+    libaio1 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory and user
+RUN useradd -m -u 1000 graphica && \
+    mkdir -p /app/data && \
+    chown -R graphica:graphica /app
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /build/arcxa-coordinator/target/release/arcxa-coordinator /app/arcxa-coordinator
+
+# Copy configuration files if they exist
+COPY --chown=graphica:graphica arcxa-coordinator/config* /app/config/ 2>/dev/null || true
+
+USER graphica
+
+# Expose ports
+EXPOSE 8080 9090 9091
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Run coordinator
+ENTRYPOINT ["/app/arcxa-coordinator"]

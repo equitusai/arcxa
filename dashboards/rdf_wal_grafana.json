@@ -1,0 +1,436 @@
+{
+  "dashboard": {
+    "title": "RDF WAL - Durability & Performance",
+    "tags": ["rdf", "wal", "durability", "graphica"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "10s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "WAL Write Rate",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(test_rdf_wal_triples_written_total[5m])",
+            "legendFormat": "Triples/sec",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(test_rdf_wal_batches_written_total[5m])",
+            "legendFormat": "Batches/sec",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Operations/sec"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 2,
+        "title": "WAL Fsync Latency",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(test_rdf_wal_fsync_duration_seconds_bucket[5m]))",
+            "legendFormat": "p99",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(test_rdf_wal_fsync_duration_seconds_bucket[5m]))",
+            "legendFormat": "p95",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(test_rdf_wal_fsync_duration_seconds_bucket[5m]))",
+            "legendFormat": "p50",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [0.1], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "name": "High Fsync Latency",
+          "notifications": []
+        },
+        "thresholds": [
+          {"value": 0.1, "colorMode": "critical", "op": "gt", "fill": true, "line": true}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "WAL Bytes Written",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(test_rdf_wal_bytes_written_total[5m])",
+            "legendFormat": "Write Rate",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "Bps", "label": "Bytes/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 4,
+        "title": "WAL Segment Rotations",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_segment_rotations_total",
+            "legendFormat": "Total Rotations",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(test_rdf_wal_segment_rotations_total[5m])",
+            "legendFormat": "Rotations/sec",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Rotations"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 5,
+        "title": "WAL Recovery Metrics",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 16, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_last_recovery_duration_seconds",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": {
+            "calcs": ["lastNotNull"],
+            "fields": "",
+            "values": false
+          },
+          "textMode": "auto"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 5, "color": "yellow"},
+                {"value": 30, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Triples Recovered (Last Recovery)",
+        "type": "stat",
+        "gridPos": {"x": 6, "y": 16, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_last_recovery_triples_total",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto",
+          "reduceOptions": {"calcs": ["lastNotNull"], "values": false}
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "color": {"mode": "palette-classic"}
+          }
+        }
+      },
+      {
+        "id": 7,
+        "title": "WAL Error Rate",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(test_rdf_wal_errors_total[5m])",
+            "legendFormat": "WAL Errors/sec",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(test_rdf_wal_shard_errors_total[5m])",
+            "legendFormat": "Shard Errors/sec",
+            "refId": "B"
+          },
+          {
+            "expr": "rate(test_rdf_wal_recovery_failures_total[5m])",
+            "legendFormat": "Recovery Failures/sec",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Errors/sec"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [0.1], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "name": "WAL Errors Detected",
+          "notifications": []
+        },
+        "thresholds": [
+          {"value": 0, "colorMode": "custom", "op": "gt", "fill": false, "line": true, "yaxis": "left"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "WAL Storage Size",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_storage_bytes",
+            "legendFormat": "Total WAL Size",
+            "refId": "A"
+          },
+          {
+            "expr": "test_rdf_wal_active_segment_bytes",
+            "legendFormat": "Active Segment Size",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Storage"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [10737418240], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "name": "WAL Storage High",
+          "notifications": [],
+          "message": "WAL storage exceeds 10GB - consider checkpoint/compaction"
+        },
+        "thresholds": [
+          {"value": 10737418240, "colorMode": "critical", "op": "gt", "fill": true, "line": true}
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Current LSN",
+        "type": "stat",
+        "gridPos": {"x": 12, "y": 24, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_current_lsn",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto",
+          "reduceOptions": {"calcs": ["lastNotNull"], "values": false}
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "blue"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "title": "Active Segments",
+        "type": "stat",
+        "gridPos": {"x": 18, "y": 24, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_active_segments",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto",
+          "reduceOptions": {"calcs": ["lastNotNull"], "values": false}
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 3, "color": "yellow"},
+                {"value": 5, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "title": "WAL Write Batch Size",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(test_rdf_wal_batch_size_bucket[5m]))",
+            "legendFormat": "p99",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(test_rdf_wal_batch_size_bucket[5m]))",
+            "legendFormat": "p50",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Triples per Batch"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 12,
+        "title": "Compression Ratio",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_bytes_written_total / test_rdf_wal_bytes_before_compression_total",
+            "legendFormat": "Compression Ratio",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit", "label": "Ratio"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 13,
+        "title": "Recovery Status",
+        "type": "table",
+        "gridPos": {"x": 0, "y": 40, "w": 24, "h": 6},
+        "targets": [
+          {
+            "expr": "test_rdf_wal_last_recovery_timestamp_seconds",
+            "legendFormat": "Last Recovery Time",
+            "refId": "A",
+            "format": "table",
+            "instant": true
+          },
+          {
+            "expr": "test_rdf_wal_last_recovery_duration_seconds",
+            "legendFormat": "Recovery Duration",
+            "refId": "B",
+            "format": "table",
+            "instant": true
+          },
+          {
+            "expr": "test_rdf_wal_last_recovery_triples_total",
+            "legendFormat": "Triples Recovered",
+            "refId": "C",
+            "format": "table",
+            "instant": true
+          },
+          {
+            "expr": "test_rdf_wal_recovery_failures_total",
+            "legendFormat": "Total Failures",
+            "refId": "D",
+            "format": "table",
+            "instant": true
+          }
+        ],
+        "transformations": [
+          {
+            "id": "merge",
+            "options": {}
+          }
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "coordinator",
+          "type": "query",
+          "datasource": "Prometheus",
+          "query": "label_values(test_rdf_wal_triples_written_total, instance)",
+          "refresh": 1,
+          "includeAll": true,
+          "multi": true
+        }
+      ]
+    },
+    "annotations": {
+      "list": [
+        {
+          "datasource": "Prometheus",
+          "enable": true,
+          "expr": "changes(test_rdf_wal_last_recovery_timestamp_seconds[5m]) > 0",
+          "iconColor": "rgba(255, 96, 96, 1)",
+          "name": "Recovery Events",
+          "tagKeys": "recovery",
+          "textFormat": "WAL Recovery"
+        }
+      ]
+    }
+  }
+}

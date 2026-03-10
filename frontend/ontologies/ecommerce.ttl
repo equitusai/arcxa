@@ -1,0 +1,777 @@
+@prefix dc: <http://purl.org/dc/elements/1.1/> .
+@prefix ecom: <http://equitus.ai/ontology/ecommerce#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<http://equitus.ai/ontology/ecommerce> a owl:Ontology ;
+    dc:creator "Equitus.ai" ;
+    dc:description "Comprehensive ecommerce ontology covering products, customers, orders, addresses, and demographics" ;
+    dc:title "Equitus.ai Ecommerce Ontology" ;
+    owl:versionInfo "1.1" .
+
+ecom:BankTransfer a owl:Class ;
+    rdfs:label "Bank Transfer" ;
+    rdfs:subClassOf ecom:PaymentMethod .
+
+ecom:Cancelled a ecom:OrderStatus ;
+    rdfs:label "Cancelled" .
+
+ecom:CreditCard a owl:Class ;
+    rdfs:label "Credit Card" ;
+    rdfs:subClassOf ecom:PaymentMethod .
+
+ecom:Delivered a ecom:OrderStatus ;
+    rdfs:label "Delivered" .
+
+ecom:DigitalProduct a owl:Class ;
+    rdfs:label "Digital Product" ;
+    rdfs:comment "A digital product delivered electronically" ;
+    rdfs:subClassOf ecom:Product .
+
+ecom:PayPal a owl:Class ;
+    rdfs:label "PayPal" ;
+    rdfs:subClassOf ecom:PaymentMethod .
+
+ecom:Pending a ecom:OrderStatus ;
+    rdfs:label "Pending" .
+
+ecom:Processing a ecom:OrderStatus ;
+    rdfs:label "Processing" .
+
+ecom:Returned a ecom:OrderStatus ;
+    rdfs:label "Returned" .
+
+ecom:RootCategory a owl:Class ;
+    rdfs:label "Root Category" ;
+    rdfs:comment "Top-level category with no parent" ;
+    rdfs:subClassOf ecom:Category .
+
+ecom:Service a owl:Class ;
+    rdfs:label "Service" ;
+    rdfs:comment "A service offering rather than a physical or digital good" ;
+    rdfs:subClassOf ecom:Product .
+
+ecom:Shipped a ecom:OrderStatus ;
+    rdfs:label "Shipped" .
+
+ecom:addressLine2 a owl:DatatypeProperty ;
+    rdfs:label "address line 2" ;
+    rdfs:domain ecom:Address ;
+    rdfs:range xsd:string .
+
+ecom:ageGroupName a owl:DatatypeProperty ;
+    rdfs:label "age group name" ;
+    rdfs:domain ecom:AgeGroup ;
+    rdfs:range xsd:string .
+
+ecom:amount a owl:DatatypeProperty ;
+    rdfs:label "amount" ;
+    rdfs:domain ecom:Price ;
+    rdfs:range xsd:decimal .
+
+ecom:belongsToCategory a owl:ObjectProperty ;
+    rdfs:label "belongs to category" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Category .
+
+ecom:belongsToSegment a owl:ObjectProperty ;
+    rdfs:label "belongs to segment" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:CustomerSegment .
+
+ecom:brandName a owl:DatatypeProperty ;
+    rdfs:label "brand name" ;
+    rdfs:domain ecom:Brand ;
+    rdfs:range xsd:string .
+
+ecom:carrierName a owl:DatatypeProperty ;
+    rdfs:label "carrier name" ;
+    rdfs:domain ecom:Carrier ;
+    rdfs:range xsd:string .
+
+ecom:categoryName a owl:DatatypeProperty ;
+    rdfs:label "category name" ;
+    rdfs:domain ecom:Category ;
+    rdfs:range xsd:string .
+
+ecom:cityName a owl:DatatypeProperty ;
+    rdfs:label "city name" ;
+    rdfs:domain ecom:City ;
+    rdfs:range xsd:string .
+
+ecom:companyName a owl:DatatypeProperty ;
+    rdfs:label "company name" ;
+    rdfs:domain ecom:BusinessCustomer ;
+    rdfs:range xsd:string .
+
+ecom:containsProduct a owl:ObjectProperty ;
+    rdfs:label "contains product" ;
+    rdfs:domain ecom:ProductBundle ;
+    rdfs:range ecom:Product .
+
+ecom:countryCode a owl:DatatypeProperty ;
+    rdfs:label "country code" ;
+    rdfs:domain ecom:Country ;
+    rdfs:range xsd:string .
+
+ecom:countryName a owl:DatatypeProperty ;
+    rdfs:label "country name" ;
+    rdfs:domain ecom:Country ;
+    rdfs:range xsd:string .
+
+ecom:currencyCode a owl:DatatypeProperty ;
+    rdfs:label "currency code" ;
+    rdfs:domain ecom:Currency ;
+    rdfs:range xsd:string .
+
+ecom:customerId a owl:DatatypeProperty ;
+    rdfs:label "customer ID" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range xsd:string .
+
+ecom:dateOfBirth a owl:DatatypeProperty ;
+    rdfs:label "date of birth" ;
+    rdfs:domain ecom:Demographics ;
+    rdfs:range xsd:date .
+
+ecom:deliveredBy a owl:ObjectProperty ;
+    rdfs:label "delivered by" ;
+    rdfs:domain ecom:Shipment ;
+    rdfs:range ecom:Carrier .
+
+ecom:dimensions a owl:DatatypeProperty ;
+    rdfs:label "dimensions" ;
+    rdfs:domain ecom:PhysicalProduct ;
+    rdfs:range xsd:string .
+
+ecom:discountAmount a owl:DatatypeProperty ;
+    rdfs:label "discount amount" ;
+    rdfs:domain ecom:Discount ;
+    rdfs:range xsd:decimal .
+
+ecom:discountPercentage a owl:DatatypeProperty ;
+    rdfs:label "discount percentage" ;
+    rdfs:domain ecom:Discount ;
+    rdfs:range xsd:decimal .
+
+ecom:educationLevelName a owl:DatatypeProperty ;
+    rdfs:label "education level name" ;
+    rdfs:domain ecom:EducationLevel ;
+    rdfs:range xsd:string .
+
+ecom:email a owl:DatatypeProperty ;
+    rdfs:label "email" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range xsd:string .
+
+ecom:endDate a owl:DatatypeProperty ;
+    rdfs:label "end date" ;
+    rdfs:domain ecom:Promotion ;
+    rdfs:range xsd:dateTime .
+
+ecom:estimatedDeliveryDate a owl:DatatypeProperty ;
+    rdfs:label "estimated delivery date" ;
+    rdfs:domain ecom:Shipment ;
+    rdfs:range xsd:dateTime .
+
+ecom:firstName a owl:DatatypeProperty ;
+    rdfs:label "first name" ;
+    rdfs:domain ecom:IndividualCustomer ;
+    rdfs:range xsd:string .
+
+ecom:genderName a owl:DatatypeProperty ;
+    rdfs:label "gender name" ;
+    rdfs:domain ecom:Gender ;
+    rdfs:range xsd:string .
+
+ecom:hasAccount a owl:ObjectProperty ;
+    rdfs:label "has account" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:CustomerAccount .
+
+ecom:hasAgeGroup a owl:ObjectProperty ;
+    rdfs:label "has age group" ;
+    rdfs:domain ecom:Demographics ;
+    rdfs:range ecom:AgeGroup .
+
+ecom:hasBillingAddress a owl:ObjectProperty ;
+    rdfs:label "has billing address" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:BillingAddress .
+
+ecom:hasBrand a owl:ObjectProperty ;
+    rdfs:label "has brand" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Brand .
+
+ecom:hasCurrency a owl:ObjectProperty ;
+    rdfs:label "has currency" ;
+    rdfs:domain ecom:Price ;
+    rdfs:range ecom:Currency .
+
+ecom:hasDemographics a owl:ObjectProperty ;
+    rdfs:label "has demographics" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:Demographics .
+
+ecom:hasDiscount a owl:ObjectProperty ;
+    rdfs:label "has discount" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Discount .
+
+ecom:hasEducationLevel a owl:ObjectProperty ;
+    rdfs:label "has education level" ;
+    rdfs:domain ecom:Demographics ;
+    rdfs:range ecom:EducationLevel .
+
+ecom:hasGender a owl:ObjectProperty ;
+    rdfs:label "has gender" ;
+    rdfs:domain ecom:Demographics ;
+    rdfs:range ecom:Gender .
+
+ecom:hasIncomeLevel a owl:ObjectProperty ;
+    rdfs:label "has income level" ;
+    rdfs:domain ecom:Demographics ;
+    rdfs:range ecom:IncomeLevel .
+
+ecom:hasInventory a owl:ObjectProperty ;
+    rdfs:label "has inventory" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Inventory .
+
+ecom:hasManufacturer a owl:ObjectProperty ;
+    rdfs:label "has manufacturer" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Manufacturer .
+
+ecom:hasOccupation a owl:ObjectProperty ;
+    rdfs:label "has occupation" ;
+    rdfs:domain ecom:Demographics ;
+    rdfs:range ecom:Occupation .
+
+ecom:hasOrderItem a owl:ObjectProperty ;
+    rdfs:label "has order item" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:OrderItem .
+
+ecom:hasParentCategory a owl:ObjectProperty ;
+    rdfs:label "has parent category" ;
+    rdfs:domain ecom:SubCategory ;
+    rdfs:range ecom:Category ;
+    owl:inverseOf ecom:hasSubCategory .
+
+ecom:hasPayment a owl:ObjectProperty ;
+    rdfs:label "has payment" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:Payment .
+
+ecom:hasPrice a owl:ObjectProperty ;
+    rdfs:label "has price" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Price .
+
+ecom:hasPromotion a owl:ObjectProperty ;
+    rdfs:label "has promotion" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:Promotion .
+
+ecom:hasRating a owl:ObjectProperty ;
+    rdfs:label "has rating" ;
+    rdfs:domain ecom:Review ;
+    rdfs:range ecom:Rating .
+
+ecom:hasReview a owl:ObjectProperty ;
+    rdfs:label "has review" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Review .
+
+ecom:hasShipment a owl:ObjectProperty ;
+    rdfs:label "has shipment" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:Shipment .
+
+ecom:hasShippingAddress a owl:ObjectProperty ;
+    rdfs:label "has shipping address" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:ShippingAddress .
+
+ecom:hasShoppingCart a owl:ObjectProperty ;
+    rdfs:label "has shopping cart" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:ShoppingCart .
+
+ecom:hasStatus a owl:ObjectProperty ;
+    rdfs:label "has status" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:OrderStatus .
+
+ecom:hasTag a owl:ObjectProperty ;
+    rdfs:label "has tag" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:Tag .
+
+ecom:hasTax a owl:ObjectProperty ;
+    rdfs:label "has tax" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:Tax .
+
+ecom:hasWishlist a owl:ObjectProperty ;
+    rdfs:label "has wishlist" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:Wishlist .
+
+ecom:incomeLevelName a owl:DatatypeProperty ;
+    rdfs:label "income level name" ;
+    rdfs:domain ecom:IncomeLevel ;
+    rdfs:range xsd:string .
+
+ecom:isAvailable a owl:DatatypeProperty ;
+    rdfs:label "is available" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:boolean .
+
+ecom:lastLoginDate a owl:DatatypeProperty ;
+    rdfs:label "last login date" ;
+    rdfs:domain ecom:CustomerAccount ;
+    rdfs:range xsd:dateTime .
+
+ecom:lastName a owl:DatatypeProperty ;
+    rdfs:label "last name" ;
+    rdfs:domain ecom:IndividualCustomer ;
+    rdfs:range xsd:string .
+
+ecom:locatedInCity a owl:ObjectProperty ;
+    rdfs:label "located in city" ;
+    rdfs:domain ecom:Address ;
+    rdfs:range ecom:City .
+
+ecom:locatedInCountry a owl:ObjectProperty ;
+    rdfs:label "located in country" ;
+    rdfs:domain ecom:Address ;
+    rdfs:range ecom:Country .
+
+ecom:locatedInRegion a owl:ObjectProperty ;
+    rdfs:label "located in region" ;
+    rdfs:domain ecom:Address ;
+    rdfs:range ecom:Region .
+
+ecom:maxRating a owl:DatatypeProperty ;
+    rdfs:label "max rating" ;
+    rdfs:domain ecom:Rating ;
+    rdfs:range xsd:decimal .
+
+ecom:occupationName a owl:DatatypeProperty ;
+    rdfs:label "occupation name" ;
+    rdfs:domain ecom:Occupation ;
+    rdfs:range xsd:string .
+
+ecom:orderDate a owl:DatatypeProperty ;
+    rdfs:label "order date" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range xsd:dateTime .
+
+ecom:orderId a owl:DatatypeProperty ;
+    rdfs:label "order ID" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range xsd:string .
+
+ecom:ordersProduct a owl:ObjectProperty ;
+    rdfs:label "orders product" ;
+    rdfs:domain ecom:OrderItem ;
+    rdfs:range ecom:Product .
+
+ecom:paidWithMethod a owl:ObjectProperty ;
+    rdfs:label "paid with method" ;
+    rdfs:domain ecom:Payment ;
+    rdfs:range ecom:PaymentMethod .
+
+ecom:paymentDate a owl:DatatypeProperty ;
+    rdfs:label "payment date" ;
+    rdfs:domain ecom:Payment ;
+    rdfs:range xsd:dateTime .
+
+ecom:phoneNumber a owl:DatatypeProperty ;
+    rdfs:label "phone number" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range xsd:string .
+
+ecom:placedOrder a owl:ObjectProperty ;
+    rdfs:label "placed order" ;
+    rdfs:domain ecom:Customer ;
+    rdfs:range ecom:Order ;
+    owl:inverseOf ecom:orderedBy .
+
+ecom:postalCode a owl:DatatypeProperty ;
+    rdfs:label "postal code" ;
+    rdfs:domain ecom:Address ;
+    rdfs:range xsd:string .
+
+ecom:productDescription a owl:DatatypeProperty ;
+    rdfs:label "product description" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:string .
+
+ecom:productId a owl:DatatypeProperty ;
+    rdfs:label "product ID" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:string .
+
+ecom:productName a owl:DatatypeProperty ;
+    rdfs:label "product name" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:string .
+
+ecom:promotionId a owl:DatatypeProperty ;
+    rdfs:label "promotion ID" ;
+    rdfs:domain ecom:Promotion ;
+    rdfs:range xsd:string .
+
+ecom:promotionName a owl:DatatypeProperty ;
+    rdfs:label "promotion name" ;
+    rdfs:domain ecom:Promotion ;
+    rdfs:range xsd:string .
+
+ecom:quantity a owl:DatatypeProperty ;
+    rdfs:label "quantity" ;
+    rdfs:domain ecom:OrderItem ;
+    rdfs:range xsd:integer .
+
+ecom:ratingValue a owl:DatatypeProperty ;
+    rdfs:label "rating value" ;
+    rdfs:domain ecom:Rating ;
+    rdfs:range xsd:decimal .
+
+ecom:regionName a owl:DatatypeProperty ;
+    rdfs:label "region name" ;
+    rdfs:domain ecom:Region ;
+    rdfs:range xsd:string .
+
+ecom:registrationDate a owl:DatatypeProperty ;
+    rdfs:label "registration date" ;
+    rdfs:domain ecom:CustomerAccount ;
+    rdfs:range xsd:dateTime .
+
+ecom:releaseDate a owl:DatatypeProperty ;
+    rdfs:label "release date" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:dateTime .
+
+ecom:reorderLevel a owl:DatatypeProperty ;
+    rdfs:label "reorder level" ;
+    rdfs:domain ecom:Inventory ;
+    rdfs:range xsd:integer .
+
+ecom:reviewDate a owl:DatatypeProperty ;
+    rdfs:label "review date" ;
+    rdfs:domain ecom:Review ;
+    rdfs:range xsd:dateTime .
+
+ecom:reviewText a owl:DatatypeProperty ;
+    rdfs:label "review text" ;
+    rdfs:domain ecom:Review ;
+    rdfs:range xsd:string .
+
+ecom:reviewTitle a owl:DatatypeProperty ;
+    rdfs:label "review title" ;
+    rdfs:domain ecom:Review ;
+    rdfs:range xsd:string .
+
+ecom:reviewedBy a owl:ObjectProperty ;
+    rdfs:label "reviewed by" ;
+    rdfs:domain ecom:Review ;
+    rdfs:range ecom:Customer .
+
+ecom:shipmentDate a owl:DatatypeProperty ;
+    rdfs:label "shipment date" ;
+    rdfs:domain ecom:Shipment ;
+    rdfs:range xsd:dateTime .
+
+ecom:shippedVia a owl:ObjectProperty ;
+    rdfs:label "shipped via" ;
+    rdfs:domain ecom:Shipment ;
+    rdfs:range ecom:ShippingMethod .
+
+ecom:sku a owl:DatatypeProperty ;
+    rdfs:label "SKU" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:string .
+
+ecom:startDate a owl:DatatypeProperty ;
+    rdfs:label "start date" ;
+    rdfs:domain ecom:Promotion ;
+    rdfs:range xsd:dateTime .
+
+ecom:statusName a owl:DatatypeProperty ;
+    rdfs:label "status name" ;
+    rdfs:domain ecom:OrderStatus ;
+    rdfs:range xsd:string .
+
+ecom:stockQuantity a owl:DatatypeProperty ;
+    rdfs:label "stock quantity" ;
+    rdfs:domain ecom:Inventory ;
+    rdfs:range xsd:integer .
+
+ecom:storedIn a owl:ObjectProperty ;
+    rdfs:label "stored in" ;
+    rdfs:domain ecom:Inventory ;
+    rdfs:range ecom:Warehouse .
+
+ecom:streetAddress a owl:DatatypeProperty ;
+    rdfs:label "street address" ;
+    rdfs:domain ecom:Address ;
+    rdfs:range xsd:string .
+
+ecom:tagName a owl:DatatypeProperty ;
+    rdfs:label "tag name" ;
+    rdfs:domain ecom:Tag ;
+    rdfs:range xsd:string .
+
+ecom:taxRate a owl:DatatypeProperty ;
+    rdfs:label "tax rate" ;
+    rdfs:domain ecom:Tax ;
+    rdfs:range xsd:decimal .
+
+ecom:totalAmount a owl:DatatypeProperty ;
+    rdfs:label "total amount" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range xsd:decimal .
+
+ecom:trackingNumber a owl:DatatypeProperty ;
+    rdfs:label "tracking number" ;
+    rdfs:domain ecom:Shipment ;
+    rdfs:range xsd:string .
+
+ecom:transactionId a owl:DatatypeProperty ;
+    rdfs:label "transaction ID" ;
+    rdfs:domain ecom:Payment ;
+    rdfs:range xsd:string .
+
+ecom:upc a owl:DatatypeProperty ;
+    rdfs:label "UPC" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range xsd:string .
+
+ecom:variantOf a owl:ObjectProperty ;
+    rdfs:label "variant of" ;
+    rdfs:domain ecom:ProductVariant ;
+    rdfs:range ecom:Product ;
+    owl:inverseOf ecom:hasVariant .
+
+ecom:warehouseName a owl:DatatypeProperty ;
+    rdfs:label "warehouse name" ;
+    rdfs:domain ecom:Warehouse ;
+    rdfs:range xsd:string .
+
+ecom:weight a owl:DatatypeProperty ;
+    rdfs:label "weight" ;
+    rdfs:domain ecom:PhysicalProduct ;
+    rdfs:range xsd:decimal .
+
+ecom:weightUnit a owl:DatatypeProperty ;
+    rdfs:label "weight unit" ;
+    rdfs:domain ecom:PhysicalProduct ;
+    rdfs:range xsd:string .
+
+ecom:BillingAddress a owl:Class ;
+    rdfs:label "Billing Address" ;
+    rdfs:comment "Address used for billing purposes" ;
+    rdfs:subClassOf ecom:Address .
+
+ecom:BusinessCustomer a owl:Class ;
+    rdfs:label "Business Customer" ;
+    rdfs:comment "A customer who represents a business or organization" ;
+    rdfs:subClassOf ecom:Customer .
+
+ecom:CustomerSegment a owl:Class ;
+    rdfs:label "Customer Segment" ;
+    rdfs:comment "A categorization of customers based on characteristics or behavior" .
+
+ecom:Manufacturer a owl:Class ;
+    rdfs:label "Manufacturer" ;
+    rdfs:comment "The company that manufactures the product." .
+
+ecom:ProductBundle a owl:Class ;
+    rdfs:label "Product Bundle" ;
+    rdfs:comment "A collection of products sold together" ;
+    rdfs:subClassOf ecom:Product .
+
+ecom:ShippingAddress a owl:Class ;
+    rdfs:label "Shipping Address" ;
+    rdfs:comment "Address where products are delivered" ;
+    rdfs:subClassOf ecom:Address .
+
+ecom:ShippingMethod a owl:Class ;
+    rdfs:label "Shipping Method" ;
+    rdfs:comment "Delivery service and speed option" .
+
+ecom:ShoppingCart a owl:Class ;
+    rdfs:label "Shopping Cart" ;
+    rdfs:comment "Temporary collection of items before purchase" .
+
+ecom:Wishlist a owl:Class ;
+    rdfs:label "Wishlist" ;
+    rdfs:comment "Collection of products a customer wants to purchase later" .
+
+ecom:hasSubCategory a owl:ObjectProperty ;
+    rdfs:label "has sub category" ;
+    rdfs:domain ecom:Category ;
+    rdfs:range ecom:SubCategory .
+
+ecom:hasVariant a owl:ObjectProperty ;
+    rdfs:label "has variant" ;
+    rdfs:domain ecom:Product ;
+    rdfs:range ecom:ProductVariant .
+
+ecom:orderedBy a owl:ObjectProperty ;
+    rdfs:label "ordered by" ;
+    rdfs:domain ecom:Order ;
+    rdfs:range ecom:Customer .
+
+ecom:AgeGroup a owl:Class ;
+    rdfs:label "Age Group" ;
+    rdfs:comment "Age range classification for demographic analysis" .
+
+ecom:Brand a owl:Class ;
+    rdfs:label "Brand" ;
+    rdfs:comment "Manufacturer or brand of a product" .
+
+ecom:Carrier a owl:Class ;
+    rdfs:label "Carrier" ;
+    rdfs:comment "Shipping company that delivers products" .
+
+ecom:City a owl:Class ;
+    rdfs:label "City" ;
+    rdfs:comment "City or municipality" .
+
+ecom:Currency a owl:Class ;
+    rdfs:label "Currency" ;
+    rdfs:comment "Monetary currency used for pricing" .
+
+ecom:EducationLevel a owl:Class ;
+    rdfs:label "Education Level" ;
+    rdfs:comment "Highest level of education attained" .
+
+ecom:Gender a owl:Class ;
+    rdfs:label "Gender" ;
+    rdfs:comment "Gender classification for demographic purposes" .
+
+ecom:IncomeLevel a owl:Class ;
+    rdfs:label "Income Level" ;
+    rdfs:comment "Income bracket classification" .
+
+ecom:IndividualCustomer a owl:Class ;
+    rdfs:label "Individual Customer" ;
+    rdfs:comment "A customer who is an individual person" ;
+    rdfs:subClassOf ecom:Customer .
+
+ecom:Occupation a owl:Class ;
+    rdfs:label "Occupation" ;
+    rdfs:comment "Professional occupation or job category" .
+
+ecom:ProductVariant a owl:Class ;
+    rdfs:label "Product Variant" ;
+    rdfs:comment "A specific variation of a product (size, color, etc.)" .
+
+ecom:Region a owl:Class ;
+    rdfs:label "Region" ;
+    rdfs:comment "State, province, or administrative region" .
+
+ecom:SubCategory a owl:Class ;
+    rdfs:label "Sub Category" ;
+    rdfs:comment "A category that has a parent category" ;
+    rdfs:subClassOf ecom:Category .
+
+ecom:Tag a owl:Class ;
+    rdfs:label "Tag" ;
+    rdfs:comment "Keyword or label for product classification and search" .
+
+ecom:Tax a owl:Class ;
+    rdfs:label "Tax" ;
+    rdfs:comment "Tax applied to products or orders" .
+
+ecom:Warehouse a owl:Class ;
+    rdfs:label "Warehouse" ;
+    rdfs:comment "Physical location where inventory is stored" .
+
+ecom:Country a owl:Class ;
+    rdfs:label "Country" ;
+    rdfs:comment "Country within an address" .
+
+ecom:CustomerAccount a owl:Class ;
+    rdfs:label "Customer Account" ;
+    rdfs:comment "The account information and credentials for a customer" .
+
+ecom:Discount a owl:Class ;
+    rdfs:label "Discount" ;
+    rdfs:comment "Price reduction or promotional offer" .
+
+ecom:OrderItem a owl:Class ;
+    rdfs:label "Order Item" ;
+    rdfs:comment "Individual product within an order" .
+
+ecom:PhysicalProduct a owl:Class ;
+    rdfs:label "Physical Product" ;
+    rdfs:comment "A tangible product that requires shipping" ;
+    rdfs:subClassOf ecom:Product .
+
+ecom:Price a owl:Class ;
+    rdfs:label "Price" ;
+    rdfs:comment "Monetary value of a product or service" .
+
+ecom:Rating a owl:Class ;
+    rdfs:label "Rating" ;
+    rdfs:comment "Numerical score given to a product" .
+
+ecom:Inventory a owl:Class ;
+    rdfs:label "Inventory" ;
+    rdfs:comment "Stock information for a product" .
+
+ecom:Payment a owl:Class ;
+    rdfs:label "Payment" ;
+    rdfs:comment "Payment transaction for an order" .
+
+ecom:PaymentMethod a owl:Class ;
+    rdfs:label "Payment Method" ;
+    rdfs:comment "Method used to pay for an order" .
+
+ecom:Promotion a owl:Class ;
+    rdfs:label "Promotion" ;
+    rdfs:comment "A special offer or campaign to increase sales." .
+
+ecom:Category a owl:Class ;
+    rdfs:label "Category" ;
+    rdfs:comment "A classification for organizing products" .
+
+ecom:Review a owl:Class ;
+    rdfs:label "Review" ;
+    rdfs:comment "Customer feedback and evaluation of a product" .
+
+ecom:Shipment a owl:Class ;
+    rdfs:label "Shipment" ;
+    rdfs:comment "Physical delivery of products to customer" .
+
+ecom:Demographics a owl:Class ;
+    rdfs:label "Demographics" ;
+    rdfs:comment "Demographic information about a customer" .
+
+ecom:Address a owl:Class ;
+    rdfs:label "Address" ;
+    rdfs:comment "Physical or postal address" .
+
+ecom:OrderStatus a owl:Class ;
+    rdfs:label "Order Status" ;
+    rdfs:comment "Current state of an order in the fulfillment process" .
+
+ecom:Order a owl:Class ;
+    rdfs:label "Order" ;
+    rdfs:comment "A customer's purchase request" .
+
+ecom:Customer a owl:Class ;
+    rdfs:label "Customer" ;
+    rdfs:comment "A person or organization that purchases products or services" .
+
+ecom:Product a owl:Class ;
+    rdfs:label "Product" ;
+    rdfs:comment "An item or service available for purchase" .
+

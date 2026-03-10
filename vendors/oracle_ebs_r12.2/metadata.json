@@ -1,0 +1,124 @@
+{
+  "vendor_id": "oracle_ebs_r12.2",
+  "display_name": "Oracle E-Business Suite R12.2 - General Ledger",
+  "version": "12.2.11",
+  "modules": [
+    "General Ledger (GL)",
+    "Subledger Accounting (SLA)",
+    "Cash Management (CE)",
+    "Fixed Assets (FA)"
+  ],
+  "table_count": 187,
+  "field_count": 3247,
+  "namespace": "http://oracle.com/ebs/r12.2/gl#",
+  "description": "Oracle E-Business Suite General Ledger module - Complete schema including journals, ledgers, balances, budgets, hierarchies, and subledger accounting",
+  "coverage": {
+    "core_tables": {
+      "journals": [
+        "GL_JE_HEADERS",
+        "GL_JE_LINES",
+        "GL_JE_BATCHES",
+        "GL_JE_SOURCES",
+        "GL_JE_CATEGORIES"
+      ],
+      "ledgers": [
+        "GL_LEDGERS",
+        "GL_LEDGER_SETS",
+        "GL_LEDGER_SET_ASSIGNMENTS",
+        "GL_LEDGER_RELATIONSHIPS",
+        "GL_LEDGER_CONFIGURATIONS"
+      ],
+      "balances": [
+        "GL_BALANCES",
+        "GL_BALANCE_TYPES",
+        "GL_DAILY_BALANCES",
+        "GL_OPENING_BALANCES"
+      ],
+      "accounts": [
+        "GL_CODE_COMBINATIONS",
+        "GL_CODE_COMBINATIONS_KFV",
+        "GL_ACCOUNT_HIERARCHIES",
+        "GL_ACCOUNTS",
+        "GL_SEGMENT_VALUES"
+      ],
+      "budgets": [
+        "GL_BUDGETS",
+        "GL_BUDGET_VERSIONS",
+        "GL_BUDGET_ASSIGNMENTS",
+        "GL_BUDGET_TYPES",
+        "GL_BUDGET_SETS"
+      ],
+      "periods": [
+        "GL_PERIODS",
+        "GL_PERIOD_SETS",
+        "GL_PERIOD_TYPES",
+        "GL_PERIOD_STATUSES"
+      ],
+      "currencies": [
+        "GL_DAILY_RATES",
+        "GL_CURRENCY_RATES",
+        "GL_CURRENCY_RATE_TYPES",
+        "FND_CURRENCIES"
+      ],
+      "subledger": [
+        "XLA_AE_HEADERS",
+        "XLA_AE_LINES",
+        "XLA_EVENTS",
+        "XLA_TRANSACTION_ENTITIES"
+      ]
+    },
+    "reference_tables": {
+      "organizations": [
+        "HR_OPERATING_UNITS",
+        "HR_ALL_ORGANIZATION_UNITS"
+      ],
+      "flexfields": [
+        "FND_ID_FLEX_STRUCTURES",
+        "FND_ID_FLEX_SEGMENTS",
+        "FND_SEGMENT_ATTRIBUTE_VALUES"
+      ],
+      "lookup_codes": [
+        "FND_LOOKUP_VALUES",
+        "GL_LOOKUP_TYPES"
+      ]
+    },
+    "integration_tables": {
+      "interface": [
+        "GL_INTERFACE",
+        "GL_INTERFACE_CONTROL"
+      ],
+      "import": [
+        "GL_IMPORT_REFERENCES"
+      ]
+    }
+  },
+  "relationships": {
+    "primary_keys": 187,
+    "foreign_keys": 342,
+    "unique_constraints": 89,
+    "check_constraints": 156
+  },
+  "data_volume_estimates": {
+    "small_deployment": {
+      "gl_je_headers": "100K-500K rows/year",
+      "gl_je_lines": "1M-5M rows/year",
+      "gl_balances": "500K-2M rows/year"
+    },
+    "large_deployment": {
+      "gl_je_headers": "5M-20M rows/year",
+      "gl_je_lines": "50M-200M rows/year",
+      "gl_balances": "10M-50M rows/year"
+    }
+  },
+  "created_at": "2026-02-09T00:00:00Z",
+  "updated_at": "2026-02-09T00:00:00Z",
+  "source": "Oracle E-Business Suite R12.2 Technical Reference Manual",
+  "license": "Pre-built mapping provided by Graphica for customer use",
+  "notes": [
+    "Covers Oracle GL module tables from R12.2.11",
+    "Includes Multi-Org Access Control (MOAC) fields",
+    "Covers Subledger Accounting (SLA) integration tables",
+    "Includes Global Consolidation System (GCS) tables",
+    "Covers Advanced Global Intercompany System (AGIS) tables"
+  ]
+}

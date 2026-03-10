@@ -1,0 +1,390 @@
+//! Integration Test for Dataflow → Cache Integration
+//!
+//! Tests the full streaming pipeline:
+//! 1. Timely dataflow creates StreamingResolvedEntity
+//! 2. Cache operator inserts into ResolvedEntityCache
+//! 3. GET endpoint retrieves from cache
+//!
+//! This validates the real-time streaming integration from Phase 2.
+
+use graphica_core::ingestion::{build_graphica_flow, Record};
+use graphica_core::ingestion::resolved_entities::{ResolvedEntityConfig, cache_resolved_entities};
+use graphica_core::core::lineage::DataRef;
+use graphica_core::checkpointing::CheckpointableDedupState;
+use graphica_coordinator::api::resolved_entity_cache::ResolvedEntityCache;
+use std::sync::Arc;
+use std::collections::HashMap;
+use chrono::Utc;
+use serde_json::json;
+use timely::Config;
+use timely::dataflow::operators::Inspect;
+
+#[test]
+fn test_dataflow_to_cache_integration() {
+    println!("\n=== Dataflow → Cache Integration Test ===\n");
+
+    // Step 1: Create shared cache (same as coordinator uses)
+    let cache = Arc::new(ResolvedEntityCache::new());
+    let cache_for_dataflow = cache.clone();
+
+    // Step 2: Create golden record config
+    let mut field_mappings = HashMap::new();
+    field_mappings.insert("email".to_string(), "email".to_string());
+    field_mappings.insert("name".to_string(), "name".to_string());
+
+    let re_config = Arc::new(ResolvedEntityConfig {
+        voting_strategy: graphica_core::orchestration::field_lineage::StrategyType::Frequency,
+        min_confidence: 0.70,
+        min_sources: 2, // Need 2 sources to trigger resolution
+        max_wait_ms: 5000,
+        field_mappings,
+        entity_id_field: "customer_id".to_string(),
+    });
+
+    // Step 3: Run dataflow with cache integration
+    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let results_clone = results.clone();
+
+    timely::execute(Config::thread(), move |worker| {
+        let cache_ref = cache_for_dataflow.clone();
+        let config = re_config.clone();
+        let res = results_clone.clone();
+
+        worker.dataflow::<u64, _, _>(move |scope| {
+            // Create dedup state
+            let dedup_state = CheckpointableDedupState::new(60_000, 100_000);
+
+            // Build dataflow with golden record creation
+            let (mut input, _processed, resolved_entities) = build_graphica_flow(
+                scope,
+                dedup_state,
+                None,  // No semantic detector
+                None,  // No RDF store
+                Some(config.clone()),  // Resolved entity config
+            );
+
+            // Attach cache operator to golden record stream
+            if let Some(re_stream) = resolved_entities {
+                let cache_results = cache_resolved_entities(re_stream, cache_ref.clone());
+
+                // Monitor cache insertion results
+                let res_inner = res.clone();
+                cache_results.inspect(move |(entity_id, success)| {
+                    res_inner.lock().unwrap().push((entity_id.clone(), *success));
+                });
+            }
+
+            // Step 4: Send test records with same entity_id (to trigger golden record)
+            // First record for customer_001
+            let record1 = Record {
+                id: "rec_001".to_string(),
+                dataset: "CRM".to_string(),
+                data: json!({
+                    "customer_id": "customer_001",
+                    "email": "john.doe@example.com",
+                    "name": "John Doe"
+                }),
+                source: DataRef {
+                    system: "crm_system".to_string(),
+                    path: "customers".to_string(),
+                    version: Some("1.0".to_string()),
+                    extracted_at: Utc::now(),
+                    cdc_position: None,
+                },
+                timestamp: Utc::now().timestamp(),
+                tenant_id: "tenant1".to_string(),
+                semantic_metadata: None,
+            };
+
+            // Second record for customer_001 (same entity, triggers resolution)
+            let record2 = Record {
+                id: "rec_002".to_string(),
+                dataset: "EmailSystem".to_string(),
+                data: json!({
+                    "customer_id": "customer_001",
+                    "email": "john.doe@example.com", // Agrees with record1
+                    "name": "John Doe"
+                }),
+                source: DataRef {
+                    system: "email_system".to_string(),
+                    path: "contacts".to_string(),
+                    version: Some("1.0".to_string()),
+                    extracted_at: Utc::now(),
+                    cdc_position: None,
+                },
+                timestamp: Utc::now().timestamp(),
+                tenant_id: "tenant1".to_string(),
+                semantic_metadata: None,
+            };
+
+            // Send records
+            input.send(record1);
+            input.send(record2);
+            input.advance_to(1);
+
+            println!("Step 1: ✓ Sent 2 records for entity customer_001 to dataflow");
+        });
+    })
+    .expect("Dataflow execution failed");
+
+    // Step 5: Verify cache insertion results
+    let cache_results = results.lock().unwrap();
+    println!("Step 2: ✓ Dataflow completed, {} cache operations recorded", cache_results.len());
+
+    // Should have at least one cache insertion
+    assert!(!cache_results.is_empty(), "Should have cached at least one golden record");
+
+    // All cache operations should succeed
+    for (entity_id, success) in cache_results.iter() {
+        assert!(*success, "Cache insertion for {} should succeed", entity_id);
+        println!("  ✓ Cached golden record for entity: {}", entity_id);
+    }
+
+    // Step 6: Verify cache contains the golden record
+    let cached_record = cache.get("customer_001");
+    assert!(cached_record.is_some(), "Cache should contain golden record for customer_001");
+
+    let cached_record = cached_record.unwrap();
+    println!("\nStep 3: ✓ Retrieved golden record from cache");
+    println!("  - Entity ID: {}", cached_record.entity_id);
+    println!("  - Fields: {}", cached_record.fields.len());
+    println!("  - Overall confidence: {:.2}", cached_record.overall_confidence);
+    println!("  - Source count: {}", cached_record.source_count);
+
+    // Verify field values
+    assert_eq!(cached_record.entity_id, "customer_001");
+    assert!(cached_record.fields.contains_key("email"), "Should have email field");
+    assert!(cached_record.fields.contains_key("name"), "Should have name field");
+
+    // Verify email value
+    let email_field = &cached_record.fields["email"];
+    assert_eq!(email_field.value, json!("john.doe@example.com"));
+    println!("  ✓ Email field resolved correctly: {}", email_field.value);
+
+    // Verify name value
+    let name_field = &cached_record.fields["name"];
+    assert_eq!(name_field.value, json!("John Doe"));
+    println!("  ✓ Name field resolved correctly: {}", name_field.value);
+
+    // Verify confidence scores
+    assert!(cached_record.overall_confidence > 0.5, "Overall confidence should be reasonable");
+    assert!(email_field.confidence > 0.5, "Email confidence should be reasonable");
+    assert!(name_field.confidence > 0.5, "Name confidence should be reasonable");
+
+    // Verify cache metrics
+    let metrics = cache.metrics();
+    println!("\nStep 4: Cache metrics after dataflow:");
+    println!("  - Insertions: {}", metrics.insertions.load(std::sync::atomic::Ordering::Relaxed));
+    println!("  - Current size: {}", metrics.size());
+    println!("  - Hits: {}", metrics.hits.load(std::sync::atomic::Ordering::Relaxed));
+    println!("  - Misses: {}", metrics.misses.load(std::sync::atomic::Ordering::Relaxed));
+
+    // Get should increase hit count (we just retrieved it)
+    let hit_count = metrics.hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(hit_count > 0, "Should have at least one cache hit");
+
+    println!("\n=== Dataflow → Cache Integration Test PASSED ===\n");
+}
+
+#[test]
+fn test_dataflow_cache_with_conflicts() {
+    println!("\n=== Dataflow → Cache with Conflicts Test ===\n");
+
+    let cache = Arc::new(ResolvedEntityCache::new());
+    let cache_for_dataflow = cache.clone();
+
+    // Config to detect conflicts
+    let mut field_mappings = HashMap::new();
+    field_mappings.insert("email".to_string(), "email".to_string());
+
+    let re_config = Arc::new(ResolvedEntityConfig {
+        voting_strategy: graphica_core::orchestration::field_lineage::StrategyType::Frequency,
+        min_confidence: 0.70,
+        min_sources: 2,
+        max_wait_ms: 5000,
+        field_mappings,
+        entity_id_field: "customer_id".to_string(),
+    });
+
+    timely::execute(Config::thread(), move |worker| {
+        let cache_ref = cache_for_dataflow.clone();
+        let config = re_config.clone();
+
+        worker.dataflow::<u64, _, _>(move |scope| {
+            let dedup_state = CheckpointableDedupState::new(60_000, 100_000);
+
+            let (mut input, _processed, resolved_entities) = build_graphica_flow(
+                scope,
+                dedup_state,
+                None,
+                None,
+                Some(config.clone()),
+            );
+
+            if let Some(re_stream) = resolved_entities {
+                cache_resolved_entities(re_stream, cache_ref.clone());
+            }
+
+            // Send conflicting records (different emails)
+            let record1 = Record {
+                id: "rec_003".to_string(),
+                dataset: "CRM".to_string(),
+                data: json!({
+                    "customer_id": "customer_002",
+                    "email": "john@email-a.com"
+                }),
+                source: DataRef {
+                    system: "crm".to_string(),
+                    path: "customers".to_string(),
+                    version: Some("1.0".to_string()),
+                    extracted_at: Utc::now(),
+                    cdc_position: None,
+                },
+                timestamp: Utc::now().timestamp(),
+                tenant_id: "tenant1".to_string(),
+                semantic_metadata: None,
+            };
+
+            let record2 = Record {
+                id: "rec_004".to_string(),
+                dataset: "EmailSystem".to_string(),
+                data: json!({
+                    "customer_id": "customer_002",
+                    "email": "john@email-b.com" // CONFLICT!
+                }),
+                source: DataRef {
+                    system: "email".to_string(),
+                    path: "contacts".to_string(),
+                    version: Some("1.0".to_string()),
+                    extracted_at: Utc::now(),
+                    cdc_position: None,
+                },
+                timestamp: Utc::now().timestamp(),
+                tenant_id: "tenant1".to_string(),
+                semantic_metadata: None,
+            };
+
+            input.send(record1);
+            input.send(record2);
+            input.advance_to(1);
+
+            println!("Sent 2 conflicting records for customer_002");
+        });
+    })
+    .expect("Dataflow execution failed");
+
+    // Verify conflict was cached
+    let cached_record = cache.get("customer_002");
+    assert!(cached_record.is_some(), "Should cache golden record even with conflicts");
+
+    let cached_record = cached_record.unwrap();
+    println!("\nCached golden record with conflict:");
+    println!("  - Entity ID: {}", cached_record.entity_id);
+    println!("  - Conflict count: {}", cached_record.conflict_count);
+    println!("  - Requires review: {}", cached_record.requires_review);
+
+    // Should detect conflict
+    assert!(cached_record.conflict_count > 0, "Should have detected conflict");
+
+    println!("\n=== Conflict Test PASSED ===\n");
+}
+
+#[test]
+fn test_cache_hit_after_dataflow() {
+    println!("\n=== Cache Hit After Dataflow Test ===\n");
+
+    let cache = Arc::new(ResolvedEntityCache::new());
+    let cache_for_dataflow = cache.clone();
+    let cache_for_verification = cache.clone();
+
+    let mut field_mappings = HashMap::new();
+    field_mappings.insert("email".to_string(), "email".to_string());
+
+    let re_config = Arc::new(ResolvedEntityConfig {
+        voting_strategy: graphica_core::orchestration::field_lineage::StrategyType::Frequency,
+        min_confidence: 0.70,
+        min_sources: 2,
+        max_wait_ms: 5000,
+        field_mappings,
+        entity_id_field: "customer_id".to_string(),
+    });
+
+    timely::execute(Config::thread(), move |worker| {
+        let cache_ref = cache_for_dataflow.clone();
+        let config = re_config.clone();
+
+        worker.dataflow::<u64, _, _>(move |scope| {
+            let dedup_state = CheckpointableDedupState::new(60_000, 100_000);
+
+            let (mut input, _processed, resolved_entities) = build_graphica_flow(
+                scope,
+                dedup_state,
+                None,
+                None,
+                Some(config.clone()),
+            );
+
+            if let Some(re_stream) = resolved_entities {
+                cache_resolved_entities(re_stream, cache_ref.clone());
+            }
+
+            // Send records
+            let record1 = Record {
+                id: "rec_005".to_string(),
+                dataset: "system1".to_string(),
+                data: json!({"customer_id": "customer_003", "email": "test@example.com"}),
+                source: DataRef {
+                    system: "sys1".to_string(),
+                    path: "data".to_string(),
+                    version: Some("1.0".to_string()),
+                    extracted_at: Utc::now(),
+                    cdc_position: None,
+                },
+                timestamp: Utc::now().timestamp(),
+                tenant_id: "tenant1".to_string(),
+                semantic_metadata: None,
+            };
+
+            let record2 = Record {
+                id: "rec_006".to_string(),
+                dataset: "system2".to_string(),
+                data: json!({"customer_id": "customer_003", "email": "test@example.com"}),
+                source: DataRef {
+                    system: "sys2".to_string(),
+                    path: "data".to_string(),
+                    version: Some("1.0".to_string()),
+                    extracted_at: Utc::now(),
+                    cdc_position: None,
+                },
+                timestamp: Utc::now().timestamp(),
+                tenant_id: "tenant1".to_string(),
+                semantic_metadata: None,
+            };
+
+            input.send(record1);
+            input.send(record2);
+            input.advance_to(1);
+        });
+    })
+    .expect("Dataflow execution failed");
+
+    // Verify multiple cache hits
+    let metrics_before = cache_for_verification.metrics();
+    let hits_before = metrics_before.hits.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Get from cache multiple times
+    let _r1 = cache_for_verification.get("customer_003");
+    let _r2 = cache_for_verification.get("customer_003");
+    let _r3 = cache_for_verification.get("customer_003");
+
+    let metrics_after = cache_for_verification.metrics();
+    let hits_after = metrics_after.hits.load(std::sync::atomic::Ordering::Relaxed);
+
+    println!("Cache hits before: {}", hits_before);
+    println!("Cache hits after: {}", hits_after);
+    println!("Hit rate: {:.2}%", metrics_after.hit_rate() * 100.0);
+
+    assert_eq!(hits_after - hits_before, 3, "Should have 3 additional cache hits");
+
+    println!("\n=== Cache Hit Test PASSED ===\n");
+}

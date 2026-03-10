@@ -1,0 +1,345 @@
+//! Tests for automated maintenance scheduler
+
+use graphica_coordinator::governance::rdf_store::GraphicaRdfStore;
+use graphica_coordinator::governance::rdf_star::AnnotatedTriple;
+use graphica_coordinator::governance::bitemporal::{TransactionId, MaintenanceScheduler, MaintenanceConfig};
+use tempfile::TempDir;
+use chrono::Utc;
+use std::time::Duration;
+
+#[tokio::test]
+async fn test_maintenance_scheduler_start_stop() {
+    println!("\n=== TEST: Maintenance Scheduler Start/Stop ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    let indexes = store.temporal_indexes().unwrap();
+
+    // Create scheduler with short intervals for testing
+    let mut scheduler = MaintenanceScheduler::new(indexes)
+        .with_compaction_interval(Duration::from_secs(10))
+        .with_stats_collection_interval(Duration::from_secs(2))
+        .with_archival_enabled(false); // Disable archival for this test
+
+    println!("✓ Created maintenance scheduler");
+
+    // Start scheduler
+    scheduler.start().await.unwrap();
+    println!("✓ Started maintenance scheduler");
+
+    // Let it run for a few seconds
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("✓ Scheduler ran for 3 seconds");
+
+    // Stop scheduler
+    scheduler.stop().await.unwrap();
+    println!("✓ Stopped maintenance scheduler");
+
+    println!("\n🎉 MAINTENANCE SCHEDULER START/STOP TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_compaction_task_execution() {
+    println!("\n=== TEST: Compaction Task Execution ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    // Insert some test data
+    for i in 1..=10 {
+        let tx_id = TransactionId::new(i, Utc::now(), 1);
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/value",
+            &format!("value_{}", i),
+        )
+        .with_valid_time(Utc::now(), None)
+        .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    println!("✓ Inserted 10 test versions");
+
+    let indexes = store.temporal_indexes().unwrap();
+
+    // Create config with compaction only, very short interval
+    let config = MaintenanceConfig {
+        compaction_interval: Duration::from_secs(2),
+        enable_compaction: true,
+        enable_archival: false,
+        enable_stats_collection: false,
+        ..Default::default()
+    };
+
+    let mut scheduler = MaintenanceScheduler::with_config(indexes.clone(), config);
+
+    // Start scheduler
+    scheduler.start().await.unwrap();
+    println!("✓ Started compaction scheduler");
+
+    // Wait for at least one compaction cycle
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("✓ Waited for compaction cycle");
+
+    // Stop scheduler
+    scheduler.stop().await.unwrap();
+    println!("✓ Stopped scheduler");
+
+    // Verify data is still intact
+    let stats = indexes.get_statistics().unwrap();
+    assert_eq!(stats.total_versions, 10, "All versions should still exist after compaction");
+
+    println!("\n🎉 COMPACTION TASK EXECUTION TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_statistics_collection_task() {
+    println!("\n=== TEST: Statistics Collection Task ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    // Insert test data
+    for i in 1..=5 {
+        let tx_id = TransactionId::new(i, Utc::now(), 1);
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/name",
+            &format!("Entity {}", i),
+        )
+        .with_valid_time(Utc::now(), None)
+        .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    println!("✓ Inserted 5 test versions");
+
+    let indexes = store.temporal_indexes().unwrap();
+
+    // Create config with stats collection only, very short interval
+    let config = MaintenanceConfig {
+        stats_interval: Duration::from_secs(1),
+        enable_compaction: false,
+        enable_archival: false,
+        enable_stats_collection: true,
+        ..Default::default()
+    };
+
+    let mut scheduler = MaintenanceScheduler::with_config(indexes.clone(), config);
+
+    // Start scheduler
+    scheduler.start().await.unwrap();
+    println!("✓ Started statistics collection scheduler");
+
+    // Wait for multiple collection cycles
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("✓ Waited for 3 collection cycles");
+
+    // Stop scheduler
+    scheduler.stop().await.unwrap();
+    println!("✓ Stopped scheduler");
+
+    // Verify statistics are accurate
+    let stats = indexes.get_statistics().unwrap();
+    assert_eq!(stats.total_versions, 5);
+    println!("✓ Statistics collection verified: {} versions", stats.total_versions);
+
+    println!("\n🎉 STATISTICS COLLECTION TASK TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_archival_candidate_detection() {
+    println!("\n=== TEST: Archival Candidate Detection ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    // Create a long version chain (20 versions)
+    let subject = "http://example.org/entity/customer_456";
+    let predicate = "http://example.org/prop/balance";
+
+    for i in 1..=20 {
+        let tx_id = TransactionId::new(i, Utc::now(), 1);
+        let triple = AnnotatedTriple::new(subject, predicate, &format!("balance_{}", i * 100))
+            .with_valid_time(Utc::now(), None)
+            .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    println!("✓ Created long version chain with 20 versions");
+
+    let indexes = store.temporal_indexes().unwrap();
+
+    // Create config with archival enabled, low threshold
+    let config = MaintenanceConfig {
+        archive_interval: Duration::from_secs(2),
+        max_versions_per_chain: 10,  // Low threshold
+        archive_threshold_days: 365,
+        enable_compaction: false,
+        enable_archival: true,
+        enable_stats_collection: false,
+        ..Default::default()
+    };
+
+    let mut scheduler = MaintenanceScheduler::with_config(indexes.clone(), config);
+
+    // Start scheduler
+    scheduler.start().await.unwrap();
+    println!("✓ Started archival scheduler");
+
+    // Wait for archival check
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("✓ Archival check completed");
+
+    // Stop scheduler
+    scheduler.stop().await.unwrap();
+    println!("✓ Stopped scheduler");
+
+    // Verify long chain was detected
+    let analysis = indexes.analyze_version_chains(10).unwrap();
+    assert_eq!(analysis.long_chains.len(), 1, "Should detect 1 long chain");
+    assert_eq!(analysis.long_chains[0].version_count, 20);
+
+    println!("✓ Long chain detected: {} versions", analysis.long_chains[0].version_count);
+
+    println!("\n🎉 ARCHIVAL CANDIDATE DETECTION TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_maintenance_config_customization() {
+    println!("\n=== TEST: Maintenance Config Customization ===");
+
+    let temp_dir = TempDir::new().unwrap();
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    let indexes = store.temporal_indexes().unwrap();
+
+    // Test builder pattern
+    let scheduler = MaintenanceScheduler::new(indexes.clone())
+        .with_compaction_interval(Duration::from_secs(7200))
+        .with_archive_threshold(365)
+        .with_stats_collection_interval(Duration::from_secs(60))
+        .with_compaction_enabled(true)
+        .with_archival_enabled(true);
+
+    assert_eq!(scheduler.config().compaction_interval, Duration::from_secs(7200));
+    assert_eq!(scheduler.config().archive_threshold_days, 365);
+    assert_eq!(scheduler.config().stats_interval, Duration::from_secs(60));
+    assert!(scheduler.config().enable_compaction);
+    assert!(scheduler.config().enable_archival);
+
+    println!("✓ Builder pattern configuration verified");
+
+    // Test custom config
+    let custom_config = MaintenanceConfig {
+        compaction_interval: Duration::from_secs(1800),
+        stats_interval: Duration::from_secs(30),
+        archive_threshold_days: 180,
+        archive_interval: Duration::from_secs(3600),
+        max_versions_per_chain: 500,
+        enable_compaction: false,
+        enable_archival: true,
+        enable_stats_collection: true,
+    };
+
+    let scheduler2 = MaintenanceScheduler::with_config(indexes.clone(), custom_config.clone());
+    assert_eq!(scheduler2.config().compaction_interval, Duration::from_secs(1800));
+    assert_eq!(scheduler2.config().max_versions_per_chain, 500);
+    assert!(!scheduler2.config().enable_compaction);
+
+    println!("✓ Custom config initialization verified");
+
+    println!("\n🎉 MAINTENANCE CONFIG CUSTOMIZATION TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_concurrent_maintenance_tasks() {
+    println!("\n=== TEST: Concurrent Maintenance Tasks ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    // Insert test data
+    for i in 1..=15 {
+        let tx_id = TransactionId::new(i, Utc::now(), 1);
+        let triple = AnnotatedTriple::new(
+            &format!("http://example.org/entity/{}", i),
+            "http://example.org/prop/data",
+            &format!("data_{}", i),
+        )
+        .with_valid_time(Utc::now(), None)
+        .with_transaction_time(&tx_id, None);
+
+        store.insert_rdf_star_triple(&triple, None).unwrap();
+    }
+
+    println!("✓ Inserted 15 test versions");
+
+    let indexes = store.temporal_indexes().unwrap();
+
+    // Enable all tasks with short intervals
+    let config = MaintenanceConfig {
+        compaction_interval: Duration::from_secs(3),
+        stats_interval: Duration::from_secs(1),
+        archive_interval: Duration::from_secs(4),
+        max_versions_per_chain: 20,
+        enable_compaction: true,
+        enable_archival: true,
+        enable_stats_collection: true,
+        ..Default::default()
+    };
+
+    let mut scheduler = MaintenanceScheduler::with_config(indexes.clone(), config);
+
+    // Start all tasks concurrently
+    scheduler.start().await.unwrap();
+    println!("✓ Started all maintenance tasks concurrently");
+
+    // Let them run together for 5 seconds
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("✓ All tasks ran concurrently for 5 seconds");
+
+    // Stop all tasks
+    scheduler.stop().await.unwrap();
+    println!("✓ Stopped all tasks gracefully");
+
+    // Verify data integrity after concurrent operations
+    let stats = indexes.get_statistics().unwrap();
+    assert_eq!(stats.total_versions, 15, "All versions should remain intact");
+
+    println!("✓ Data integrity verified: {} versions", stats.total_versions);
+
+    println!("\n🎉 CONCURRENT MAINTENANCE TASKS TEST PASSED!");
+}

@@ -1,0 +1,627 @@
+version: '3.8'
+
+services:
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: arcxa-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 5
+      ZOOKEEPER_INIT_LIMIT: 10
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 0
+      ZOOKEEPER_AUTOPURGE_PURGE_INTERVAL: 1
+      ZOOKEEPER_AUTOPURGE_SNAP_RETAIN_COUNT: 3
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - graphica-network
+    healthcheck:
+      test: echo stat | nc localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Kafka - Event streaming and CDC
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: arcxa-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      # Performance tuning
+      KAFKA_NUM_NETWORK_THREADS: 8
+      KAFKA_NUM_IO_THREADS: 8
+      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      # JVM settings
+      KAFKA_HEAP_OPTS: "-Xmx2G -Xms2G"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - graphica-network
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # Schema Registry - For Avro/Protobuf schemas (optional but recommended)
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    hostname: schema-registry
+    container_name: arcxa-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_SCHEMA_REGISTRY_GROUP_ID: graphica-schema-registry
+      SCHEMA_REGISTRY_LEADER_ELIGIBILITY: 'true'
+      SCHEMA_REGISTRY_HEAP_OPTS: "-Xmx512M -Xms512M"
+    networks:
+      - graphica-network
+    healthcheck:
+      test: curl -f http://localhost:8081/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Kafka UI - For debugging and monitoring (development/staging)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: arcxa-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: graphica-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    networks:
+      - graphica-network
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8080 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - dev
+      - staging
+
+  # RDF Shard 0 - Distributed RDF storage node
+  shard-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard
+    image: arcxa-shard:latest
+    container_name: arcxa-shard-0
+    depends_on:
+      coordinator:
+        condition: service_started
+    ports:
+      - "9100:9090"  # gRPC port mapped to host 9100
+    environment:
+      # Auto-registration: shard connects to coordinator and receives shard_id dynamically
+      COORDINATOR_URL: "http://coordinator:9090"
+      HEARTBEAT_INTERVAL: "30"
+      SHARD_PORT: "9090"
+      ROCKSDB_PATH: /data/rocksdb
+      RUST_LOG: info
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+    volumes:
+      - shard-0-data:/data
+    networks:
+      - graphica-network
+    healthcheck:
+      test: grpcurl -plaintext localhost:9090 list || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # RDF Shard 1 - Distributed RDF storage node
+  shard-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard
+    image: arcxa-shard:latest
+    container_name: arcxa-shard-1
+    depends_on:
+      coordinator:
+        condition: service_started
+    ports:
+      - "9101:9090"  # gRPC port mapped to host 9101
+    environment:
+      # Auto-registration: shard connects to coordinator and receives shard_id dynamically
+      COORDINATOR_URL: "http://coordinator:9090"
+      HEARTBEAT_INTERVAL: "30"
+      SHARD_PORT: "9090"
+      ROCKSDB_PATH: /data/rocksdb
+      RUST_LOG: info
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+    volumes:
+      - shard-1-data:/data
+    networks:
+      - graphica-network
+    healthcheck:
+      test: grpcurl -plaintext localhost:9090 list || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # RDF Shard 2 - Third shard to demonstrate automatic hash partitioning
+  shard-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard
+    image: arcxa-shard:latest
+    container_name: arcxa-shard-2
+    depends_on:
+      coordinator:
+        condition: service_started
+    ports:
+      - "9102:9090"  # gRPC port mapped to host 9102
+    environment:
+      # Auto-registration: shard connects to coordinator and receives shard_id dynamically
+      COORDINATOR_URL: "http://coordinator:9090"
+      HEARTBEAT_INTERVAL: "30"
+      SHARD_PORT: "9090"
+      ROCKSDB_PATH: /data/rocksdb
+      RUST_LOG: info
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+    volumes:
+      - shard-2-data:/data
+    networks:
+      - graphica-network
+    healthcheck:
+      test: grpcurl -plaintext localhost:9090 list || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    profiles:
+      - full
+      - three-shards
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: arcxa-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    networks:
+      - graphica-network
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Grafana - Metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: arcxa-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: graphica-admin
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - graphica-network
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # DB2 Community Edition - For ETL loader testing and data warehousing
+  db2:
+    image: icr.io/db2_community/db2:11.5.9.0
+    container_name: arcxa-db2
+    privileged: true
+    ports:
+      - "50000:50000"  # DB2 database port
+      - "55000:55000"  # DB2 admin console
+    environment:
+      LICENSE: accept
+      DB2INST1_PASSWORD: graphica-db2-pass
+      DB2INSTANCE: db2inst1
+      DBNAME: GRAPHICA
+      # Performance tuning
+      DB2_ENABLE_AUTOCONFIG: "NO"
+      BLU: "false"
+      # Set page size for better performance with large batches
+      PAGESIZE: "32768"
+      # Connection pool settings
+      MAX_CONNECTIONS: "200"
+      # Transaction log settings
+      LOGARCHMETH1: "OFF"
+      LOGFILSIZ: "4096"
+      LOGPRIMARY: "13"
+      LOGSECOND: "12"
+    volumes:
+      - db2-data:/database
+      - ./docker/db2/init:/docker-entrypoint-initdb.d
+      - ./docker/db2/scripts:/scripts
+    networks:
+      - graphica-network
+    healthcheck:
+      test: su - db2inst1 -c "db2 connect to GRAPHICA user db2inst1 using graphica-db2-pass && db2 'select 1 from sysibm.sysdummy1' && db2 connect reset" || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s  # DB2 takes time to initialize
+    restart: unless-stopped
+    # Resource limits (DB2 is memory-hungry)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    profiles:
+      - loader
+      - full
+
+  # PostgreSQL - For fusion operations (optional, can start later)
+  postgres:
+    image: postgres:16-alpine
+    container_name: arcxa-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: graphica
+      POSTGRES_USER: graphica
+      POSTGRES_PASSWORD: graphica-secret
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - graphica-network
+    healthcheck:
+      test: pg_isready -U graphica -d graphica
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - fusion
+      - full
+
+  # TimescaleDB - For time-series data (optional, can start later)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: arcxa-timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: graphica_timeseries
+      POSTGRES_USER: graphica
+      POSTGRES_PASSWORD: graphica-secret
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./docker/timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - graphica-network
+    healthcheck:
+      test: pg_isready -U graphica -d graphica_timeseries
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - timeseries
+      - full
+
+  # Redis - For caching (optional, can start later)
+  redis:
+    image: redis:7-alpine
+    container_name: arcxa-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - graphica-network
+    healthcheck:
+      test: redis-cli ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - cache
+      - full
+
+  # etcd - Required by Milvus for metadata storage
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: arcxa-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd-data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    networks:
+      - graphica-network
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - semantic
+      - full
+
+  # MinIO - Object storage for Milvus
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: arcxa-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio-data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - graphica-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - semantic
+      - full
+
+  # Milvus - Vector database for semantic embeddings
+  milvus:
+    image: milvusdb/milvus:v2.3.3
+    container_name: arcxa-milvus
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - milvus-data:/var/lib/milvus
+    ports:
+      - "19530:19530"  # gRPC API
+      - "9091:9091"    # Metrics
+    networks:
+      - graphica-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    profiles:
+      - semantic
+      - full
+
+  # Graphica Coordinator - Main application with distributed RDF store
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+      args:
+        ENABLE_CRYPTOGRAPHIC_AUDIT: "true"  # Enable audit chain compilation
+    image: arcxa-coordinator:latest
+    container_name: arcxa-coordinator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      # Note: With auto-registration, shards connect to coordinator (not vice versa)
+      # No need to wait for shards before starting coordinator
+    ports:
+      - "8888:8080"  # REST API (using 8888 to avoid conflict with kafka-ui)
+      - "9095:9090"  # gRPC API (using 9095 to avoid conflict with shards)
+      - "9091:9091"  # Metrics
+    environment:
+      # Shard configuration - AUTOMATIC REGISTRATION
+      # Shards connect to coordinator gRPC service and register automatically
+      # Coordinator assigns shard IDs dynamically (0, 1, 2, ...)
+      # Hash ranges automatically rebalanced on each registration:
+      # - 2 shards: shard-0 (0-50%), shard-1 (50-100%)
+      # - 3 shards: shard-0 (0-33%), shard-1 (33-67%), shard-2 (67-100%)
+      # No manual SHARD_URLS configuration needed!
+
+      # Network configuration
+      REST_PORT: "8080"
+      GRPC_PORT: "9090"
+      REST_BIND_ADDRESS: "0.0.0.0"
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+
+      # Storage configuration
+      ROCKSDB_PATH: /app/data/rocksdb
+      PARQUET_PATH: /app/data/parquet
+      ARCHIVE_PATH: /app/data/archive
+      ROW_LINEAGE_DB_PATH: /app/data/row-lineage-db
+
+      # Cryptographic Audit Chain (SOX/HIPAA/GDPR compliance)
+      ENABLE_CRYPTOGRAPHIC_AUDIT: "true"
+      AUDIT_CHAIN_PATH: /app/data/audit
+      AUDIT_USER_ID: "coordinator-service"
+      # AUDIT_SIGNING_KEY_PATH: /app/secrets/audit-key.pem  # For production
+
+      # Kafka configuration
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_CONSUMER_GROUP: "arcxa-coordinator"
+      KAFKA_LINEAGE_TOPIC: "graphica.lineage"
+      KAFKA_QUALITY_TOPIC: "graphica.quality"
+
+      # Field Mapping Engine - Phase 2 Semantic Matching (optional)
+      # Uncomment to enable semantic matching with transformer embeddings
+      # GRAPHICA_MODEL_SERVICE_URL: "http://model-service:50051"
+
+      # Authentication (disabled for development)
+      ENABLE_AUTH: "false"
+      CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:5173"
+
+      # Logging
+      RUST_LOG: "info,graphica_coordinator::mapping=debug,graphica_coordinator::bitemporal::audit=debug"
+
+      # Metrics
+      ENABLE_METRICS: "true"
+      METRICS_PORT: "9091"
+
+      # Connection pool settings
+      SHARD_CONNECT_TIMEOUT_MS: "5000"
+      SHARD_REQUEST_TIMEOUT_MS: "30000"
+      SHARD_MAX_FAILURES: "3"
+      SHARD_CIRCUIT_RESET_SECONDS: "30"
+      SHARD_POOL_SIZE: "10"
+
+      # Query configuration
+      QUERY_TIMEOUT_MS: "60000"
+      QUERY_MAX_RESULTS_PER_SHARD: "10000"
+      QUERY_FAILURE_MODE: "best_effort"
+    volumes:
+      - coordinator-data:/app/data
+      - audit-chain:/app/data/audit  # Persistent audit chain storage
+      # - ./secrets:/app/secrets:ro  # For production: mount Ed25519 signing keys
+    networks:
+      - graphica-network
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    # Graceful shutdown
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+
+volumes:
+  zookeeper-data:
+    driver: local
+  zookeeper-logs:
+    driver: local
+  kafka-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  db2-data:
+    driver: local
+  postgres-data:
+    driver: local
+  timescaledb-data:
+    driver: local
+  redis-data:
+    driver: local
+  shard-0-data:
+    driver: local
+  shard-1-data:
+    driver: local
+  shard-2-data:
+    driver: local
+  coordinator-data:
+    driver: local
+  audit-chain:
+    driver: local
+  model-cache:
+    driver: local
+  etcd-data:
+    driver: local
+  minio-data:
+    driver: local
+  milvus-data:
+    driver: local
+
+networks:
+  graphica-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16

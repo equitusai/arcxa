@@ -1,0 +1,57 @@
+# Dockerfile for ARCXA Shard
+# Multi-stage build for optimal image size
+
+# Stage 1: Build
+FROM rust:1.75-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    cmake \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace files (proto files needed for graphica_core build.rs)
+COPY Cargo.toml ./Cargo.toml
+COPY proto ./proto
+COPY arcxa-core ./arcxa-core
+COPY arcxa-shard ./arcxa-shard
+
+# Build shard (release mode)
+WORKDIR /build/arcxa-shard
+RUN cargo build --release --bin arcxa-shard
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory and user
+RUN useradd -m -u 1000 graphica && \
+    mkdir -p /app/data && \
+    chown -R graphica:graphica /app
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /build/arcxa-shard/target/release/arcxa-shard /app/arcxa-shard
+
+USER graphica
+
+# Expose gRPC port
+EXPOSE 50051
+
+# Health check via gRPC reflection
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD /app/arcxa-shard --health-check || exit 1
+
+# Run shard
+ENTRYPOINT ["/app/arcxa-shard"]

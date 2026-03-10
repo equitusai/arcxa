@@ -1,0 +1,327 @@
+//! Integration tests for AsyncGovernanceBrainV2
+//!
+//! Tests the complete async governance system with real message flow:
+//! - MessageRouter distributes work
+//! - ProcessorPool runs N concurrent tasks
+//! - BatchProcessor handles batching + retry + RDF persistence
+
+use graphica_core::core::lineage::{DataRef, LineageEvent};
+use graphica_coordinator::governance::{AsyncGovernanceBrainV2, AsyncGovernanceConfig};
+use graphica_coordinator::governance::rdf_store::GraphicaRdfStore;
+use std::sync::Arc;
+use std::time::Duration;
+use uuid::Uuid;
+use chrono::Utc;
+use std::collections::HashMap;
+
+fn create_test_event(dataset: &str, record: &str) -> LineageEvent {
+    LineageEvent {
+        id: Uuid::new_v4(),
+        dataset: dataset.to_string(),
+        record_id: record.to_string(),
+        source_refs: vec![DataRef {
+            system: "test".to_string(),
+            path: "/test".to_string(),
+            version: None,
+            extracted_at: Utc::now(),
+            cdc_position: None,
+        }],
+        transforms: vec![],
+        model_refs: vec![],
+        output_ref: DataRef {
+            system: "output".to_string(),
+            path: "/output".to_string(),
+            version: None,
+            extracted_at: Utc::now(),
+            cdc_position: None,
+        },
+        ts: Utc::now(),
+        run_id: "test-run".to_string(),
+        tenant_id: "test-tenant".to_string(),
+        correlation_id: Some(Uuid::new_v4().to_string()),
+        metadata: HashMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn test_v2_brain_creation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::default();
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    assert_eq!(brain.num_processors(), 4); // Default config
+    assert!(brain.is_healthy());
+
+    println!("✓ Brain created with {} processors", brain.num_processors());
+}
+
+#[tokio::test]
+async fn test_v2_single_event_ingestion() {
+    // Enable detailed logging for this test
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::default();
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    println!("Brain created with {} processors", brain.num_processors());
+    println!("Is healthy: {}", brain.is_healthy());
+
+    let event = create_test_event("customers", "cust_001");
+    brain.materialize_event(event).await.unwrap();
+
+    println!("Event sent to router");
+
+    // Allow time for async processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let stats = brain.stats().await;
+    println!("✓ Single event ingested - Stats: processed={}, failed={}",
+             stats.total_processed, stats.total_failed);
+
+    assert!(stats.total_processed > 0 || stats.total_failed > 0,
+            "No events processed or failed");
+}
+
+#[tokio::test]
+async fn test_v2_batch_ingestion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::default();
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    // Create batch of events
+    let events: Vec<_> = (0..100)
+        .map(|i| create_test_event("customers", &format!("cust_{:03}", i)))
+        .collect();
+
+    brain.materialize_batch(events).await.unwrap();
+
+    // Allow time for async processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let stats = brain.stats().await;
+    println!("✓ Batch ingested - Stats: processed={}, failed={}, avg_batch_size={:.1}",
+             stats.total_processed, stats.total_failed, stats.avg_batch_size);
+
+    // Allow some failures due to async nature
+    assert!(stats.total_processed >= 90,
+            "Expected >=90 processed, got {}", stats.total_processed);
+}
+
+#[tokio::test]
+async fn test_v2_coordinated_flush() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::default();
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    // Send events
+    for i in 0..50 {
+        let event = create_test_event("orders", &format!("order_{}", i));
+        brain.materialize_event(event).await.unwrap();
+    }
+
+    // Flush should coordinate across all processors
+    brain.flush().await.unwrap();
+
+    // Allow time for async processing to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stats = brain.stats().await;
+    println!("✓ Coordinated flush complete - Stats: processed={}, avg_batch_size={:.1}",
+             stats.total_processed, stats.avg_batch_size);
+
+    assert!(stats.total_processed > 0);
+}
+
+#[tokio::test]
+async fn test_v2_graceful_shutdown() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::default();
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    // Send some events
+    for i in 0..20 {
+        let event = create_test_event("products", &format!("prod_{}", i));
+        brain.materialize_event(event).await.unwrap();
+    }
+
+    // Get stats before shutdown
+    let stats_before = brain.stats().await;
+
+    // Shutdown should flush remaining events
+    brain.shutdown().await.unwrap();
+
+    println!("✓ Graceful shutdown complete - Final stats: processed={}, failed={}",
+             stats_before.total_processed, stats_before.total_failed);
+}
+
+#[tokio::test]
+async fn test_v2_processor_load_distribution() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig {
+        num_processors: 8,
+        batch_size: 10,
+        batch_timeout: Duration::from_millis(100),
+        channel_capacity: 100,
+        max_retries: 3,
+        enable_metrics: true,
+    };
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    // Send many events with different datasets (different hash keys)
+    for i in 0..200 {
+        let dataset = format!("dataset_{}", i % 10); // 10 different datasets
+        let event = create_test_event(&dataset, &format!("rec_{}", i));
+        brain.materialize_event(event).await.unwrap();
+    }
+
+    // Allow processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let loads = brain.processor_loads();
+    println!("✓ Processor loads: {:?}", loads);
+
+    // Verify all processors got some work (with HybridHashLeastLoaded strategy)
+    // Note: Due to async nature, some processors might have 0 if they processed quickly
+    assert_eq!(loads.len(), 8);
+}
+
+// Throughput benchmark test
+#[tokio::test]
+#[ignore] // Run with: cargo test --test async_brain_v2_integration -- --ignored --nocapture
+async fn test_v2_throughput_benchmark() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::high_throughput();
+    let brain = AsyncGovernanceBrainV2::new(config, store).await.unwrap();
+
+    let num_events = 10_000;
+    let start = std::time::Instant::now();
+
+    println!("Starting throughput benchmark with {} events...", num_events);
+
+    // Send events as fast as possible
+    for i in 0..num_events {
+        let event = create_test_event("benchmark", &format!("rec_{}", i));
+        brain.materialize_event(event).await.unwrap();
+    }
+
+    // Flush and measure
+    brain.flush().await.unwrap();
+    let duration = start.elapsed();
+
+    let stats = brain.stats().await;
+    let throughput = num_events as f64 / duration.as_secs_f64();
+
+    println!("\n=== THROUGHPUT BENCHMARK RESULTS ===");
+    println!("Total events:     {}", num_events);
+    println!("Duration:         {:?}", duration);
+    println!("Throughput:       {:.0} events/sec", throughput);
+    println!("Events processed: {}", stats.total_processed);
+    println!("Events failed:    {}", stats.total_failed);
+    println!("Avg batch size:   {:.1}", stats.avg_batch_size);
+    println!("Processors:       {}", brain.num_processors());
+    println!("====================================\n");
+
+    // Target: 2,000+ events/sec
+    assert!(
+        throughput > 2000.0,
+        "Throughput {:.0} < 2000 events/sec - FAILED",
+        throughput
+    );
+
+    println!("✓ Throughput benchmark PASSED: {:.0} events/sec", throughput);
+}
+
+// Stress test with concurrent senders
+#[tokio::test]
+#[ignore] // Run with: cargo test --test async_brain_v2_integration -- --ignored --nocapture
+async fn test_v2_concurrent_senders() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        GraphicaRdfStore::new(temp_dir.path().to_str().unwrap()).unwrap()
+    );
+
+    let config = AsyncGovernanceConfig::high_throughput();
+    let brain = Arc::new(AsyncGovernanceBrainV2::new(config, store).await.unwrap());
+
+    let num_senders = 10;
+    let events_per_sender = 500;
+
+    println!("Starting concurrent senders test: {} senders × {} events...",
+             num_senders, events_per_sender);
+
+    let start = std::time::Instant::now();
+
+    // Spawn concurrent senders
+    let mut handles = vec![];
+    for sender_id in 0..num_senders {
+        let brain_clone = brain.clone();
+        let handle = tokio::spawn(async move {
+            for i in 0..events_per_sender {
+                let event = create_test_event(
+                    &format!("sender_{}", sender_id),
+                    &format!("rec_{}", i)
+                );
+                brain_clone.materialize_event(event).await.unwrap();
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all senders
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // Flush and measure
+    brain.flush().await.unwrap();
+    let duration = start.elapsed();
+
+    let stats = brain.stats().await;
+    let total_events = num_senders * events_per_sender;
+    let throughput = total_events as f64 / duration.as_secs_f64();
+
+    println!("\n=== CONCURRENT SENDERS RESULTS ===");
+    println!("Total events:     {}", total_events);
+    println!("Duration:         {:?}", duration);
+    println!("Throughput:       {:.0} events/sec", throughput);
+    println!("Events processed: {}", stats.total_processed);
+    println!("Events failed:    {}", stats.total_failed);
+    println!("==================================\n");
+
+    // Most events should succeed
+    assert!(stats.total_processed >= (total_events * 90) / 100,
+            "Expected >=90% success rate");
+
+    println!("✓ Concurrent senders test PASSED");
+}

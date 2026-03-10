@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/arcxa-mark.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ARCXA | Data Governance Workspace</title>
+    <!-- Critical: Initialize theme BEFORE any rendering to prevent FOUC -->
+    <script>
+      (function() {
+        try {
+          const stored = localStorage.getItem('graphica-app-store');
+          if (stored) {
+            const data = JSON.parse(stored);
+            const theme = data?.state?.theme || 'light';
+            if (theme === 'dark') {
+              document.documentElement.classList.add('dark');
+            }
+          }
+        } catch (e) {
+          // Silently fail and use default light theme
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

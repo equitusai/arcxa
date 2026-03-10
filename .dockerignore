@@ -1,0 +1,60 @@
+# Build artifacts
+**/target/
+**/*.rs.bk
+**/Cargo.lock
+
+# Development files
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+docs/
+demos/
+
+# Test data
+**/tests/fixtures/
+**/test_data/
+
+# Local development
+data/
+logs/
+*.log
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+!Dockerfile
+!Dockerfile.coordinator
+!Dockerfile.shard
+
+# Models (mount as volume instead)
+models/
+*.onnx
+*.pb
+*.pth

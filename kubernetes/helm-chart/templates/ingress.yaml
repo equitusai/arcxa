@@ -1,0 +1,51 @@
+kind: Ingress
+apiVersion: networking.k8s.io/v1
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 10G
+    nginx.org/client-max-body-size: 10G
+    {{ if not .Values.graphica.ingress.certName }}
+    cert-manager.io/cluster-issuer: equitus-root-issuer
+    {{ end }}
+    {{ if .Values.openshiftMode.enabled }}
+    route.openshift.io/termination: edge
+    {{ end }}
+  name: graphica
+  namespace: {{ .Release.namespace }}
+  labels:
+    app: graphica
+    component: frontend
+spec:
+  tls:
+    - hosts:
+        - {{ .Values.graphica.ingress.uri }}
+      {{ if .Values.graphica.ingress.certName }}
+      secretName: {{.Values.graphica.ingress.certName}}
+      {{ else }}
+      secretName: graphica-tls-secret
+      {{end}}
+  rules:
+    - host: {{ .Values.graphica.ingress.uri }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: graphica-frontend
+                port:
+                  number: 8080
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: graphica-coordinator
+                port:
+                  number: 8080
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: graphica-coordinator
+                port:
+                  number: 8080

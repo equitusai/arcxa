@@ -1,0 +1,51 @@
+use graphica_core::core::lineage::{DataRef, LineageEvent, LineageSink};
+use graphica_core::storage::rocks::RocksLineageStore;
+use std::collections::HashMap;
+use uuid::Uuid;
+use chrono::Utc;
+use anyhow::Result;
+
+#[test]
+fn test_inverted_index_write_and_read() -> Result<()> {
+    eprintln!("Creating temp directory...");
+    let temp_dir = tempfile::tempdir()?;
+
+    eprintln!("Creating RocksLineageStore...");
+    let store = RocksLineageStore::new(temp_dir.path().to_str().unwrap())?;
+
+    eprintln!("Creating test event...");
+    let event = LineageEvent {
+        id: Uuid::new_v4(),
+        dataset: "test_dataset".to_string(),
+        record_id: "test_record_123".to_string(),
+        source_refs: vec![],
+        transforms: vec![],
+        model_refs: vec![],
+        output_ref: DataRef {
+            system: "test".to_string(),
+            path: "test".to_string(),
+            version: None,
+            extracted_at: Utc::now(),
+            cdc_position: None,
+        },
+        ts: Utc::now(),
+        run_id: "test_run".to_string(),
+        tenant_id: "test_tenant".to_string(),
+        correlation_id: Some(Uuid::new_v4().to_string()),
+        metadata: HashMap::new(),
+    };
+
+    eprintln!("Writing event...");
+    store.write(event.clone())?;
+    eprintln!("Event written successfully");
+
+    eprintln!("Reading back lineage...");
+    let events = store.get_record_lineage("test_record_123")?;
+    eprintln!("Got {} events back", events.len());
+
+    assert_eq!(events.len(), 1, "Should retrieve the event");
+    assert_eq!(events[0].id, event.id);
+
+    eprintln!("Test passed!");
+    Ok(())
+}

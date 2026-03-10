@@ -1,0 +1,101 @@
+{
+  "dashboard": {
+    "title": "Graphica - RDF Operations",
+    "tags": ["graphica", "rdf", "sparql"],
+    "timezone": "browser",
+    "schemaVersion": 36,
+    "version": 1,
+    "refresh": "5s",
+    "time": {
+      "from": "now-15m",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "SPARQL Queries by Type",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [{
+          "expr": "rate(graphica_sparql_queries_total[1m])",
+          "legendFormat": "{{query_type}}",
+          "refId": "A"
+        }],
+        "yaxes": [
+          {"format": "qps", "label": "Queries/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 2,
+        "title": "SPARQL Query Latency",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(graphica_sparql_query_duration_seconds_bucket[1m]))",
+            "legendFormat": "P50 - {{query_type}}",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(graphica_sparql_query_duration_seconds_bucket[1m]))",
+            "legendFormat": "P95 - {{query_type}}",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(graphica_sparql_query_duration_seconds_bucket[1m]))",
+            "legendFormat": "P99 - {{query_type}}",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Triple Operations",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [{
+          "expr": "rate(graphica_triple_operations_total[1m])",
+          "legendFormat": "{{operation}}",
+          "refId": "A"
+        }],
+        "yaxes": [
+          {"format": "ops", "label": "Operations/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 4,
+        "title": "SPARQL Parse Errors",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [{
+          "expr": "rate(graphica_sparql_parse_errors_total[1m])",
+          "legendFormat": "{{error_type}}",
+          "refId": "A"
+        }],
+        "yaxes": [
+          {"format": "eps", "label": "Errors/sec"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [{
+            "evaluator": {"params": [1], "type": "gt"},
+            "operator": {"type": "and"},
+            "query": {"params": ["A", "5m", "now"]},
+            "reducer": {"type": "avg"}
+          }],
+          "executionErrorState": "alerting",
+          "frequency": "60s",
+          "handler": 1,
+          "name": "High SPARQL Parse Error Rate",
+          "noDataState": "no_data"
+        }
+      }
+    ]
+  }
+}

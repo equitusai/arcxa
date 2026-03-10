@@ -1,0 +1,225 @@
+[package]
+name = "arcxa-coordinator"
+version = "0.2.0"
+edition = "2021"
+authors = ["Equitus Corporation"]
+license-file = "../LICENSE.md"
+
+[lib]
+name = "graphica_coordinator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcxa-coordinator"
+path = "src/main.rs"
+
+[[bin]]
+name = "arcxa"
+path = "src/main.rs"
+
+# Migrate binary will be re-enabled after storage module migration
+# [[bin]]
+# name = "migrate"
+# path = "src/bin/migrate.rs"
+
+[features]
+default = ["async-governance", "workflow-storage", "odbc"]  # Production-ready defaults
+async-governance = []
+sync-governance = []
+all-governance = ["async-governance", "sync-governance"]
+simd = []
+power10-optimized = []
+odbc = ["dep:odbc-api"]  # Enable ODBC connectivity for DB2 (requires DB2 drivers installed)
+# NOTE: If building without DB2 drivers, use: cargo build --no-default-features --features async-governance,workflow-storage
+
+# Workflow optimization features
+workflow-storage = ["graphica-core/workflow-storage"]  # Enable RocksDB-backed workflow storage for streaming dedup
+
+# Testing and development features (NOT FOR PRODUCTION)
+test-endpoints = []  # Enables test-only HTTP endpoints for lineage injection (SECURITY RISK in production)
+
+# Enterprise bitemporal features (Phase 1 - Foundation)
+raft-consensus = ["raft", "raft-proto", "protobuf", "slog"]
+cryptographic-audit = ["ed25519-dalek", "blake3", "hex"]
+wal-replication = []
+full-enterprise = ["raft-consensus", "cryptographic-audit", "wal-replication", "workflow-storage"]
+
+[dependencies]
+# Internal dependencies
+graphica-core = { package = "arcxa-core", path = "../arcxa-core" }
+graphica-migrations = { package = "arcxa-migrations", path = "../arcxa-migrations" }
+
+# Core utilities
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+tonic = { version = "0.11", features = ["gzip"] }
+prost = "0.12"
+prost-types = "0.12"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.8"  # IANA timezone database for workflow scheduling
+cron = "0.12"  # Cron expression parsing and next execution calculation
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Streaming & Dataflow
+timely = "0.12"
+differential-dataflow = "0.12"
+
+# Kafka & CDC
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# Columnar & Serialization
+arrow2 = { version = "0.17", features = ["io_parquet", "io_json"] }
+parquet2 = "0.17"
+
+# ===================================================================
+# KEY DEPENDENCY: RocksDB for temporal indexes and WAL
+# This resolves to librocksdb-sys (RocksDB v9.x)
+# ===================================================================
+rocksdb = "0.22"
+
+# Performance
+hashbrown = "0.14"
+ahash = "0.8"
+hyperloglog = "1.0"
+quantiles = "0.7"
+
+# WASM Runtime (wasmi for multi-platform support - Power10, ARM64, RISC-V, x86_64)
+wasmi = "0.32"
+wasmparser = "0.118"  # WASM module metadata extraction
+
+# String interning for workflow module performance optimization
+string_cache = "0.8"  # Atom-based string interning for identifiers
+
+# API Layer
+axum = { version = "0.7", features = ["multipart"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+utoipa = { version = "4.2", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "6.0", features = ["axum"] }
+
+# CLI
+colored = "2.1"
+
+# Utilities
+futures = "0.3"
+async-stream = "0.3"
+regex = "1.10"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["compat"] }  # CancellationToken + compat layer
+nom = "7.1"  # Parser combinator for transformation expressions
+rust_decimal = "1.33"  # Decimal type for financial calculations
+once_cell = "1.19"
+lazy_static = "1.4"
+flume = "0.11"  # Pure-Rust channels, works on all platforms including ppc64le
+bytes = { version = "1.10.1", features = ["serde"] }
+crc32fast = "1.5.0"
+prometheus = "0.14.0"
+async-trait = "0.1.89"
+dashmap = "6.1.0"
+parking_lot = "0.12.4"
+lru = "0.12"
+bincode = "1.3"
+zstd = "0.13"
+clap = { version = "4.5", features = ["derive"] }
+tempfile = "3.8"
+num_cpus = "1.16"
+rayon = "1.8"
+base64 = "0.21"
+governor = "0.6"
+humantime-serde = "1.1"  # Duration serialization for config
+notify = "6.1"  # File system event notifications for workflow file watching
+notify-debouncer-full = "0.3"  # Debounced file system events with full metadata
+lz4_flex = "0.11"  # LZ4 compression for workflow checkpoints
+sha2 = "0.10"  # SHA-256 checksums for checkpoint integrity
+strsim = "0.10"  # String similarity for manual mapping auto-suggestion
+jsonschema = "0.18"  # JSON Schema validation for SoS interface schemas
+
+# CSV parsing and encoding
+csv = "1.3"
+csv-async = "1.3"  # Async CSV parsing for non-blocking I/O
+encoding_rs = "0.8"
+
+# Database connectivity (optional - requires DB2 ODBC drivers installed)
+odbc-api = { version = "20.1", optional = true }
+r2d2 = "0.8"
+deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }  # Async connection pooling
+deadpool-postgres = "0.14"  # PostgreSQL connection pooling
+
+# Authentication & Authorization
+jsonwebtoken = "9.2"
+tower_governor = "0.3"
+argon2 = "0.5"
+
+# Phase 2: Semantic Matching - gRPC Client Only (heavy ML in model service)
+# Note: tonic and prost already declared above (lines 39-41)
+ndarray = "0.15"  # N-dimensional arrays for embeddings (lightweight)
+
+# Rule Orchestration
+petgraph = "0.6"
+serde_yaml = "0.9"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+statrs = "0.16"
+rand = "0.8"
+
+# RDF types (NO Oxigraph - that's in shard!)
+rio_api = "0.8"
+rio_turtle = "0.8"
+rio_xml = "0.8"
+
+# memmap2 for file mapping
+memmap2 = "0.9"
+
+# libc for system calls (statvfs for disk space checking)
+libc = "0.2"
+
+# CRITICAL: NO oxigraph (that's shard-only)
+# Only rocksdb for temporal indexes
+
+# ===================================================================
+# Enterprise Bitemporal Dependencies (Phase 1 - Foundation)
+# Optional - enabled via feature flags for incremental rollout
+# ===================================================================
+
+# Raft consensus (optional - behind raft-consensus feature)
+raft = { version = "0.7", optional = true }
+raft-proto = { version = "0.7", optional = true }
+protobuf = { version = "2.28", optional = true }  # Required for raft protobuf codec
+slog = { version = "2.7", optional = true }
+
+# Cryptographic audit trail (optional - behind cryptographic-audit feature)
+ed25519-dalek = { version = "2.1", optional = true }
+blake3 = { version = "1.5", optional = true }
+hex = { version = "0.4", optional = true }
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+proptest = "1.4"
+tempfile = "3.8"
+regex = "1.10"
+tokio-stream = "0.1"
+hdrhistogram = "7.5"
+tokio-test = "0.4"
+rand = "0.8"
+serial_test = "3.0"
+
+# Benchmarks for performance testing
+[[bench]]
+name = "kafka_throughput_bench"
+harness = false
+
+[[bench]]
+name = "field_mapping_bench"
+harness = false
+
+[[bench]]
+name = "large_dataset_bench"
+harness = false

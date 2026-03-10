@@ -1,0 +1,461 @@
+//! Governance Brain Performance Testing
+//!
+//! Validates the async refactoring achieves target performance:
+//! - Target: 2,000+ events/sec (from 100-370/sec baseline)
+//! - Tests both sync and async implementations
+//! - Measures latency, throughput, and resource usage
+
+use graphica_core::core::lineage::{DataRef, LineageEvent, ModelRef, TransformRef, ModelMetrics, CdcPosition};
+use graphica_coordinator::governance::{GovernanceBrain, SharedGovernanceBrain};
+use graphica_coordinator::governance::shared_async::GovernanceConfig;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use uuid::Uuid;
+
+/// Create a realistic test lineage event
+fn create_test_event(id: usize) -> LineageEvent {
+    LineageEvent {
+        id: Uuid::new_v4(),
+        dataset: format!("perf_test_dataset_{}", id % 10),
+        record_id: format!("record_{}", id),
+        source_refs: vec![
+            DataRef {
+                system: "kafka".to_string(),
+                path: format!("topic_{}", id % 5),
+                version: Some("v1.0.0".to_string()),
+                extracted_at: chrono::Utc::now(),
+                cdc_position: Some(CdcPosition {
+                    topic: format!("topic_{}", id % 5),
+                    partition: 0,
+                    offset: id as i64,
+                    lsn: None,
+                }),
+            },
+        ],
+        transforms: vec![
+            TransformRef {
+                id: Uuid::new_v4(),
+                transform_type: "standardize".to_string(),
+                rule_id: "std_001".to_string(),
+                version: "1.0".to_string(),
+                parameters: HashMap::from([
+                    ("field".to_string(), serde_json::json!("email")),
+                ]),
+                applied_at: chrono::Utc::now(),
+                fields_modified: vec!["email".to_string()],
+            },
+        ],
+        model_refs: vec![
+            ModelRef {
+                model_id: format!("model_{}", id % 3),
+                version: "1.0.0".to_string(),
+                model_type: "sklearn.RandomForest".to_string(),
+                params_hash: format!("hash_{}", id),
+                training_data: vec![],
+                metrics: ModelMetrics {
+                    accuracy: Some(0.95),
+                    precision: Some(0.93),
+                    recall: Some(0.91),
+                    f1_score: Some(0.92),
+                    rmse: None,
+                    custom_metrics: HashMap::new(),
+                },
+                registry_uri: "mlflow://models".to_string(),
+                inference_at: chrono::Utc::now(),
+                features_used: vec!["feature1".to_string(), "feature2".to_string()],
+                outputs: vec!["prediction".to_string()],
+            },
+        ],
+        output_ref: DataRef {
+            system: "warehouse".to_string(),
+            path: "output_table".to_string(),
+            version: None,
+            extracted_at: chrono::Utc::now(),
+            cdc_position: None,
+        },
+        ts: chrono::Utc::now(),
+        run_id: "perf_test_run".to_string(),
+        tenant_id: "tenant_001".to_string(),
+        correlation_id: Some(Uuid::new_v4().to_string()),
+        metadata: HashMap::from([
+            ("test_id".to_string(), id.to_string()),
+            ("test_type".to_string(), "performance".to_string()),
+        ]),
+    }
+}
+
+#[tokio::test]
+async fn test_sync_baseline_performance() {
+    println!("\n=== SYNC BASELINE PERFORMANCE TEST ===");
+
+    let brain = GovernanceBrain::new("./data/perf_test_sync").unwrap();
+    let shared = SharedGovernanceBrain::new_sync(brain);
+
+    let num_events = 1000;
+    let start = Instant::now();
+
+    for i in 0..num_events {
+        let event = create_test_event(i);
+        shared.materialize_event(&event).expect("Failed to materialize");
+
+        if i % 100 == 0 {
+            println!("Sync processed {} events...", i);
+        }
+    }
+
+    let duration = start.elapsed();
+    let throughput = num_events as f64 / duration.as_secs_f64();
+
+    println!("Sync Implementation Results:");
+    println!("  Events: {}", num_events);
+    println!("  Duration: {:?}", duration);
+    println!("  Throughput: {:.0} events/sec", throughput);
+    println!("  Avg latency: {:.2} ms/event", duration.as_millis() as f64 / num_events as f64);
+
+    // Baseline expectation: 100-370 events/sec
+    assert!(throughput >= 50.0, "Sync throughput too low: {:.0}/sec", throughput);
+}
+
+#[tokio::test]
+async fn test_async_performance_single_thread() {
+    println!("\n=== ASYNC SINGLE-THREAD PERFORMANCE TEST ===");
+
+    let brain = GovernanceBrain::new("./data/perf_test_async_single").unwrap();
+
+    let config = GovernanceConfig {
+        use_async: true,
+        batch_config: Some(BatchConfig {
+            target_batch_size: 500,
+            max_batch_size: 1000,
+            batch_timeout_ms: 100,
+            num_processors: 4,
+            ..Default::default()
+        }),
+        enable_metrics: true,
+    };
+
+    let shared = SharedGovernanceBrain::new_with_config(brain, config).unwrap();
+
+    let num_events = 10_000;
+    let start = Instant::now();
+
+    for i in 0..num_events {
+        let event = create_test_event(i);
+        shared.materialize_lineage_event(&event).await.expect("Failed to materialize");
+
+        if i % 1000 == 0 && i > 0 {
+            println!("Async processed {} events...", i);
+        }
+    }
+
+    // Ensure all events are flushed
+    shared.flush().await.unwrap();
+
+    let duration = start.elapsed();
+    let throughput = num_events as f64 / duration.as_secs_f64();
+
+    println!("Async Single-Thread Results:");
+    println!("  Events: {}", num_events);
+    println!("  Duration: {:?}", duration);
+    println!("  Throughput: {:.0} events/sec", throughput);
+    println!("  Avg latency: {:.2} ms/event", duration.as_millis() as f64 / num_events as f64);
+
+    if let Some(metrics) = shared.metrics().await {
+        println!("  Processed events: {}", metrics.processed_events);
+        println!("  Batches processed: {}", metrics.batches_processed);
+        println!("  Avg batch size: {:.1}", metrics.avg_batch_size);
+    }
+
+    // Target: 2,000+ events/sec
+    assert!(throughput >= 1500.0, "Async throughput below target: {:.0}/sec", throughput);
+}
+
+#[tokio::test]
+async fn test_async_performance_concurrent() {
+    println!("\n=== ASYNC CONCURRENT PERFORMANCE TEST ===");
+
+    let brain = GovernanceBrain::new("./data/perf_test_async_concurrent").unwrap();
+
+    let config = GovernanceConfig {
+        use_async: true,
+        batch_config: Some(BatchConfig {
+            target_batch_size: 500,
+            max_batch_size: 1000,
+            batch_timeout_ms: 50,
+            num_processors: 4,
+            ..Default::default()
+        }),
+        enable_metrics: true,
+    };
+
+    let shared = Arc::new(SharedGovernanceBrain::new_with_config(brain, config).unwrap());
+
+    let num_events = 50_000;
+    let num_workers = 10;
+    let events_per_worker = num_events / num_workers;
+
+    // Use semaphore to control concurrency
+    let semaphore = Arc::new(Semaphore::new(100));
+
+    let start = Instant::now();
+    let mut handles = vec![];
+
+    for worker_id in 0..num_workers {
+        let shared_clone = shared.clone();
+        let sem_clone = semaphore.clone();
+
+        let handle = tokio::spawn(async move {
+            for i in 0..events_per_worker {
+                let event_id = worker_id * events_per_worker + i;
+                let event = create_test_event(event_id);
+
+                // Acquire permit to control concurrency
+                let _permit = sem_clone.acquire().await.unwrap();
+
+                shared_clone.materialize_lineage_event(&event)
+                    .await
+                    .expect("Failed to materialize");
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all workers
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // Ensure all events are flushed
+    shared.flush().await.unwrap();
+
+    let duration = start.elapsed();
+    let throughput = num_events as f64 / duration.as_secs_f64();
+
+    println!("Async Concurrent Results:");
+    println!("  Events: {}", num_events);
+    println!("  Workers: {}", num_workers);
+    println!("  Duration: {:?}", duration);
+    println!("  Throughput: {:.0} events/sec", throughput);
+
+    if let Some(metrics) = shared.metrics().await {
+        let processed = metrics.processed_events;
+        let batches = metrics.batches_processed;
+        let errors = metrics.failed_events;
+
+        println!("  Events processed: {}", processed);
+        println!("  Batches: {}", batches);
+        println!("  Avg batch size: {:.1}", metrics.avg_batch_size);
+        println!("  Errors: {}", errors);
+
+        assert_eq!(processed, num_events as u64, "Not all events processed");
+        assert_eq!(errors, 0, "Batch errors occurred");
+    }
+
+    // Target: 2,000+ events/sec with concurrency
+    assert!(throughput >= 2000.0, "Concurrent throughput below target: {:.0}/sec", throughput);
+}
+
+#[tokio::test]
+async fn test_batch_api_performance() {
+    println!("\n=== BATCH API PERFORMANCE TEST ===");
+
+    let brain = GovernanceBrain::new("./data/perf_test_batch_api").unwrap();
+    let shared = SharedGovernanceBrain::new(brain);
+
+    let batch_size = 1000;
+    let num_batches = 50;
+    let total_events = batch_size * num_batches;
+
+    let start = Instant::now();
+
+    for batch_id in 0..num_batches {
+        let events: Vec<_> = (0..batch_size)
+            .map(|i| create_test_event(batch_id * batch_size + i))
+            .collect();
+
+        shared.materialize_batch(events).await.unwrap();
+
+        if batch_id % 10 == 0 {
+            println!("Processed batch {}/{}", batch_id, num_batches);
+        }
+    }
+
+    let duration = start.elapsed();
+    let throughput = total_events as f64 / duration.as_secs_f64();
+
+    println!("Batch API Results:");
+    println!("  Total events: {}", total_events);
+    println!("  Batch size: {}", batch_size);
+    println!("  Duration: {:?}", duration);
+    println!("  Throughput: {:.0} events/sec", throughput);
+
+    // Batch API should achieve highest throughput
+    assert!(throughput >= 5000.0, "Batch API throughput below target: {:.0}/sec", throughput);
+}
+
+#[tokio::test]
+async fn test_mixed_workload_performance() {
+    println!("\n=== MIXED WORKLOAD PERFORMANCE TEST ===");
+
+    let brain = GovernanceBrain::new("./data/perf_test_mixed").unwrap();
+    let shared = Arc::new(SharedGovernanceBrain::new(brain));
+
+    let num_writers = 5;
+    let num_readers = 3;
+    let events_per_writer = 2000;
+
+    let start = Instant::now();
+    let mut handles = vec![];
+
+    // Spawn writers
+    for writer_id in 0..num_writers {
+        let shared_clone = shared.clone();
+
+        let handle = tokio::spawn(async move {
+            for i in 0..events_per_writer {
+                let event = create_test_event(writer_id * events_per_writer + i);
+                shared_clone.materialize_lineage_event(&event).await.unwrap();
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Spawn readers (SPARQL queries)
+    for reader_id in 0..num_readers {
+        let shared_clone = shared.clone();
+
+        let handle = tokio::spawn(async move {
+            for i in 0..100 {
+                let query = format!(
+                    "SELECT ?s ?p ?o WHERE {{ ?s ?p ?o }} LIMIT {}",
+                    (reader_id + 1) * 10
+                );
+
+                shared_clone.query_async(&query).await.unwrap();
+
+                // Small delay between queries
+                if i % 10 == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all tasks
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    shared.flush().await.unwrap();
+
+    let duration = start.elapsed();
+    let total_events = num_writers * events_per_writer;
+    let write_throughput = total_events as f64 / duration.as_secs_f64();
+
+    println!("Mixed Workload Results:");
+    println!("  Writers: {}", num_writers);
+    println!("  Readers: {}", num_readers);
+    println!("  Total events: {}", total_events);
+    println!("  Duration: {:?}", duration);
+    println!("  Write throughput: {:.0} events/sec", write_throughput);
+
+    // Should maintain good throughput even with concurrent reads
+    assert!(write_throughput >= 1500.0, "Mixed workload throughput too low: {:.0}/sec", write_throughput);
+}
+
+#[tokio::test]
+async fn test_fire_and_forget_performance() {
+    println!("\n=== FIRE-AND-FORGET PERFORMANCE TEST ===");
+
+    let brain = GovernanceBrain::new("./data/perf_test_nowait").unwrap();
+    let shared = SharedGovernanceBrain::new(brain);
+
+    // Fire-and-forget should achieve maximum throughput
+    let num_events = 100_000;
+    let start = Instant::now();
+
+    for i in 0..num_events {
+        let event = create_test_event(i);
+
+        // Try fire-and-forget, fall back to regular if channel full
+        if shared.materialize_nowait(event.clone()).is_err() {
+            // Channel full - wait a bit
+            tokio::time::sleep(Duration::from_micros(100)).await;
+            shared.materialize_nowait(event).unwrap();
+        }
+
+        if i % 10000 == 0 && i > 0 {
+            println!("Fired {} events...", i);
+        }
+    }
+
+    // Give time for processing
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    shared.flush().await.unwrap();
+
+    let duration = start.elapsed();
+    let throughput = num_events as f64 / duration.as_secs_f64();
+
+    println!("Fire-and-Forget Results:");
+    println!("  Events fired: {}", num_events);
+    println!("  Duration: {:?}", duration);
+    println!("  Throughput: {:.0} events/sec", throughput);
+
+    if let Some(metrics) = shared.metrics().await {
+        let processed = metrics.processed_events;
+        println!("  Events processed: {}", processed);
+
+        // Some events might still be in flight
+        assert!(processed >= (num_events as u64 * 95 / 100), "Too many events lost");
+    }
+
+    // Fire-and-forget should achieve very high throughput
+    assert!(throughput >= 10000.0, "Fire-and-forget throughput too low: {:.0}/sec", throughput);
+}
+
+#[tokio::test]
+async fn test_performance_comparison() {
+    println!("\n=== PERFORMANCE COMPARISON ===");
+
+    let test_events = 5000;
+
+    // Test sync implementation
+    let brain_sync = GovernanceBrain::new("./data/perf_compare_sync").unwrap();
+    let shared_sync = SharedGovernanceBrain::new_sync(brain_sync);
+
+    let start_sync = Instant::now();
+    for i in 0..test_events {
+        shared_sync.materialize_event(&create_test_event(i)).unwrap();
+    }
+    let sync_duration = start_sync.elapsed();
+    let sync_throughput = test_events as f64 / sync_duration.as_secs_f64();
+
+    // Test async implementation
+    let brain_async = GovernanceBrain::new("./data/perf_compare_async").unwrap();
+    let shared_async = SharedGovernanceBrain::new(brain_async);
+
+    let start_async = Instant::now();
+    for i in 0..test_events {
+        shared_async.materialize_lineage_event(&create_test_event(i)).await.unwrap();
+    }
+    shared_async.flush().await.unwrap();
+    let async_duration = start_async.elapsed();
+    let async_throughput = test_events as f64 / async_duration.as_secs_f64();
+
+    // Calculate improvement
+    let improvement = async_throughput / sync_throughput;
+
+    println!("Performance Comparison:");
+    println!("  Sync:  {:.0} events/sec ({:?} for {} events)", sync_throughput, sync_duration, test_events);
+    println!("  Async: {:.0} events/sec ({:?} for {} events)", async_throughput, async_duration, test_events);
+    println!("  Improvement: {:.1}x", improvement);
+
+    // Should see at least 5x improvement
+    assert!(improvement >= 5.0, "Async improvement only {:.1}x (expected ≥5x)", improvement);
+}

@@ -1,0 +1,11 @@
+CUSTOMER_ID,FIRST_NAME,LAST_NAME,EMAIL,PHONE,DATE_OF_BIRTH,LOYALTY_POINTS,CUSTOMER_SEGMENT
+101,David,Davis,david.davis@example.com,555-0201,1992-05-10,450,BRONZE
+102,Emma,Evans,emma.evans@example.com,555-0202,1987-09-18,1200,SILVER
+103,Frank,Foster,frank.foster@example.com,555-0203,1995-12-03,200,BRONZE
+104,Grace,Garcia,grace.garcia@example.com,555-0204,1989-06-25,2100,GOLD
+105,Henry,Harris,henry.harris@example.com,555-0205,1993-02-14,650,SILVER
+106,Iris,Ingram,iris.ingram@example.com,555-0206,1986-11-30,380,BRONZE
+107,Jack,Jackson,jack.jackson@example.com,555-0207,1991-08-22,1550,SILVER
+108,Kelly,King,kelly.king@example.com,555-0208,1994-04-07,950,SILVER
+109,Leo,Lee,leo.lee@example.com,555-0209,1988-07-16,3200,PLATINUM
+110,Mia,Martinez,mia.martinez@example.com,555-0210,1996-01-29,180,BRONZE

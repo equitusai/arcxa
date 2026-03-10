@@ -1,0 +1,61 @@
+//! Tests for temporal index health checks
+
+use graphica_coordinator::governance::rdf_store::GraphicaRdfStore;
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn test_temporal_index_health_check() {
+    println!("\n=== TEST: Temporal Index Health Check ===");
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create RDF store with temporal indexes
+    let store = GraphicaRdfStore::new_in_memory()
+        .unwrap()
+        .with_temporal_indexes(temp_dir.path().join("indexes"))
+        .unwrap();
+
+    println!("✓ Created RDF store with temporal indexes");
+
+    // Perform health check
+    let health = store.temporal_index_health();
+    assert!(health.is_some(), "Health check should return Some when indexes enabled");
+
+    let health_status = health.unwrap();
+    println!("✓ Health check returned: {:?}", health_status);
+
+    // Verify all health checks pass
+    assert!(health_status.healthy, "Temporal indexes should be healthy");
+    assert!(health_status.rocksdb_accessible, "RocksDB should be accessible");
+    assert!(health_status.column_families_ok, "All column families should exist");
+    assert!(health_status.cache_operational, "Cache should be operational");
+    assert!(health_status.basic_ops_ok, "Basic operations should work");
+    assert_eq!(health_status.cache_size, 0, "Cache should start empty");
+    assert!(health_status.error_message.is_none(), "No errors should be present");
+
+    println!("✅ All health checks PASSED:");
+    println!("   - RocksDB accessible: {}", health_status.rocksdb_accessible);
+    println!("   - Column families OK: {}", health_status.column_families_ok);
+    println!("   - Cache operational: {}", health_status.cache_operational);
+    println!("   - Basic ops OK: {}", health_status.basic_ops_ok);
+    println!("   - Cache size: {}", health_status.cache_size);
+
+    println!("\n🎉 TEMPORAL INDEX HEALTH CHECK TEST PASSED!");
+}
+
+#[tokio::test]
+async fn test_health_check_without_indexes() {
+    println!("\n=== TEST: Health Check Without Indexes ===");
+
+    // Create RDF store WITHOUT temporal indexes
+    let store = GraphicaRdfStore::new_in_memory().unwrap();
+
+    println!("✓ Created RDF store without temporal indexes");
+
+    // Health check should return None
+    let health = store.temporal_index_health();
+    assert!(health.is_none(), "Health check should return None when indexes not enabled");
+
+    println!("✓ Health check correctly returns None for disabled indexes");
+    println!("\n🎉 HEALTH CHECK WITHOUT INDEXES TEST PASSED!");
+}

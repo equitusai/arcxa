@@ -1,0 +1,331 @@
+//! RDF persistence for workflow execution results
+//!
+//! Converts workflow results to RDF triples using W3C PROV ontology
+//! and stores them in the governance brain's RDF store.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use std::sync::Arc;
+
+use crate::orchestration::workflow::executor::{WorkflowResult, StepResult, FinalDecision};
+use crate::governance::rdf_store::{GraphicaRdfStore, NamedGraph};
+use crate::governance::rdf_star::AnnotatedTriple;
+
+/// RDF namespace for workflow orchestration
+const WORKFLOW_NS: &str = "http://graphica.io/workflow#";
+const PROV_NS: &str = "http://www.w3.org/ns/prov#";
+
+/// Workflow result persistence layer
+pub struct WorkflowResultPersistence {
+    rdf_store: Arc<GraphicaRdfStore>,
+}
+
+impl WorkflowResultPersistence {
+    /// Create new persistence layer with RDF store
+    pub fn new(rdf_store: Arc<GraphicaRdfStore>) -> Self {
+        Self { rdf_store }
+    }
+
+    /// Persist workflow result to RDF store
+    pub async fn persist_result(&self, workflow_id: &str, result: &WorkflowResult) -> Result<()> {
+        let mut triples = Vec::new();
+
+        // Create URIs
+        let execution_uri = self.execution_uri(&result.execution_id);
+        let workflow_uri = self.workflow_uri(workflow_id);
+
+        // Type declaration: this execution is a workflow execution
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}type", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+                &format!("{}{}", PROV_NS, "Activity"),
+            )
+            .with_timestamp(&result.started_at),
+        );
+
+        // Link to workflow definition
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}executedWorkflow", WORKFLOW_NS),
+                &workflow_uri,
+            )
+        );
+
+        // Execution metadata
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}startedAtTime", PROV_NS),
+                &format!("\"{}\"^^xsd:dateTime", result.started_at.to_rfc3339()),
+            )
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}endedAtTime", PROV_NS),
+                &format!("\"{}\"^^xsd:dateTime", result.completed_at.to_rfc3339()),
+            )
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}success", WORKFLOW_NS),
+                &format!("\"{}\"^^xsd:boolean", result.success),
+            )
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}confidence", WORKFLOW_NS),
+                &format!("\"{}\"^^xsd:double", result.confidence),
+            ).with_confidence(result.confidence)
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &execution_uri,
+                &format!("{}finalDecision", WORKFLOW_NS),
+                &format!("\"{}\"", format!("{:?}", result.final_decision)),
+            )
+        );
+
+        if let Some(error) = &result.error {
+            triples.push(
+                AnnotatedTriple::new(
+                    &execution_uri,
+                    &format!("{}error", WORKFLOW_NS),
+                    &format!("\"{}\"", error.replace('"', "\\\"")),
+                )
+            );
+        }
+
+        // Persist step results
+        for (step_id, step_result) in &result.step_results {
+            let step_triples = self.step_result_to_triples(&execution_uri, step_id, step_result)?;
+            triples.extend(step_triples);
+        }
+
+        // Insert triples into RDF store using workflow graph
+        let graph = NamedGraph::new(format!("{}executions", WORKFLOW_NS));
+        for triple in triples {
+            self.rdf_store.insert_rdf_star_triple(&triple, Some(&graph))?;
+        }
+
+        Ok(())
+    }
+
+    /// Convert step result to RDF triples
+    fn step_result_to_triples(
+        &self,
+        execution_uri: &str,
+        step_id: &str,
+        step_result: &StepResult,
+    ) -> Result<Vec<AnnotatedTriple>> {
+        let mut triples = Vec::new();
+        let step_uri = self.step_execution_uri(&step_result.step_id);
+
+        // Type: step execution
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}type", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+                &format!("{}{}", PROV_NS, "Activity"),
+            )
+            .with_timestamp(&step_result.started_at)
+        );
+
+        // Link to parent execution
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}partOfExecution", WORKFLOW_NS),
+                execution_uri,
+            )
+        );
+
+        // Step metadata
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}stepId", WORKFLOW_NS),
+                &format!("\"{}\"", step_id),
+            )
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}success", WORKFLOW_NS),
+                &format!("\"{}\"^^xsd:boolean", step_result.success),
+            )
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}confidence", WORKFLOW_NS),
+                &format!("\"{}\"^^xsd:double", step_result.confidence),
+            ).with_confidence(step_result.confidence)
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}startedAtTime", PROV_NS),
+                &format!("\"{}\"^^xsd:dateTime", step_result.started_at.to_rfc3339()),
+            )
+        );
+
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}endedAtTime", PROV_NS),
+                &format!("\"{}\"^^xsd:dateTime", step_result.completed_at.to_rfc3339()),
+            )
+        );
+
+        // Store output as JSON string
+        let output_json = serde_json::to_string(&step_result.output)
+            .context("Failed to serialize step output")?;
+        triples.push(
+            AnnotatedTriple::new(
+                &step_uri,
+                &format!("{}output", WORKFLOW_NS),
+                &format!("\"{}\"", output_json.replace('"', "\\\"")),
+            )
+        );
+
+        Ok(triples)
+    }
+
+    /// Query workflow execution history
+    pub async fn query_execution_history(
+        &self,
+        workflow_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<ExecutionSummary>> {
+        let workflow_uri = self.workflow_uri(workflow_id);
+
+        let sparql = format!(
+            r#"
+            PREFIX workflow: <{WORKFLOW_NS}>
+            PREFIX prov: <{PROV_NS}>
+
+            SELECT ?execution ?success ?confidence ?started ?ended
+            WHERE {{
+                ?execution workflow:executedWorkflow <{workflow_uri}> ;
+                          workflow:success ?success ;
+                          workflow:confidence ?confidence ;
+                          prov:startedAtTime ?started ;
+                          prov:endedAtTime ?ended .
+            }}
+            ORDER BY DESC(?started)
+            {limit_clause}
+            "#,
+            limit_clause = limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default()
+        );
+
+        let results = self.rdf_store.query_rdf_star(&sparql)?;
+
+        // Parse results into ExecutionSummary
+        // TODO: Implement result parsing from JSON
+        Ok(vec![])
+    }
+
+    /// Get detailed execution result by ID
+    pub async fn get_execution_details(&self, execution_id: &str) -> Result<Option<serde_json::Value>> {
+        let execution_uri = self.execution_uri(execution_id);
+
+        let sparql = format!(
+            r#"
+            PREFIX workflow: <{WORKFLOW_NS}>
+            PREFIX prov: <{PROV_NS}>
+
+            SELECT ?p ?o
+            WHERE {{
+                <{execution_uri}> ?p ?o .
+            }}
+            "#
+        );
+
+        let results = self.rdf_store.query_rdf_star(&sparql)?;
+
+        // query_rdf_star returns Vec<JsonValue>
+        if results.is_empty() {
+            return Ok(None);
+        }
+
+        // Convert SPARQL results to execution details JSON
+        let mut details = serde_json::json!({
+            "execution_id": execution_id,
+            "execution_uri": execution_uri,
+            "properties": {}
+        });
+
+        // Each result is a binding with p and o variables
+        for result in results {
+            if let (Some(p), Some(o)) = (
+                result.get("p").and_then(|v| v.as_str()),
+                result.get("o")
+            ) {
+                details["properties"][p] = o.clone();
+            }
+        }
+
+        Ok(Some(details))
+    }
+
+    // Helper methods for URI construction
+
+    fn execution_uri(&self, execution_id: &str) -> String {
+        format!("{}execution/{}", WORKFLOW_NS, execution_id)
+    }
+
+    fn workflow_uri(&self, workflow_id: &str) -> String {
+        format!("{}workflow/{}", WORKFLOW_NS, workflow_id)
+    }
+
+    fn step_execution_uri(&self, step_id: &str) -> String {
+        format!("{}step/{}", WORKFLOW_NS, step_id)
+    }
+}
+
+/// Execution summary for query results
+#[derive(Debug, Clone)]
+pub struct ExecutionSummary {
+    pub execution_id: String,
+    pub workflow_id: String,
+    pub success: bool,
+    pub confidence: f64,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uri_construction() {
+        let persistence = WorkflowResultPersistence {
+            rdf_store: Arc::new(GraphicaRdfStore::new_in_memory().unwrap()),
+        };
+
+        let execution_uri = persistence.execution_uri("exec_123");
+        assert_eq!(
+            execution_uri,
+            "http://graphica.io/workflow#execution/exec_123"
+        );
+
+        let workflow_uri = persistence.workflow_uri("wf_456");
+        assert_eq!(
+            workflow_uri,
+            "http://graphica.io/workflow#workflow/wf_456"
+        );
+    }
+}

@@ -1,0 +1,69 @@
+apiVersion: graphica.io/v1
+kind: Workflow
+metadata:
+  name: customer-routing
+  version: 1.0.0
+  description: Route customers based on type and revenue
+  owner: data-team
+  tags:
+    - customer
+    - routing
+    - demo
+
+spec:
+  execution:
+    mode: streaming
+    timeout: 300
+    retries: 3
+
+  default_route: standard
+
+  routes:
+    # Enterprise customers - high priority
+    - name: enterprise
+      priority: 100
+      condition:
+        And:
+          - Field:
+              field: customer_type
+              operator: Equals
+              value: "enterprise"
+          - Field:
+              field: annual_revenue
+              operator: GreaterThan
+              value: 1000000
+
+      actions:
+        - type: SetField
+          field: tier
+          value: "platinum"
+
+        - type: SetField
+          field: priority_queue
+          value: "high"
+
+        - type: Log
+          level: info
+          message: "Routing enterprise customer to high priority queue"
+
+    # Standard customers
+    - name: standard
+      priority: 50
+      condition:
+        Always: true
+
+      actions:
+        - type: SetField
+          field: tier
+          value: "standard"
+
+        - type: SetField
+          field: priority_queue
+          value: "normal"
+
+  monitoring:
+    enabled: true
+    quality_threshold: 0.95
+    sla:
+      latency_p99_ms: 1000
+      throughput_per_sec: 10000

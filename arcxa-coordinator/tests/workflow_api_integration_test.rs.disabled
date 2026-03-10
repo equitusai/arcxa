@@ -1,0 +1,789 @@
+//! Workflow API Integration Tests
+//!
+//! Tests the complete REST API workflow lifecycle including:
+//! - HTTP request/response through Axum router
+//! - Authentication and middleware
+//! - State extraction and FromRef trait
+//! - All modern workflow endpoints (Implementation #3)
+//! - Backward compatibility with existing workflow endpoints
+//!
+//! These tests use axum::test_helpers to create a real test server.
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, Method},
+    Router,
+};
+use graphica_coordinator::api::{ApiState};
+use graphica_coordinator::api::auth::AuthConfig;
+use graphica_coordinator::api::setup_token::SetupTokenManager;
+use graphica_coordinator::storage::LineageStorage;
+use graphica_coordinator::workflows::domain::{
+    Action, Condition, ExecutionMode, Route, StreamingConfig, Workflow,
+    WatermarkStrategy, StateBackendConfig,
+};
+use graphica_coordinator::workflows::storage::{
+    ExecutionStore, ScheduleStore, WorkflowStore,
+};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+/// Helper to create test API state with all necessary components
+fn create_test_api_state() -> Arc<ApiState> {
+    let test_secret = vec![
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+    ];
+    let auth_config = Arc::new(AuthConfig::from_secret_bytes(&test_secret).unwrap());
+    let setup_token_manager = Arc::new(SetupTokenManager::new());
+
+    // Use unique directory for each test to avoid RocksDB lock conflicts
+    let test_id = Uuid::new_v4();
+    let base_path = format!("/tmp/graphica-test-{}", test_id);
+
+    let lineage_storage = Arc::new(
+        LineageStorage::new(
+            &format!("{}/rocks", base_path),
+            &format!("{}/parquet", base_path),
+            &format!("{}/cold", base_path),
+            "localhost:9092"
+        ).unwrap()
+    );
+
+    Arc::new(ApiState {
+        lineage_storage,
+        governance_brain: None,
+        rdf_store: None,
+        shard_registry: None,
+        query_executor: None,
+        workflow_engine: None,
+        model_registry: None,
+        model_cache: None,
+        rule_executor: None,
+            transformer_registry: None,
+        circuit_breakers: None,
+        auth_config,
+        user_service: None,
+        setup_token_manager,
+        audit_logger: None,
+        datasource_catalog: None,
+        datasource_catalog_impl: None,
+        import_job_manager: Arc::new(graphica_coordinator::api::import_jobs::ImportJobManager::new()),
+        persisted_ontology_registry: None,
+        ontology_registry: None,
+        rdf_storage: None,
+        connector_registry: None,
+        resolved_entity_cache: None,
+        metrics_registry: None,
+        mapping_engine: None,
+        secret_store_registry: None,
+        loader_job_manager: None,
+        unified_mapping_coordinator: None,
+        schedule_store: Some(Arc::new(ScheduleStore::new())),
+        workflow_store: Some(Arc::new(WorkflowStore::new())),
+        execution_store: Some(Arc::new(ExecutionStore::new())),
+        file_library: None,
+        kafka_producer: None,
+        http_client: None,
+        lineage_generator: None,
+        metrics: None,
+        replay_coordinator: None,
+        row_lineage_store: None,
+    })
+}
+
+/// Build a test router without auth middleware for testing
+fn build_test_router(state: ApiState) -> Router {
+    use axum::routing::{get, post, put, delete};
+    use graphica_coordinator::workflows::api::handlers;
+
+    let state_arc = std::sync::Arc::new(state);
+
+    Router::new()
+        // Workflow CRUD (basic endpoints)
+        .route("/api/v1/workflows", post(handlers::create_workflow))
+        .route("/api/v1/workflows", get(handlers::list_workflows))
+        .route("/api/v1/workflows/:id", get(handlers::get_workflow))
+        .route("/api/v1/workflows/:id", put(handlers::update_workflow))
+        .route("/api/v1/workflows/:id", delete(handlers::delete_workflow))
+        // Nest modern workflow endpoints under /api/v1
+        .nest("/api/v1", graphica_coordinator::workflows::api::create_modern_workflow_router())
+        .with_state(state_arc)
+}
+
+/// Helper to create a test streaming workflow
+fn create_streaming_workflow(id: &str) -> Workflow {
+    let route = Route::with_priority(
+        "rt_001",
+        "streaming_route",
+        Condition::Always,
+        vec![
+            Action::Log {
+                level: "info".to_string(),
+                message: "Processing streaming record".to_string(),
+            },
+            Action::Transform {
+                transformer: "add_timestamp".to_string(),
+                config: json!({
+                    "field": "processed_timestamp"
+                }),
+            },
+        ],
+        100,
+    );
+
+    let mut kafka_props = HashMap::new();
+    kafka_props.insert("bootstrap.servers".to_string(), "localhost:9092".to_string());
+
+    let streaming_config = StreamingConfig {
+        source_topic: "test_events".to_string(),
+        consumer_group: format!("{}_group", id),
+        checkpoint_interval_ms: 60000,
+        watermark_strategy: WatermarkStrategy::BoundedOutOfOrderness {
+            max_out_of_orderness_ms: 30000,
+        },
+        max_parallel_workers: Some(2),
+        state_backend: StateBackendConfig::Memory,
+        auto_scaling: None,
+        kafka_properties: kafka_props,
+    };
+
+    let mut workflow = Workflow::new(id, format!("Test Workflow {}", id), vec![route]);
+    workflow.execution_mode = ExecutionMode::Streaming {
+        config: streaming_config,
+    };
+
+    workflow.with_description("Integration test workflow")
+}
+
+/// Helper to create a batch workflow
+fn create_batch_workflow(id: &str) -> Workflow {
+    let route = Route::with_priority(
+        "rt_001",
+        "batch_route",
+        Condition::Always,
+        vec![Action::Log {
+            level: "info".to_string(),
+            message: "Processing batch record".to_string(),
+        }],
+        100,
+    );
+
+    Workflow::new(id, format!("Batch Workflow {}", id), vec![route])
+        .with_description("Integration test batch workflow")
+}
+
+/// Helper to extract JSON body from response
+async fn extract_json_body(body: Body) -> Value {
+    let bytes = to_bytes(body, usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn test_workflow_create_via_api() {
+    let state = create_test_api_state();
+    let app = build_test_router((*state).clone());
+
+    let workflow = create_batch_workflow("wf_api_001");
+    let request_body = serde_json::to_string(&workflow).unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows")
+        .header("content-type", "application/json")
+        .body(Body::from(request_body))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    // ID is auto-generated, just verify it starts with "wf_"
+    assert!(body["id"].as_str().unwrap().starts_with("wf_"));
+    assert_eq!(body["name"], "Batch Workflow wf_api_001");
+}
+
+#[tokio::test]
+async fn test_workflow_get_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_002");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/workflows/wf_api_002")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert_eq!(body["id"], "wf_api_002");
+    assert_eq!(body["name"], "Batch Workflow wf_api_002");
+}
+
+#[tokio::test]
+async fn test_workflow_list_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflows
+    let wf1 = create_batch_workflow("wf_api_list_001");
+    let wf2 = create_streaming_workflow("wf_api_list_002");
+    state.workflow_store.as_ref().unwrap().create(wf1).unwrap();
+    state.workflow_store.as_ref().unwrap().create(wf2).unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/workflows")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert!(body.is_array());
+    assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_workflow_delete_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_003");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri("/api/v1/workflows/wf_api_003")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Verify deleted
+    let deleted = state.workflow_store.as_ref().unwrap().get("wf_api_003").unwrap();
+    assert!(deleted.is_none());
+}
+
+#[tokio::test]
+async fn test_execute_workflow_async_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_async_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    let request_body = json!({
+        "input_data": {"key": "value"}
+    });
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows/wf_api_async_001/execute-async")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert!(body["execution_id"].is_string());
+    assert_eq!(body["workflow_id"], "wf_api_async_001");
+    assert_eq!(body["status"], "pending");
+}
+
+#[tokio::test]
+async fn test_get_execution_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_exec_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    // Create execution via async endpoint first
+    let app = build_test_router((*state).clone());
+
+    let request_body = json!({"input_data": {"test": "data"}});
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows/wf_api_exec_001/execute-async")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    let create_body = extract_json_body(response.into_body()).await;
+    let execution_id = create_body["execution_id"].as_str().unwrap();
+
+    // Now get the execution
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/executions/{}", execution_id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert_eq!(body["execution_id"], execution_id);
+    assert_eq!(body["workflow_id"], "wf_api_exec_001");
+}
+
+#[tokio::test]
+async fn test_list_executions_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_list_exec_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    // Create multiple executions
+    let app = build_test_router((*state).clone());
+
+    for i in 0..3 {
+        let request_body = json!({"input_data": {"index": i}});
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/workflows/wf_api_list_exec_001/execute-async")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+            .unwrap();
+
+        let _ = app.clone().oneshot(request).await.unwrap();
+    }
+
+    // List all executions
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/executions")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert!(body["executions"].is_array());
+    assert_eq!(body["executions"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn test_list_executions_with_workflow_filter_via_api() {
+    let state = create_test_api_state();
+
+    // Create two workflows
+    let wf1 = create_batch_workflow("wf_api_filter_001");
+    let wf2 = create_batch_workflow("wf_api_filter_002");
+    state.workflow_store.as_ref().unwrap().create(wf1).unwrap();
+    state.workflow_store.as_ref().unwrap().create(wf2).unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    // Create executions for both workflows
+    for workflow_id in &["wf_api_filter_001", "wf_api_filter_002"] {
+        let request_body = json!({"input_data": {}});
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/workflows/{}/execute-async", workflow_id))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+            .unwrap();
+
+        let _ = app.clone().oneshot(request).await.unwrap();
+    }
+
+    // List executions filtered by workflow_id
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/executions?workflow_id=wf_api_filter_001")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    let executions = body["executions"].as_array().unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0]["workflow_id"], "wf_api_filter_001");
+}
+
+#[tokio::test]
+async fn test_stop_execution_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_stop_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    // Create execution
+    let request_body = json!({"input_data": {}});
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows/wf_api_stop_001/execute-async")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    let create_body = extract_json_body(response.into_body()).await;
+    let execution_id = create_body["execution_id"].as_str().unwrap();
+
+    // Stop execution
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/executions/{}/stop", execution_id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert_eq!(body["status"], "stopped");
+}
+
+#[tokio::test]
+async fn test_pause_resume_execution_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_pause_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    // Create execution
+    let request_body = json!({"input_data": {}});
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows/wf_api_pause_001/execute-async")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    let create_body = extract_json_body(response.into_body()).await;
+    let execution_id = create_body["execution_id"].as_str().unwrap();
+
+    // Immediately try to pause execution while it's still pending/starting
+    // (No delay - we want to pause before it completes)
+    // Pause execution
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/executions/{}/pause", execution_id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+
+    // Debug: print status if not OK
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = extract_json_body(response.into_body()).await;
+        eprintln!("Pause failed with status {}: {:?}", status, body);
+
+        // Check current execution status
+        let get_request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/executions/{}", execution_id))
+            .body(Body::empty())
+            .unwrap();
+        let get_response = app.clone().oneshot(get_request).await.unwrap();
+        let exec_body = extract_json_body(get_response.into_body()).await;
+        eprintln!("Current execution status: {:?}", exec_body["status"]);
+    }
+
+    assert_eq!(status, StatusCode::OK);
+
+    // Resume execution
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/executions/{}/resume", execution_id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert_eq!(body["status"], "running");
+}
+
+#[tokio::test]
+async fn test_abort_execution_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_abort_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    // Create execution
+    let request_body = json!({"input_data": {}});
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows/wf_api_abort_001/execute-async")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    let create_body = extract_json_body(response.into_body()).await;
+    let execution_id = create_body["execution_id"].as_str().unwrap();
+
+    // Abort execution
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/executions/{}/abort", execution_id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert_eq!(body["status"], "aborted");
+}
+
+#[tokio::test]
+async fn test_get_execution_logs_via_api() {
+    let state = create_test_api_state();
+
+    // Pre-populate workflow
+    let workflow = create_batch_workflow("wf_api_logs_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    let app = build_test_router((*state).clone());
+
+    // Create execution
+    let request_body = json!({"input_data": {}});
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows/wf_api_logs_001/execute-async")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    let create_body = extract_json_body(response.into_body()).await;
+    let execution_id = create_body["execution_id"].as_str().unwrap();
+
+    // Get execution logs
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/executions/{}/logs", execution_id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert!(body["logs"].is_array());
+}
+
+#[tokio::test]
+async fn test_streaming_workflow_via_api() {
+    let state = create_test_api_state();
+    let app = build_test_router((*state).clone());
+
+    // Pre-create workflow directly in store (since we need streaming mode which isn't in DTO)
+    let workflow = create_streaming_workflow("wf_api_stream_001");
+    state.workflow_store.as_ref().unwrap()
+        .create(workflow.clone())
+        .unwrap();
+
+    // Get the workflow via API
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/workflows/wf_api_stream_001")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = extract_json_body(response.into_body()).await;
+    assert_eq!(body["id"], "wf_api_stream_001");
+
+    // Verify execution mode preserved
+    assert!(body["execution_mode"].is_object());
+    assert_eq!(body["execution_mode"]["type"], "streaming");
+    assert_eq!(body["execution_mode"]["source_topic"], "test_events");
+    assert_eq!(body["execution_mode"]["consumer_group"], "wf_api_stream_001_group");
+    assert_eq!(body["execution_mode"]["checkpoint_interval_ms"], 60000);
+}
+
+#[tokio::test]
+async fn test_workflow_not_found_via_api() {
+    let state = create_test_api_state();
+    let app = build_test_router((*state).clone());
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/workflows/nonexistent")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_execution_not_found_via_api() {
+    let state = create_test_api_state();
+    let app = build_test_router((*state).clone());
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/executions/nonexistent_exec_id")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_invalid_workflow_validation_via_api() {
+    let state = create_test_api_state();
+    let app = build_test_router((*state).clone());
+
+    // Test 1: Create workflow with empty name (invalid)
+    use graphica_coordinator::workflows::api::dto::CreateWorkflowRequest;
+    use graphica_coordinator::workflows::domain::{Action, Condition};
+    use graphica_coordinator::workflows::api::dto::RouteDto;
+
+    let invalid_request = CreateWorkflowRequest {
+        name: "".to_string(), // Empty name should be invalid
+        description: "Test".to_string(),
+        routes: vec![RouteDto {
+            name: "test_route".to_string(),
+            description: "Test route".to_string(),
+            condition: Box::new(Condition::Always),
+            actions: vec![Action::Log {
+                level: "info".to_string(),
+                message: "test".to_string(),
+            }],
+            priority: 100,
+        }],
+        default_route: None,
+        tags: vec![],
+    };
+
+    let request_body = serde_json::to_string(&invalid_request).unwrap();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows")
+        .header("content-type", "application/json")
+        .body(Body::from(request_body))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Test 2: Create workflow with empty routes (invalid)
+    let invalid_request2 = CreateWorkflowRequest {
+        name: "Valid Name".to_string(),
+        description: "Test".to_string(),
+        routes: vec![], // Empty routes should be invalid
+        default_route: None,
+        tags: vec![],
+    };
+
+    let request_body2 = serde_json::to_string(&invalid_request2).unwrap();
+    let request2 = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows")
+        .header("content-type", "application/json")
+        .body(Body::from(request_body2))
+        .unwrap();
+
+    let response2 = app.oneshot(request2).await.unwrap();
+    assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_fromref_state_extraction() {
+    // This test verifies that the FromRef trait correctly extracts WorkflowApiState
+    // from ApiState when routing to modern workflow endpoints
+    let state = create_test_api_state();
+
+    // Ensure stores are initialized
+    assert!(state.workflow_store.is_some());
+    assert!(state.execution_store.is_some());
+    assert!(state.schedule_store.is_some());
+
+    let app = build_test_router((*state).clone());
+
+    // Test an endpoint that requires WorkflowApiState extraction
+    let workflow = create_batch_workflow("wf_fromref_001");
+    let request_body = serde_json::to_string(&workflow).unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workflows")
+        .header("content-type", "application/json")
+        .body(Body::from(request_body))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    // If FromRef works correctly, we should get OK
+    assert_eq!(response.status(), StatusCode::OK);
+}

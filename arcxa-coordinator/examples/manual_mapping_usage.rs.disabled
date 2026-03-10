@@ -1,0 +1,323 @@
+// Example Usage of Manual Field Mapping System
+use graphica::mapping::manual::{
+    ManualMappingStore, MappingLearningEngine, ManualMappingMigration,
+    ManualFieldMapping, SourceContext, FieldCharacteristics, UsageStats,
+};
+use graphica::mapping::enhanced_engine::{EnhancedMappingEngine, EnhancedMappingConfig};
+use graphica::workflows::engine::transformers::enhanced_ontology_mapper::{
+    EnhancedOntologyMapperTransformer, EnhancedOntologyMapperConfig, MappingStrategy,
+};
+use graphica::governance::rdf_store::RdfStore;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+
+    // 1. SETUP: Initialize stores
+    let rdf_store = Arc::new(RdfStore::new("./data/rdf").await?);
+    let manual_store = Arc::new(ManualMappingStore::new(
+        rdf_store.clone(),
+        "./data/rocksdb/manual_mappings",
+    )?);
+
+    // 2. MIGRATION: Run migration if first time
+    let migration = ManualMappingMigration::new(
+        rdf_store.clone(),
+        "./data/rocksdb/manual_mappings".to_string(),
+    );
+    migration.run_migration().await?;
+
+    // 3. MANUAL MAPPING CREATION: Create manual mappings for weird field names
+
+    // Example 1: Map "fname1" to "retail:customerFirstName"
+    let mapping1 = ManualFieldMapping {
+        id: uuid::Uuid::new_v4().to_string(),
+        source_context: SourceContext {
+            source_id: Some("sap_prod".to_string()),
+            table_name: "customers".to_string(),
+            field_name: "fname1".to_string(),
+            field_metadata: Some(FieldCharacteristics {
+                data_type: Some("string".to_string()),
+                sample_values: vec!["John".to_string(), "Jane".to_string(), "Bob".to_string()],
+                detected_pattern: Some("first_name".to_string()),
+                profile_hash: None,
+            }),
+        },
+        target_field_uri: "retail:customerFirstName".to_string(),
+        confidence: 1.0,
+        created_by: "admin@example.com".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        notes: Some("SAP uses abbreviated field names".to_string()),
+        usage_stats: UsageStats::default(),
+    };
+
+    manual_store.store_mapping(mapping1).await?;
+    println!("✓ Created manual mapping: fname1 → retail:customerFirstName");
+
+    // Example 2: Map weird field "JSHHDD1" to meaningful ontology
+    let mapping2 = ManualFieldMapping {
+        id: uuid::Uuid::new_v4().to_string(),
+        source_context: SourceContext {
+            source_id: Some("legacy_system".to_string()),
+            table_name: "transactions".to_string(),
+            field_name: "JSHHDD1".to_string(),
+            field_metadata: Some(FieldCharacteristics {
+                data_type: Some("decimal".to_string()),
+                sample_values: vec!["123.45".to_string(), "678.90".to_string()],
+                detected_pattern: Some("currency".to_string()),
+                profile_hash: None,
+            }),
+        },
+        target_field_uri: "finance:transactionAmount".to_string(),
+        confidence: 1.0,
+        created_by: "admin@example.com".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        notes: Some("JSHHDD1 is legacy code for transaction amount".to_string()),
+        usage_stats: UsageStats::default(),
+    };
+
+    manual_store.store_mapping(mapping2).await?;
+    println!("✓ Created manual mapping: JSHHDD1 → finance:transactionAmount");
+
+    // 4. LEARNING ENGINE: Initialize and train
+    let learning_engine = Arc::new(MappingLearningEngine::new(manual_store.clone()));
+    learning_engine.initialize().await?;
+    println!("✓ Learning engine initialized");
+
+    // 5. AUTO-SUGGESTION: Test suggestions for similar fields
+
+    // Test 1: Should suggest mapping for "fname2" based on "fname1"
+    let test_context1 = SourceContext {
+        source_id: Some("sap_prod".to_string()),
+        table_name: "customers".to_string(),
+        field_name: "fname2".to_string(),
+        field_metadata: None,
+    };
+
+    let suggestions1 = manual_store.find_similar_mappings(&test_context1, 3).await?;
+    println!("\nSuggestions for 'fname2':");
+    for suggestion in suggestions1 {
+        println!("  - {} (confidence: {:.2}, reason: {:?})",
+            suggestion.mapping.target_field_uri,
+            suggestion.relevance_score,
+            suggestion.suggestion_reason
+        );
+    }
+
+    // Test 2: Should suggest for similar pattern
+    let test_context2 = SourceContext {
+        source_id: Some("erp_system".to_string()),
+        table_name: "clients".to_string(),
+        field_name: "first_nm".to_string(),
+        field_metadata: None,
+    };
+
+    let suggestions2 = manual_store.find_similar_mappings(&test_context2, 3).await?;
+    println!("\nSuggestions for 'first_nm':");
+    for suggestion in suggestions2 {
+        println!("  - {} (confidence: {:.2})",
+            suggestion.mapping.target_field_uri,
+            suggestion.relevance_score
+        );
+    }
+
+    // 6. ENHANCED MAPPING ENGINE: Combine ML and manual
+    let ml_engine = Arc::new(graphica::mapping::engine::MappingEngine::new()?);
+    let enhanced_engine = Arc::new(EnhancedMappingEngine::new(
+        ml_engine,
+        manual_store.clone(),
+        EnhancedMappingConfig {
+            ml_confidence_threshold: 0.5,
+            manual_mapping_weight: 2.0, // Manual mappings weighted 2x ML
+            auto_learn: true,
+            max_suggestions: 5,
+        },
+    ));
+
+    // Test combined engine
+    let combined_request = graphica::mapping::types::GetCandidatesRequest {
+        source_id: Some("sap_prod".to_string()),
+        table_name: "customers".to_string(),
+        field_name: "fname1".to_string(),
+        field_characteristics: None,
+    };
+
+    let combined_response = enhanced_engine.get_candidates(combined_request).await?;
+    println!("\nEnhanced engine candidates for 'fname1':");
+    for candidate in combined_response.candidates {
+        println!("  - {} (confidence: {:.2}, type: {})",
+            candidate.target_field,
+            candidate.confidence,
+            candidate.mapping_type
+        );
+    }
+
+    // 7. WORKFLOW INTEGRATION: Use in transformer
+    let transformer_config = EnhancedOntologyMapperConfig {
+        source_id: Some("sap_prod".to_string()),
+        table_name: "customers".to_string(),
+        field_overrides: HashMap::from([
+            ("override_field".to_string(), "retail:overriddenField".to_string()),
+        ]),
+        auto_apply_threshold: 0.95,
+        interactive_mode: false,
+        record_decisions: true,
+        bulk_mapping_file: None,
+        strategy: MappingStrategy::ManualWithMLFallback,
+    };
+
+    let mut transformer = EnhancedOntologyMapperTransformer::new(
+        enhanced_engine.clone(),
+        transformer_config,
+    );
+
+    // Test data with weird field names
+    let test_data = serde_json::json!({
+        "fname1": "John",
+        "lname1": "Doe",
+        "JSHHDD1": 123.45,
+        "email": "john@example.com",
+        "normal_field": "value"
+    });
+
+    let context = graphica::workflows::engine::TransformerContext {
+        workflow_id: "test_workflow".to_string(),
+        execution_id: "test_exec".to_string(),
+        user_id: Some("user@example.com".to_string()),
+        metadata: HashMap::new(),
+    };
+
+    let result = transformer.transform(test_data, &context).await?;
+    println!("\nTransformed data:");
+    println!("{}", serde_json::to_string_pretty(&result.output)?);
+
+    // 8. BULK IMPORT/EXPORT: Export mappings
+    let export = manual_store.bulk_export(None).await?;
+    println!("\nExported {} mappings", export.mappings.len());
+    println!("Statistics:");
+    println!("  - Unique sources: {}", export.statistics.unique_sources);
+    println!("  - Unique tables: {}", export.statistics.unique_tables);
+    println!("  - Unique fields: {}", export.statistics.unique_fields);
+
+    // Save to file
+    let export_json = serde_json::to_string_pretty(&export)?;
+    tokio::fs::write("manual_mappings_export.json", export_json).await?;
+    println!("✓ Saved export to manual_mappings_export.json");
+
+    // 9. API USAGE: Create REST endpoint
+    use axum::Router;
+    use std::net::SocketAddr;
+
+    let api_router = graphica::api::manual_mapping::manual_mapping_router(manual_store.clone());
+
+    let app = Router::new()
+        .nest("/", api_router)
+        .with_state(manual_store);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    println!("\nManual mapping API available at http://{}", addr);
+    println!("Example endpoints:");
+    println!("  POST   /api/v1/mappings/manual         - Create mapping");
+    println!("  GET    /api/v1/mappings/manual/:id     - Get mapping");
+    println!("  POST   /api/v1/mappings/manual/suggest - Get suggestions");
+    println!("  POST   /api/v1/mappings/manual/bulk    - Bulk create");
+    println!("  GET    /api/v1/mappings/manual/export  - Export all");
+
+    // 10. USAGE TRACKING: Record usage
+    manual_store.update_usage_stats(
+        &mapping1.id,
+        graphica::mapping::manual::store::UsageStatType::Applied,
+    ).await?;
+    println!("\n✓ Updated usage statistics");
+
+    Ok(())
+}
+
+// Example: Interactive CLI for manual mapping
+pub async fn interactive_mapping_cli(store: Arc<ManualMappingStore>) -> anyhow::Result<()> {
+    use std::io::{self, Write};
+
+    loop {
+        print!("\nEnter source field name (or 'quit'): ");
+        io::stdout().flush()?;
+
+        let mut field_name = String::new();
+        io::stdin().read_line(&mut field_name)?;
+        let field_name = field_name.trim();
+
+        if field_name == "quit" {
+            break;
+        }
+
+        print!("Enter table name: ");
+        io::stdout().flush()?;
+
+        let mut table_name = String::new();
+        io::stdin().read_line(&mut table_name)?;
+        let table_name = table_name.trim();
+
+        // Get suggestions
+        let context = SourceContext {
+            source_id: None,
+            table_name: table_name.to_string(),
+            field_name: field_name.to_string(),
+            field_metadata: None,
+        };
+
+        let suggestions = store.find_similar_mappings(&context, 5).await?;
+
+        if suggestions.is_empty() {
+            println!("No suggestions found.");
+            print!("Enter target field URI: ");
+        } else {
+            println!("\nSuggestions:");
+            for (i, suggestion) in suggestions.iter().enumerate() {
+                println!("  {}. {} (confidence: {:.2})",
+                    i + 1,
+                    suggestion.mapping.target_field_uri,
+                    suggestion.relevance_score
+                );
+            }
+            print!("Select suggestion (1-{}) or enter custom URI: ", suggestions.len());
+        }
+
+        io::stdout().flush()?;
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)?;
+        let choice = choice.trim();
+
+        let target_uri = if let Ok(num) = choice.parse::<usize>() {
+            if num > 0 && num <= suggestions.len() {
+                suggestions[num - 1].mapping.target_field_uri.clone()
+            } else {
+                choice.to_string()
+            }
+        } else {
+            choice.to_string()
+        };
+
+        // Create and store mapping
+        let mapping = ManualFieldMapping {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_context: context,
+            target_field_uri: target_uri.clone(),
+            confidence: 1.0,
+            created_by: "cli_user".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            notes: Some("Created via interactive CLI".to_string()),
+            usage_stats: UsageStats::default(),
+        };
+
+        store.store_mapping(mapping).await?;
+        println!("✓ Created mapping: {} → {}", field_name, target_uri);
+    }
+
+    Ok(())
+}

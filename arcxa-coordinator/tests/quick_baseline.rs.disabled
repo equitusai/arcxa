@@ -1,0 +1,59 @@
+//! Quick Baseline Measurement
+//!
+//! Fast benchmark to establish current performance baseline
+//! Run with: cargo test --test quick_baseline -- --nocapture
+
+use graphica_core::test_helpers::*;
+use graphica_core::storage::rocks::RocksLineageStore;
+use std::time::Instant;
+use tempfile::TempDir;
+
+#[test]
+fn quick_throughput_baseline() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksLineageStore::new(temp_dir.path().to_str().unwrap()).unwrap();
+
+    println!("\n=== QUICK BASELINE MEASUREMENT ===\n");
+
+    // Warm-up
+    for i in 0..10 {
+        let event = create_test_lineage_event(&format!("warmup_{}", i));
+        use graphica_core::core::lineage::LineageSink;
+        storage.write(event).unwrap();
+    }
+
+    // Measure 100 events
+    let num_events = 100;
+    let start = Instant::now();
+
+    for i in 0..num_events {
+        let event = create_test_lineage_event(&format!("baseline_{}", i));
+        use graphica_core::core::lineage::LineageSink;
+        storage.write(event).unwrap();
+    }
+
+    let duration = start.elapsed();
+    let throughput = num_events as f64 / duration.as_secs_f64();
+    let avg_latency_ms = duration.as_millis() as f64 / num_events as f64;
+
+    println!("Events Written: {}", num_events);
+    println!("Total Time: {:.2}s", duration.as_secs_f64());
+    println!("Throughput: {:.2} events/sec", throughput);
+    println!("Avg Latency: {:.2}ms/event", avg_latency_ms);
+    println!("\n--- Baseline Comparison ---");
+    println!("Expected Range: 86-370 events/sec");
+    println!("Measured: {:.2} events/sec", throughput);
+
+    if throughput < 86.0 {
+        println!("Status: ⚠️  BELOW EXPECTED");
+    } else if throughput > 370.0 {
+        println!("Status: ✅ ABOVE EXPECTED");
+    } else {
+        println!("Status: ✅ WITHIN EXPECTED RANGE");
+    }
+
+    println!("\n--- Targets ---");
+    println!("Phase 2 Target: 2,000-3,000 events/sec ({:.1}× improvement needed)", 2000.0 / throughput);
+    println!("Phase 3 Target: 10,000 events/sec ({:.1}× improvement needed)", 10000.0 / throughput);
+    println!();
+}

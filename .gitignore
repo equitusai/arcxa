@@ -1,0 +1,33 @@
+# Rust
+/target/
+/arcxa-shard/target/
+**/target/
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/coverage/
+/frontend/.vite/
+
+# Local runtime state
+/data/
+/logs/
+/tmp/
+/arcxa-coordinator/:memory:/
+/arcxa-coordinator/data/
+/arcxa-coordinator/test_rocks/
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.venv/
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

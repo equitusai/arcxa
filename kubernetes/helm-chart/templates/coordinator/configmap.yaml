@@ -1,0 +1,15 @@
+{{- if .Values.graphica.coordinator.enabled -}}
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: graphica-coordinator-configmap
+  namespace: graphica
+immutable: false
+data:
+  ENABLE_CRYPTOGRAPHIC_AUDIT: {{ .Values.graphica.coordinator.cryptographicAudit }}
+  ROCKSDB_PATH: /data
+  KAFKA_BROKERS: {{ include "kafka.brokerList" . | quote }}
+  GRAPHICA_SECRET_STORE_TYPE: {{ .Values.graphica.coordinator.secretStore.type | default "file" | quote }}
+  GRAPHICA_SECRET_STORE_DIR: {{ .Values.graphica.coordinator.secretStore.directory | default "/data/secrets" | quote }}
+  GRAPHICA_SECRET_STORE_FORMAT: {{ .Values.graphica.coordinator.secretStore.format | default "json" | quote }}
+{{- end }}

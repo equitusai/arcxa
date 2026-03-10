@@ -1,0 +1,73 @@
+{{- if .Values.graphica.coordinator.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: graphica-coordinator
+  namespace: graphica
+spec:
+  serviceName: graphica
+  replicas: {{ .Values.graphica.coordinator.replicas }}
+  selector:
+    matchLabels:
+      app: graphica
+      component: coordinator
+  template:
+    metadata:
+      labels:
+        app: graphica
+        component: coordinator
+    spec:
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
+      serviceAccount: graphica
+      imagePullSecrets:
+      - name: graphica-pull
+      containers:
+      - name: graphica-coordinator
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        image: {{ .Values.graphica.coordinator.imageTag }}
+        volumeMounts:
+          - name: graphica-coordinator-metadata
+            mountPath: /data
+        args:
+          - ./graphica-coordinator
+        envFrom:
+        - configMapRef:
+            name: graphica-coordinator-configmap
+        - secretRef:
+            name: graphica-initial-admin
+        # livenessProbe:
+        #   httpGet:
+        #     path: /health/liveness
+        #     port: 8080
+        #   initialDelaySeconds: 300
+        #   periodSeconds: 120
+        #   timeoutSeconds: 10
+        # startupProbe:
+        #   httpGet:
+        #     path: /health/readiness
+        #     port: 8080
+        #   initialDelaySeconds: 10
+        #   periodSeconds: 5
+        #   timeoutSeconds: 10
+        env:
+        - name: RUST_LOG
+          value: info
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+      volumes:
+        - name: graphica-coordinator-metadata
+          persistentVolumeClaim:
+            claimName: graphica-coordinator-metadata
+  volumeClaimTemplates:
+    - metadata:
+        name: graphica-coordinator-metadata
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.graphica.coordinator.storage.size }}
+        storageClassName: {{ .Values.global.storageClassName }}
+        volumeMode: Filesystem
+{{- end }}

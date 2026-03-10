@@ -1,0 +1,365 @@
+# Pipeline-Integrated Workflow Example
+# Demonstrates integration of new ETL abstractions with existing workflow system
+
+id: pipeline_integrated_etl
+name: Modern ETL with Pipeline Integration
+version: 1.0.0
+description: |
+  This workflow demonstrates how the new ETL abstractions (Pipeline, FormatReader,
+  DataDestination) integrate with the existing workflow system through adapters.
+  It maintains backward compatibility while leveraging new capabilities.
+
+# Workflow-level configuration
+config:
+  execution_mode: batch
+  checkpoint_enabled: true
+  lineage_capture: true
+  max_parallelism: 4
+
+# Input parameters
+parameters:
+  - name: source_file_id
+    type: string
+    required: true
+    description: File Library ID of source CSV file
+
+  - name: target_table
+    type: string
+    required: true
+    description: Target DB2 table name
+
+  - name: dataset_type
+    type: string
+    required: true
+    enum: [customer, product, transaction]
+
+  - name: quality_threshold
+    type: number
+    default: 0.8
+    description: Minimum quality score for records
+
+# Main workflow routes
+routes:
+  # Route 1: Traditional approach (backward compatible)
+  - id: traditional_route
+    name: Traditional CSV to DB2
+    condition: "${input.use_traditional} == true"
+    actions:
+      # Step 1: Parse CSV using existing transformer
+      - type: Transform
+        transformer: csv_parse
+        config:
+          source_file_id: "${input.source_file_id}"
+          delimiter: ","
+          has_header: true
+          encoding: "UTF-8"
+
+      # Step 2: Manual field mapping
+      - type: Transform
+        transformer: field_mapper
+        config:
+          dataset_type: "${input.dataset_type}"
+          apply_suggestions: true
+          confidence_threshold: 0.7
+
+      # Step 3: Ontology mapping
+      - type: Transform
+        transformer: ontology_map
+        config:
+          dataset_type: "${input.dataset_type}"
+          include_lineage: true
+
+      # Step 4: Load to DB2
+      - type: Transform
+        transformer: db2_load
+        config:
+          connection_pool: "main_pool"
+          table: "${input.target_table}"
+          mode: "append"
+          batch_size: 1000
+
+      # Step 5: Record lineage
+      - type: RecordLineage
+        event_type: "traditional_etl_complete"
+        metadata:
+          route: "traditional"
+          records_processed: "${data.record_count}"
+
+  # Route 2: New pipeline approach
+  - id: pipeline_route
+    name: Pipeline-based ETL
+    condition: "${input.use_traditional} != true"
+    actions:
+      # Single pipeline action that encapsulates entire ETL
+      - type: Transform
+        transformer: pipeline_adapter
+        config:
+          pipeline_id: "csv_quality_etl"
+          execution_mode: "${input.execution_mode || 'batch'}"
+
+          # Pipeline stages configuration
+          stages:
+            # Stage 1: Format Reader
+            - id: read_csv
+              type: format_reader
+              config:
+                format: csv
+                source_file_id: "${input.source_file_id}"
+                options:
+                  delimiter: ","
+                  has_header: true
+                  encoding: "UTF-8"
+                  skip_errors: false
+
+            # Stage 2: Standardization
+            - id: standardize
+              type: standardizer
+              depends_on: [read_csv]
+              config:
+                rules:
+                  - trim_whitespace
+                  - normalize_dates
+                  - uppercase_codes
+                  - validate_emails
+
+            # Stage 3: Deduplication (Differential Dataflow)
+            - id: deduplicate
+              type: deduplicator
+              depends_on: [standardize]
+              config:
+                key_fields:
+                  - "${input.dataset_type}_id"
+                  - "timestamp"
+                window_size_ms: 3600000  # 1 hour
+                strategy: "keep_latest"
+
+            # Stage 4: Quality Profiling
+            - id: profile
+              type: quality_profiler
+              depends_on: [deduplicate]
+              config:
+                rules:
+                  - type: completeness
+                    required_fields:
+                      customer: [customer_id, email, created_date]
+                      product: [product_id, name, category]
+                      transaction: [transaction_id, customer_id, amount]
+
+                  - type: validity
+                    validations:
+                      - field: email
+                        regex: "^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+                      - field: phone
+                        regex: "^\\+?[1-9]\\d{1,14}$"
+
+                  - type: consistency
+                    rules:
+                      - "created_date <= updated_date"
+                      - "amount > 0"
+
+                quality_threshold: "${input.quality_threshold}"
+
+            # Stage 5: Model Enhancement
+            - id: model_predict
+              type: model_predictor
+              depends_on: [profile]
+              config:
+                models:
+                  - model_id: "gender_predictor_v2"
+                    applicable_to: customer
+                    confidence_threshold: 0.8
+                    input_fields: [first_name, last_name, email]
+                    output_field: predicted_gender
+
+                  - model_id: "churn_risk_v3"
+                    applicable_to: customer
+                    confidence_threshold: 0.75
+                    input_fields: [recency, frequency, monetary, support_tickets]
+                    output_field: churn_risk_score
+
+                  - model_id: "fraud_detector_v1"
+                    applicable_to: transaction
+                    confidence_threshold: 0.9
+                    input_fields: [amount, merchant_category, time_of_day, location]
+                    output_field: fraud_probability
+
+            # Stage 6: Field Mapping
+            - id: field_map
+              type: field_mapper
+              depends_on: [model_predict]
+              config:
+                dataset_type: "${input.dataset_type}"
+                use_learning: true
+                mappings:
+                  # Manual overrides
+                  cust_id: customer_id
+                  prod_id: product_id
+                  txn_id: transaction_id
+
+            # Stage 7: Ontology Mapping
+            - id: ontology_map
+              type: ontology_mapper
+              depends_on: [field_map]
+              config:
+                dataset_type: "${input.dataset_type}"
+                ontology_version: "2.0.0"
+                create_rdf_triples: true
+
+            # Stage 8: Multi-Destination Write
+            - id: write_destinations
+              type: multi_destination
+              depends_on: [ontology_map]
+              config:
+                parallel_writes: true
+                destinations:
+                  # Primary: DB2
+                  - type: db2
+                    config:
+                      connection_pool: "main_pool"
+                      table: "${input.target_table}"
+                      mode: "merge"
+                      merge_keys: ["${input.dataset_type}_id"]
+                      batch_size: 1000
+
+                  # Secondary: RDF Store
+                  - type: rdf_store
+                    config:
+                      graph_uri: "http://graphica.io/data/${input.dataset_type}"
+                      format: "turtle"
+                      include_lineage: true
+
+                  # Tertiary: Kafka (for downstream systems)
+                  - type: kafka
+                    config:
+                      topic: "enriched_${input.dataset_type}"
+                      partition_key: "${input.dataset_type}_id"
+                      format: "avro"
+
+          # Lineage configuration
+          lineage:
+            enabled: true
+            capture_mode: "continuous"
+            field_level: true
+            include_models: true
+            include_transformations: true
+            sink:
+              type: rdf_store
+              graph_uri: "http://graphica.io/lineage"
+
+      # Post-pipeline actions
+      - type: Validate
+        rule_id: "pipeline_output_validation"
+
+      - type: IncrementMetric
+        metric: "pipeline_executions"
+        labels:
+          pipeline: "csv_quality_etl"
+          dataset: "${input.dataset_type}"
+
+      - type: Notify
+        channel: "slack"
+        recipient: "#data-ops"
+        message: "Pipeline completed: ${data.records_processed} records processed with ${data.quality_score} quality score"
+
+  # Route 3: Streaming mode with Timely Dataflow
+  - id: streaming_route
+    name: Streaming ETL with Timely
+    condition: "${input.mode} == 'streaming'"
+    actions:
+      - type: Transform
+        transformer: pipeline_adapter
+        config:
+          pipeline_id: "streaming_etl"
+          execution_mode: "timely_dataflow"
+
+          # Timely Dataflow configuration
+          timely_config:
+            workers: 4
+            process_id: 0
+            addresses: ["localhost:5000"]
+
+          stages:
+            # Kafka source for CDC
+            - id: kafka_source
+              type: kafka_reader
+              config:
+                topics: ["${input.dataset_type}_cdc"]
+                consumer_group: "graphica_streaming"
+                format: "debezium_json"
+                start_offset: "latest"
+
+            # Differential Dataflow for stateful operations
+            - id: differential_ops
+              type: differential_dataflow
+              depends_on: [kafka_source]
+              config:
+                operators:
+                  # Windowed deduplication
+                  - type: dedupe_window
+                    window_size_ms: 60000
+                    key_fields: ["id"]
+
+                  # Incremental aggregation
+                  - type: aggregate
+                    group_by: ["customer_id"]
+                    aggregations:
+                      - count
+                      - sum: amount
+                      - avg: amount
+                      - max: timestamp
+
+                  # Join with reference data
+                  - type: join
+                    with: "customer_reference"
+                    on: "customer_id"
+                    type: "inner"
+
+            # Real-time quality monitoring
+            - id: quality_monitor
+              type: quality_stream_monitor
+              depends_on: [differential_ops]
+              config:
+                alert_threshold: 0.7
+                window_size_ms: 5000
+                metrics:
+                  - completeness
+                  - validity
+                  - timeliness
+
+            # Stream to multiple sinks
+            - id: stream_sinks
+              type: multi_stream_sink
+              depends_on: [quality_monitor]
+              config:
+                sinks:
+                  - type: kafka
+                    topic: "processed_stream"
+                  - type: websocket
+                    endpoint: "ws://dashboard:8080/stream"
+                  - type: rdf_stream
+                    graph_uri: "http://graphica.io/stream"
+
+# Error handling configuration
+error_handling:
+  - route_id: "*"
+    on_error:
+      - type: Log
+        level: error
+        message: "Error in route ${route_id}: ${error.message}"
+
+      - type: SendToKafka
+        topic: "etl_errors"
+        partition_key: "${input.source_file_id}"
+
+      - type: Notify
+        channel: email
+        recipient: "data-ops@example.com"
+        message: "ETL Error: ${error.message}"
+
+# Scheduling configuration (optional)
+schedule:
+  cron: "0 */6 * * *"  # Every 6 hours
+  timezone: "America/New_York"
+  retry:
+    max_attempts: 3
+    backoff_seconds: 300

@@ -1,0 +1,134 @@
+[workspace]
+members = [
+    "arcxa-core",
+    "arcxa-coordinator",
+    "arcxa-model-service",
+    "arcxa-migrations",
+    "arcxa-cli",
+]
+# Exclude arcxa-shard due to RocksDB linking conflict (oxrocksdb-sys vs librocksdb-sys)
+# Build separately: cd arcxa-shard && cargo build
+exclude = ["arcxa-shard"]
+resolver = "2"
+
+[workspace.package]
+version = "0.4.1"
+edition = "2021"
+authors = ["Equitus Corporation"]
+license-file = "LICENSE.md"
+repository = "https://github.com/graphica/graphica"
+
+[workspace.dependencies]
+# Core utilities
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Async runtime & futures
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+
+# gRPC & Proto
+tonic = { version = "0.11", features = ["gzip"] }
+tonic-build = "0.11"
+tonic-reflection = "0.11"
+tonic-health = "0.11"
+prost = "0.12"
+prost-types = "0.12"
+prost-build = "0.12"
+
+# HTTP/API
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Storage
+rocksdb = "0.22"
+
+# RDF & SPARQL (for shard only - version-locked to avoid conflicts)
+oxigraph = { version = "=0.4.11", features = ["rocksdb"] }
+rio_api = "0.8"
+rio_turtle = "0.8"
+rio_xml = "0.8"
+
+# Streaming & Dataflow
+timely = "0.12"
+differential-dataflow = "0.12"
+
+# Kafka
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# Columnar & Serialization
+arrow2 = { version = "0.17", features = ["io_parquet", "io_json"] }
+parquet2 = "0.17"
+
+# Performance
+hashbrown = "0.14"
+ahash = "0.8"
+hyperloglog = "1.0"
+quantiles = "0.7"
+memmap2 = "0.9"
+
+# WASM Runtime
+wasmtime = "17.0"
+
+# Time & Date
+chrono = { version = "0.4", features = ["serde"] }
+
+# Concurrency
+parking_lot = "0.12.4"
+dashmap = "6.0"
+crossbeam = "0.8"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+num_cpus = "1.0"
+regex = "1.0"
+lazy_static = "1.4"
+once_cell = "1.0"
+
+# Cryptography & Security
+argon2 = "0.5"
+jsonwebtoken = "9.0"
+sha2 = "0.10"
+rand = "0.8"
+
+# Database & Connection Pooling
+deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
+
+# ODBC (for DB2)
+odbc-api = "20.1"
+
+# HTTP Client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Prometheus metrics
+prometheus = "0.14.0"
+
+# Testing
+tempfile = "3.0"
+proptest = "1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0          # no optimization; much faster
+debug = 1              # enough for backtraces, smaller debug info
+debug-assertions = true
+overflow-checks = true
+incremental = true     # should be default, but make it explicit
+codegen-units = 256    # more parallelism for codegen

@@ -1,0 +1,228 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix wf: <http://graphica.io/ontology/workflow#> .
+@prefix gph: <http://graphica.io/ontology#> .
+
+# ============================================================================
+# Workflow Execution Ontology - Extension of W3C PROV
+# ============================================================================
+
+wf:WorkflowExecution a owl:Class ;
+    rdfs:subClassOf prov:Activity ;
+    rdfs:label "Workflow Execution" ;
+    rdfs:comment "A single execution instance of a workflow definition" .
+
+wf:WorkflowDefinition a owl:Class ;
+    rdfs:subClassOf prov:Plan ;
+    rdfs:label "Workflow Definition" ;
+    rdfs:comment "The definition/template of a workflow" .
+
+wf:WorkflowStep a owl:Class ;
+    rdfs:subClassOf prov:Activity ;
+    rdfs:label "Workflow Step" ;
+    rdfs:comment "A single step within a workflow execution" .
+
+wf:Checkpoint a owl:Class ;
+    rdfs:subClassOf prov:Entity ;
+    rdfs:label "Execution Checkpoint" ;
+    rdfs:comment "A snapshot of workflow execution state for recovery" .
+
+wf:ExecutionContext a owl:Class ;
+    rdfs:subClassOf prov:Entity ;
+    rdfs:label "Execution Context" ;
+    rdfs:comment "Runtime context and parameters for workflow execution" .
+
+# ============================================================================
+# Properties
+# ============================================================================
+
+# Execution identification
+wf:executionId a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "execution ID" ;
+    rdfs:comment "Unique identifier for this execution" .
+
+wf:workflowId a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "workflow ID" ;
+    rdfs:comment "Reference to the workflow definition" .
+
+wf:workflowName a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "workflow name" .
+
+# Status and timing
+wf:status a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "execution status" ;
+    rdfs:comment "Current status: Pending, Running, Paused, Completed, Failed, Stopped, Aborted" .
+
+wf:startedAt a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "started at" ;
+    rdfs:comment "Timestamp when execution started" .
+
+wf:completedAt a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "completed at" ;
+    rdfs:comment "Timestamp when execution completed (success or failure)" .
+
+wf:duration a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:integer ;
+    rdfs:label "duration (milliseconds)" .
+
+# Context and output
+wf:triggeredBy a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "triggered by" ;
+    rdfs:comment "User or system that triggered the execution" .
+
+wf:hasContext a owl:ObjectProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range wf:ExecutionContext ;
+    rdfs:label "has context" .
+
+wf:contextData a owl:DatatypeProperty ;
+    rdfs:domain wf:ExecutionContext ;
+    rdfs:range xsd:string ;
+    rdfs:label "context data (JSON)" ;
+    rdfs:comment "Serialized JSON context" .
+
+wf:hasOutput a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "output (JSON)" ;
+    rdfs:comment "Serialized JSON output" .
+
+wf:hasError a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range xsd:string ;
+    rdfs:label "error message" .
+
+# Checkpoints
+wf:hasCheckpoint a owl:ObjectProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range wf:Checkpoint ;
+    rdfs:label "has checkpoint" .
+
+wf:checkpointSequence a owl:DatatypeProperty ;
+    rdfs:domain wf:Checkpoint ;
+    rdfs:range xsd:integer ;
+    rdfs:label "checkpoint sequence number" .
+
+wf:checkpointCreatedAt a owl:DatatypeProperty ;
+    rdfs:domain wf:Checkpoint ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "checkpoint created at" .
+
+wf:compressedState a owl:DatatypeProperty ;
+    rdfs:domain wf:Checkpoint ;
+    rdfs:range xsd:base64Binary ;
+    rdfs:label "compressed state" ;
+    rdfs:comment "LZ4-compressed execution state" .
+
+wf:stateChecksum a owl:DatatypeProperty ;
+    rdfs:domain wf:Checkpoint ;
+    rdfs:range xsd:string ;
+    rdfs:label "state checksum (SHA-256)" .
+
+wf:previousCheckpoint a owl:ObjectProperty ;
+    rdfs:domain wf:Checkpoint ;
+    rdfs:range wf:Checkpoint ;
+    rdfs:label "previous checkpoint" ;
+    rdfs:comment "Link to previous checkpoint for chain traversal" .
+
+# Steps
+wf:hasStep a owl:ObjectProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range wf:WorkflowStep ;
+    rdfs:label "has step" .
+
+wf:stepNumber a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowStep ;
+    rdfs:range xsd:integer ;
+    rdfs:label "step number" .
+
+wf:stepName a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowStep ;
+    rdfs:range xsd:string ;
+    rdfs:label "step name" .
+
+wf:stepStatus a owl:DatatypeProperty ;
+    rdfs:domain wf:WorkflowStep ;
+    rdfs:range xsd:string ;
+    rdfs:label "step status" .
+
+# Logs
+wf:LogEntry a owl:Class ;
+    rdfs:label "Log Entry" .
+
+wf:hasLog a owl:ObjectProperty ;
+    rdfs:domain wf:WorkflowExecution ;
+    rdfs:range wf:LogEntry ;
+    rdfs:label "has log entry" .
+
+wf:logLevel a owl:DatatypeProperty ;
+    rdfs:domain wf:LogEntry ;
+    rdfs:range xsd:string ;
+    rdfs:label "log level" ;
+    rdfs:comment "DEBUG, INFO, WARN, ERROR" .
+
+wf:logMessage a owl:DatatypeProperty ;
+    rdfs:domain wf:LogEntry ;
+    rdfs:range xsd:string ;
+    rdfs:label "log message" .
+
+wf:logTimestamp a owl:DatatypeProperty ;
+    rdfs:domain wf:LogEntry ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "log timestamp" .
+
+# ============================================================================
+# PROV Mappings
+# ============================================================================
+
+# WorkflowExecution -> prov:Activity
+# - prov:wasAssociatedWith -> User/System agent
+# - prov:used -> Input datasets/entities
+# - prov:generated -> Output datasets/entities
+# - prov:startedAtTime -> wf:startedAt
+# - prov:endedAtTime -> wf:completedAt
+
+# WorkflowDefinition -> prov:Plan
+# - prov:wasDerivedFrom -> Previous workflow versions
+
+# Checkpoint -> prov:Entity
+# - prov:wasGeneratedBy -> WorkflowExecution
+# - prov:wasAttributedTo -> Coordinator instance
+
+# ============================================================================
+# Example Instance
+# ============================================================================
+
+# <gph:execution/exec_001> a wf:WorkflowExecution ;
+#     wf:executionId "exec_001" ;
+#     wf:workflowId "wf_001" ;
+#     wf:workflowName "Customer Data Pipeline" ;
+#     wf:status "Running" ;
+#     wf:startedAt "2024-10-25T10:00:00Z"^^xsd:dateTime ;
+#     wf:triggeredBy "user@example.com" ;
+#     prov:wasAssociatedWith <gph:user/user@example.com> ;
+#     wf:hasCheckpoint <gph:checkpoint/exec_001/seq_1> .
+#
+# <gph:checkpoint/exec_001/seq_1> a wf:Checkpoint ;
+#     wf:checkpointSequence 1 ;
+#     wf:checkpointCreatedAt "2024-10-25T10:05:00Z"^^xsd:dateTime ;
+#     wf:stateChecksum "a1b2c3..." ;
+#     prov:wasGeneratedBy <gph:execution/exec_001> .

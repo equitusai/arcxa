@@ -1,0 +1,89 @@
+name: "Customer Routing Tests"
+workflow_file: "demos/workflows/customer_routing.yaml"
+
+test_cases:
+  # Test 1: Enterprise customer should route to high priority
+  - name: "Enterprise customer routes to high priority"
+    description: "Enterprise customers with revenue > 1M should go to enterprise route"
+    input:
+      customer_id: "CUST-001"
+      customer_type: "enterprise"
+      annual_revenue: 5000000
+      name: "Acme Corporation"
+    expect:
+      route: "enterprise"
+      assertions:
+        - type: field_equals
+          field: "tier"
+          value: "platinum"
+        - type: field_equals
+          field: "priority_queue"
+          value: "high"
+        - type: field_exists
+          field: "customer_id"
+
+  # Test 2: Small business should route to standard
+  - name: "Small business routes to standard"
+    description: "Non-enterprise customers should go to standard route"
+    input:
+      customer_id: "CUST-002"
+      customer_type: "small_business"
+      annual_revenue: 50000
+      name: "Small Co"
+    expect:
+      route: "standard"
+      assertions:
+        - type: field_equals
+          field: "tier"
+          value: "standard"
+        - type: field_equals
+          field: "priority_queue"
+          value: "normal"
+
+  # Test 3: Enterprise with low revenue should go to standard
+  - name: "Enterprise with low revenue routes to standard"
+    description: "Enterprise type but revenue < 1M should go to standard route"
+    input:
+      customer_id: "CUST-003"
+      customer_type: "enterprise"
+      annual_revenue: 500000
+      name: "Startup Inc"
+    expect:
+      route: "standard"
+      assertions:
+        - type: field_equals
+          field: "tier"
+          value: "standard"
+
+  # Test 4: Field validation
+  - name: "Customer ID must exist"
+    description: "All records should have customer_id field"
+    input:
+      customer_id: "CUST-004"
+      customer_type: "individual"
+      annual_revenue: 0
+    expect:
+      route: "standard"
+      assertions:
+        - type: field_exists
+          field: "customer_id"
+        - type: field_matches
+          field: "customer_id"
+          pattern: "^CUST-\\d+$"
+
+  # Test 5: Numeric comparisons
+  - name: "Revenue field validation"
+    description: "Revenue should be a number greater than or equal to 0"
+    input:
+      customer_id: "CUST-005"
+      customer_type: "individual"
+      annual_revenue: 100000
+    expect:
+      route: "standard"
+      assertions:
+        - type: field_greater_than
+          field: "annual_revenue"
+          value: -1
+        - type: field_less_than
+          field: "annual_revenue"
+          value: 999999999

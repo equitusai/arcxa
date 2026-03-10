@@ -1,0 +1,133 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics-init
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+spec:
+  ttlSecondsAfterFinished: 500
+  template:
+    spec:
+      serviceAccountName: graphica
+      imagePullSecrets:
+        - name: graphica-pull
+      volumes:
+        - name: kafka-init-script
+          configMap:
+            name: kafka-init-cm
+            items:
+              - key: kafka-init.py
+                path: kafka-init.py
+                mode: 0555
+              - key: topics.txt
+                path: topics.txt
+                mode: 0444
+              - key: startup.sh
+                path: startup.sh
+                mode: 0555
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: kafka-topics-init
+          image: redhat/ubi9
+          command:
+          - /bin/bash
+          - -c
+          - /tmp/init-scripts/startup.sh
+          volumeMounts:
+            - name: kafka-init-script
+              mountPath: /tmp/init-scripts
+      restartPolicy: Never
+  backoffLimit: 4
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: kafka-init-cm
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-1"
+data:
+  kafka-init.py: |
+    import logging
+    import os
+    from urllib.parse import urlparse
+    import backoff
+    from confluent_kafka import KafkaException
+    from confluent_kafka.admin import AdminClient, NewTopic
+
+    logging.basicConfig(level="INFO")
+
+    class Initiator:
+        @backoff.on_exception(backoff.constant, Exception, interval=10)
+        def __init__(self):
+            self.replication_factor = int(
+                os.getenv("KAFKA_REPLICATION_FACTOR", default="3")
+            )
+            bootstrap_url = os.getenv(
+                "KAFKA_BOOTSTRAP_URL", "http://graphica-kafka-bootstrap:9092"
+            )
+            bootstrap_url = "{uri.netloc}{uri.path}".format(uri=urlparse(bootstrap_url))
+
+            self.admin_client = AdminClient({"bootstrap.servers": bootstrap_url})
+            self.admin_client.list_topics()  # TODO: Do something to kafka that actually raises an exception as this does not appear to at runtime
+            logging.info("Kafka is available. Initializing...")
+
+            with open("topics.txt") as f:
+                self.topics = [line.strip().split() for line in f.readlines()]
+
+        @backoff.on_exception(backoff.expo, Exception)
+        def create_topic(self, topic):
+            try:
+                topic_request = self.admin_client.create_topics([topic])
+                # If the request fails for whatever reason, this below line will throw an exception
+                list(topic_request.values())[0].result()
+                logging.info(f"Topic {topic.topic} successfully created")
+            except KafkaException as e:
+                if e.args[0].name() == "TOPIC_ALREADY_EXISTS":
+                    logging.info(f"Topic {topic.topic} already exists. Skipping")
+                else:
+                    raise e
+
+        def do_init(self):
+            for topic in self.topics:
+                new_topic = NewTopic(
+                    topic[0],
+                    num_partitions=int(topic[1]),
+                    replication_factor=self.replication_factor,
+                )
+                self.create_topic(new_topic)
+
+        def wipe(self):
+            topic_names = list(self.admin_client.list_topics().topics.keys())
+            topic_names.remove("__consumer_offsets")
+            if len(topic_names) == 0:
+                return
+
+            futures = self.admin_client.delete_topics(topic_names, operation_timeout=60)
+
+            for topic, future in futures.items():
+                try:
+                    future.result()  # The result itself is None
+                    logging.info(f"Topic {topic} deleted")
+                except Exception as e:
+                    logging.exception(f"Failed to delete topic {topic}: {e}")
+
+
+    if __name__ == "__main__":
+        initiator = Initiator()
+        initiator.do_init()
+
+  topics.txt: |
+    graphica.lineage 4
+    graphica.dlq 1
+    graphica.quality.violations 4
+
+  startup.sh: |
+    #!/bin/bash
+    dnf install -y python3-pip
+    pip install confluent_kafka==1.9.2
+    pip install backoff
+    cd /tmp/init-scripts
+    python3 ./kafka-init.py

@@ -1,0 +1,686 @@
+//! Execution Storage - CRUD operations for workflow executions
+//!
+//! Supports both in-memory (development/testing) and RocksDB (production) backends.
+
+use crate::workflows::domain::{
+    ExecutionFilters, ExecutionLog, ExecutionStatus, WorkflowExecution,
+};
+use crate::workflows::storage::RocksExecutionStore;
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+
+/// Storage backend for executions
+enum ExecutionBackend {
+    /// In-memory storage (for development/testing)
+    InMemory(Arc<RwLock<HashMap<String, WorkflowExecution>>>),
+    /// RocksDB storage (for production)
+    RocksDB(Arc<RocksExecutionStore>),
+}
+
+/// Execution storage with pluggable backend
+///
+/// Supports both in-memory and persistent RocksDB backends.
+/// Thread-safe with RwLock for concurrent access.
+#[derive(Clone)]
+pub struct ExecutionStore {
+    backend: Arc<ExecutionBackend>,
+}
+
+impl Default for ExecutionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecutionStore {
+    /// Create a new in-memory execution store (for development/testing)
+    pub fn new() -> Self {
+        Self {
+            backend: Arc::new(ExecutionBackend::InMemory(Arc::new(RwLock::new(
+                HashMap::new(),
+            )))),
+        }
+    }
+
+    /// Create a new RocksDB-backed execution store (for production)
+    pub fn with_rocksdb<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let rocks_store = RocksExecutionStore::open(path)?;
+        Ok(Self {
+            backend: Arc::new(ExecutionBackend::RocksDB(Arc::new(rocks_store))),
+        })
+    }
+
+    /// Check if using RocksDB backend
+    pub fn is_persistent(&self) -> bool {
+        matches!(*self.backend, ExecutionBackend::RocksDB(_))
+    }
+
+    /// Save a new execution
+    ///
+    /// ## Errors
+    /// - If execution ID already exists
+    pub fn save(&self, execution: WorkflowExecution) -> Result<()> {
+        match &*self.backend {
+            ExecutionBackend::InMemory(map) => {
+                let mut executions = map
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+                if executions.contains_key(&execution.execution_id) {
+                    anyhow::bail!("Execution '{}' already exists", execution.execution_id);
+                }
+
+                executions.insert(execution.execution_id.clone(), execution);
+                Ok(())
+            }
+            ExecutionBackend::RocksDB(store) => store.save(execution),
+        }
+    }
+
+    /// Get an execution by ID
+    pub fn get(&self, execution_id: &str) -> Result<Option<WorkflowExecution>> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        Ok(executions.get(execution_id).cloned())
+    }
+
+    /// Get an execution by ID (required, returns error if not found)
+    pub fn get_required(&self, execution_id: &str) -> Result<WorkflowExecution> {
+        self.get(execution_id)?
+            .ok_or_else(|| anyhow::anyhow!("Execution '{}' not found", execution_id))
+    }
+
+    /// Update an existing execution
+    ///
+    /// ## Errors
+    /// - If execution doesn't exist
+    pub fn update(&self, execution: WorkflowExecution) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        if !executions.contains_key(&execution.execution_id) {
+            anyhow::bail!("Execution '{}' not found", execution.execution_id);
+        }
+
+        executions.insert(execution.execution_id.clone(), execution);
+
+        Ok(())
+    }
+
+    /// Update execution status
+    ///
+    /// Convenience method to update just the status without fetching entire execution.
+    pub fn update_status(
+        &self,
+        execution_id: &str,
+        status: ExecutionStatus,
+    ) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let execution = executions
+            .get_mut(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution '{}' not found", execution_id))?;
+
+        execution.update_status(status);
+
+        Ok(())
+    }
+
+    /// Add a log entry to an execution
+    ///
+    /// Convenience method to append logs without fetching entire execution.
+    pub fn add_log(&self, execution_id: &str, log: ExecutionLog) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let execution = executions
+            .get_mut(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution '{}' not found", execution_id))?;
+
+        execution.add_log(log);
+
+        Ok(())
+    }
+
+    /// Set execution output
+    pub fn set_output(
+        &self,
+        execution_id: &str,
+        output: serde_json::Value,
+    ) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let execution = executions
+            .get_mut(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution '{}' not found", execution_id))?;
+
+        execution.set_output(output);
+
+        Ok(())
+    }
+
+    /// Set execution error
+    pub fn set_error(&self, execution_id: &str, error: String) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let execution = executions
+            .get_mut(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution '{}' not found", execution_id))?;
+
+        execution.set_error(error);
+
+        Ok(())
+    }
+
+    /// List all executions for a workflow
+    pub fn list_by_workflow(&self, workflow_id: &str) -> Result<Vec<WorkflowExecution>> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let filtered: Vec<WorkflowExecution> = executions
+            .values()
+            .filter(|e| e.workflow_id == workflow_id)
+            .cloned()
+            .collect();
+
+        Ok(filtered)
+    }
+
+    /// List executions with filters
+    pub fn list_filtered(
+        &self,
+        filters: &ExecutionFilters,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<WorkflowExecution>> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let mut filtered: Vec<WorkflowExecution> = executions
+            .values()
+            .filter(|e| filters.matches(e))
+            .cloned()
+            .collect();
+
+        // Sort by started_at descending (most recent first)
+        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
+        // Apply pagination
+        let offset = offset.unwrap_or(0);
+        let filtered: Vec<_> = filtered.into_iter().skip(offset).collect();
+
+        if let Some(limit) = limit {
+            Ok(filtered.into_iter().take(limit).collect())
+        } else {
+            Ok(filtered)
+        }
+    }
+
+    /// Get execution logs
+    pub fn get_logs(&self, execution_id: &str) -> Result<Vec<ExecutionLog>> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let execution = executions
+            .get(execution_id)
+            .ok_or_else(|| anyhow::anyhow!("Execution '{}' not found", execution_id))?;
+
+        Ok(execution.logs.clone())
+    }
+
+    /// Count total executions
+    pub fn count(&self) -> Result<usize> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        Ok(executions.len())
+    }
+
+    /// Count executions matching filters
+    pub fn count_filtered(&self, filters: &ExecutionFilters) -> Result<usize> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let count = executions.values().filter(|e| filters.matches(e)).count();
+
+        Ok(count)
+    }
+
+    /// Check if an execution exists
+    pub fn exists(&self, execution_id: &str) -> Result<bool> {
+        let executions = self
+            .executions
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        Ok(executions.contains_key(execution_id))
+    }
+
+    /// Delete an execution (for cleanup/testing)
+    pub fn delete(&self, execution_id: &str) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        if executions.remove(execution_id).is_none() {
+            anyhow::bail!("Execution '{}' not found", execution_id);
+        }
+
+        Ok(())
+    }
+
+    /// Clear all executions (for testing)
+    #[cfg(test)]
+    pub fn clear(&self) -> Result<()> {
+        let mut executions = self
+            .executions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        executions.clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflows::domain::LogLevel;
+    use chrono::Duration;
+    use serde_json::json;
+
+    fn create_test_execution(id: &str, workflow_id: &str) -> WorkflowExecution {
+        WorkflowExecution::new(
+            id.to_string(),
+            workflow_id.to_string(),
+            format!("Workflow {}", workflow_id),
+            json!({"test": "data"}),
+            Some("test@example.com".to_string()),
+        )
+    }
+
+    #[test]
+    fn test_save_execution() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        assert!(store.save(execution).is_ok());
+    }
+
+    #[test]
+    fn test_save_duplicate_execution() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution.clone()).unwrap();
+
+        // Second save should fail
+        let result = store.save(execution);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_execution() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        let retrieved = store.get("exec_001").unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().execution_id, "exec_001");
+    }
+
+    #[test]
+    fn test_get_nonexistent_execution() {
+        let store = ExecutionStore::new();
+
+        let retrieved = store.get("exec_999").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_get_required_execution() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        let retrieved = store.get_required("exec_001").unwrap();
+        assert_eq!(retrieved.execution_id, "exec_001");
+    }
+
+    #[test]
+    fn test_get_required_nonexistent() {
+        let store = ExecutionStore::new();
+
+        let result = store.get_required("exec_999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_execution() {
+        let store = ExecutionStore::new();
+        let mut execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution.clone()).unwrap();
+
+        // Modify execution
+        execution.update_status(ExecutionStatus::Running);
+
+        store.update(execution).unwrap();
+
+        // Verify update
+        let updated = store.get("exec_001").unwrap().unwrap();
+        assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[test]
+    fn test_update_nonexistent_execution() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        let result = store.update(execution);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_status() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        store
+            .update_status("exec_001", ExecutionStatus::Running)
+            .unwrap();
+
+        let updated = store.get("exec_001").unwrap().unwrap();
+        assert_eq!(updated.status, ExecutionStatus::Running);
+    }
+
+    #[test]
+    fn test_add_log() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        let log = ExecutionLog::info("Test log message");
+        store.add_log("exec_001", log).unwrap();
+
+        let logs = store.get_logs("exec_001").unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "Test log message");
+        assert_eq!(logs[0].level, LogLevel::Info);
+    }
+
+    #[test]
+    fn test_set_output() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        let output = json!({"result": "success"});
+        store.set_output("exec_001", output.clone()).unwrap();
+
+        let updated = store.get("exec_001").unwrap().unwrap();
+        assert_eq!(updated.output, Some(output));
+    }
+
+    #[test]
+    fn test_set_error() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        store
+            .set_error("exec_001", "Test error".to_string())
+            .unwrap();
+
+        let updated = store.get("exec_001").unwrap().unwrap();
+        assert_eq!(updated.error, Some("Test error".to_string()));
+        assert_eq!(updated.status, ExecutionStatus::Failed);
+    }
+
+    #[test]
+    fn test_list_by_workflow() {
+        let store = ExecutionStore::new();
+
+        store.save(create_test_execution("exec_001", "wf_001")).unwrap();
+        store.save(create_test_execution("exec_002", "wf_001")).unwrap();
+        store.save(create_test_execution("exec_003", "wf_002")).unwrap();
+
+        let executions = store.list_by_workflow("wf_001").unwrap();
+        assert_eq!(executions.len(), 2);
+    }
+
+    #[test]
+    fn test_list_filtered_by_status() {
+        let store = ExecutionStore::new();
+
+        let mut exec1 = create_test_execution("exec_001", "wf_001");
+        exec1.update_status(ExecutionStatus::Running);
+        store.save(exec1).unwrap();
+
+        let mut exec2 = create_test_execution("exec_002", "wf_001");
+        exec2.update_status(ExecutionStatus::Completed);
+        store.save(exec2).unwrap();
+
+        let filters = ExecutionFilters {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        };
+
+        let executions = store.list_filtered(&filters, None, None).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].execution_id, "exec_001");
+    }
+
+    #[test]
+    fn test_list_filtered_by_date() {
+        let store = ExecutionStore::new();
+
+        let mut exec1 = create_test_execution("exec_001", "wf_001");
+        exec1.started_at = Utc::now() - Duration::days(2);
+        store.save(exec1).unwrap();
+
+        let exec2 = create_test_execution("exec_002", "wf_001");
+        store.save(exec2).unwrap();
+
+        let filters = ExecutionFilters {
+            start_date: Some(Utc::now() - Duration::days(1)),
+            ..Default::default()
+        };
+
+        let executions = store.list_filtered(&filters, None, None).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].execution_id, "exec_002");
+    }
+
+    #[test]
+    fn test_list_filtered_with_search() {
+        let store = ExecutionStore::new();
+
+        store.save(create_test_execution("exec_001", "wf_001")).unwrap();
+        store.save(create_test_execution("exec_002", "wf_002")).unwrap();
+
+        let filters = ExecutionFilters {
+            search: Some("exec_001".to_string()),
+            ..Default::default()
+        };
+
+        let executions = store.list_filtered(&filters, None, None).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].execution_id, "exec_001");
+    }
+
+    #[test]
+    fn test_list_filtered_with_pagination() {
+        let store = ExecutionStore::new();
+
+        for i in 1..=5 {
+            let exec = create_test_execution(&format!("exec_{:03}", i), "wf_001");
+            store.save(exec).unwrap();
+        }
+
+        let filters = ExecutionFilters::default();
+
+        // Get first 2
+        let page1 = store.list_filtered(&filters, Some(2), Some(0)).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        // Get next 2
+        let page2 = store.list_filtered(&filters, Some(2), Some(2)).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        // Verify no overlap
+        assert_ne!(page1[0].execution_id, page2[0].execution_id);
+    }
+
+    #[test]
+    fn test_count() {
+        let store = ExecutionStore::new();
+
+        assert_eq!(store.count().unwrap(), 0);
+
+        store.save(create_test_execution("exec_001", "wf_001")).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+
+        store.save(create_test_execution("exec_002", "wf_001")).unwrap();
+        assert_eq!(store.count().unwrap(), 2);
+
+        store.delete("exec_001").unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_filtered() {
+        let store = ExecutionStore::new();
+
+        let mut exec1 = create_test_execution("exec_001", "wf_001");
+        exec1.update_status(ExecutionStatus::Running);
+        store.save(exec1).unwrap();
+
+        let mut exec2 = create_test_execution("exec_002", "wf_001");
+        exec2.update_status(ExecutionStatus::Completed);
+        store.save(exec2).unwrap();
+
+        let filters = ExecutionFilters {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        };
+
+        assert_eq!(store.count_filtered(&filters).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_exists() {
+        let store = ExecutionStore::new();
+
+        assert!(!store.exists("exec_001").unwrap());
+
+        store.save(create_test_execution("exec_001", "wf_001")).unwrap();
+        assert!(store.exists("exec_001").unwrap());
+
+        store.delete("exec_001").unwrap();
+        assert!(!store.exists("exec_001").unwrap());
+    }
+
+    #[test]
+    fn test_delete() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+        assert!(store.exists("exec_001").unwrap());
+
+        store.delete("exec_001").unwrap();
+        assert!(!store.exists("exec_001").unwrap());
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let store = ExecutionStore::new();
+
+        let result = store.delete("exec_999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        use std::thread;
+
+        let store = ExecutionStore::new();
+
+        // Create executions concurrently
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let store_clone = store.clone();
+                thread::spawn(move || {
+                    let execution =
+                        create_test_execution(&format!("exec_{:03}", i), "wf_001");
+                    store_clone.save(execution)
+                })
+            })
+            .collect();
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        // Verify all executions created
+        assert_eq!(store.count().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_get_logs() {
+        let store = ExecutionStore::new();
+        let execution = create_test_execution("exec_001", "wf_001");
+
+        store.save(execution).unwrap();
+
+        store.add_log("exec_001", ExecutionLog::info("Log 1")).unwrap();
+        store.add_log("exec_001", ExecutionLog::warn("Log 2")).unwrap();
+        store.add_log("exec_001", ExecutionLog::error("Log 3")).unwrap();
+
+        let logs = store.get_logs("exec_001").unwrap();
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0].message, "Log 1");
+        assert_eq!(logs[1].message, "Log 2");
+        assert_eq!(logs[2].message, "Log 3");
+    }
+}

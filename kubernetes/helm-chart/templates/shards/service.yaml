@@ -1,0 +1,15 @@
+{{- if .Values.graphica.shards.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: graphica-shard
+  namespace: graphica
+spec:
+  ports:
+  - port: 9100
+    name: data
+  clusterIP: None
+  selector:
+    app: graphica
+    component: shard
+{{- end }}

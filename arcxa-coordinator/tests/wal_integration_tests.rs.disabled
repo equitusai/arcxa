@@ -1,0 +1,417 @@
+// Integration tests for the Write-Ahead Log
+//
+// Tests crash recovery, transaction semantics, and performance
+
+use graphica::core::lineage::{DataRef, LineageEvent};
+use graphica::storage::wal::{
+    FileWal, RecoveryManager, RotationManager, WalConfig, WalError, WalFactory,
+    WalMetricsCollector, WriteAheadLog,
+};
+use graphica::storage::LineageStorage;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
+use tokio::time;
+
+#[tokio::test]
+async fn test_wal_basic_operations() {
+    let tmp_dir = TempDir::new().unwrap();
+    let config = WalConfig::default()
+        .with_path(tmp_dir.path().join("wal"))
+        .with_max_file_size(10 * 1024 * 1024);  // 10MB
+
+    let metrics = Arc::new(WalMetricsCollector::new("test"));
+    let wal = FileWal::new(config, metrics).await.unwrap();
+
+    // Test single append
+    let event = create_test_event("test_1");
+    let entry = graphica::storage::wal::WalEntry::lineage(
+        graphica::storage::wal::LogSequenceNumber::ZERO,
+        event.clone(),
+    );
+
+    let lsn = wal.append(entry).await.unwrap();
+    assert!(lsn.0 > 0);
+
+    // Test batch append
+    let events: Vec<_> = (0..10)
+        .map(|i| {
+            let event = create_test_event(&format!("batch_{}", i));
+            graphica::storage::wal::WalEntry::lineage(
+                graphica::storage::wal::LogSequenceNumber::ZERO,
+                event,
+            )
+        })
+        .collect();
+
+    let lsns = wal.append_batch(events).await.unwrap();
+    assert_eq!(lsns.len(), 10);
+
+    // Test sync
+    wal.sync().await.unwrap();
+
+    // Test commit
+    wal.commit(lsn).await.unwrap();
+    wal.commit_batch(lsns).await.unwrap();
+
+    // Verify LSNs
+    let tail = wal.tail_lsn().await;
+    let head = wal.head_lsn().await;
+    assert!(tail >= head);
+
+    // Test health check
+    assert!(wal.is_healthy().await);
+
+    // Clean shutdown
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_wal_recovery() {
+    let tmp_dir = TempDir::new().unwrap();
+    let config = WalConfig::default()
+        .with_path(tmp_dir.path().join("wal"))
+        .with_fsync_mode(graphica::storage::wal::FsyncMode::EveryWrite);
+
+    // Write entries and simulate crash
+    {
+        let metrics = Arc::new(WalMetricsCollector::new("test"));
+        let wal = FileWal::new(config.clone(), metrics).await.unwrap();
+
+        // Write some entries
+        for i in 0..100 {
+            let event = create_test_event(&format!("event_{}", i));
+            let entry = graphica::storage::wal::WalEntry::lineage(
+                graphica::storage::wal::LogSequenceNumber::ZERO,
+                event,
+            );
+            wal.append(entry).await.unwrap();
+        }
+
+        // Sync but don't close cleanly (simulate crash)
+        wal.sync().await.unwrap();
+        // Drop without calling close()
+    }
+
+    // Recover
+    let recovery_manager = RecoveryManager::new(config.clone());
+    let report = recovery_manager.recover().await.unwrap();
+
+    // Verify recovery
+    assert_eq!(report.result.recovered_entries.len(), 100);
+    assert_eq!(report.result.corrupted_entries.len(), 0);
+    assert!(report.result.recovery_time_ms > 0);
+
+    // Verify we can write after recovery
+    let metrics = Arc::new(WalMetricsCollector::new("test"));
+    let wal = FileWal::new(config, metrics).await.unwrap();
+
+    let event = create_test_event("post_recovery");
+    let entry = graphica::storage::wal::WalEntry::lineage(
+        graphica::storage::wal::LogSequenceNumber::ZERO,
+        event,
+    );
+
+    let lsn = wal.append(entry).await.unwrap();
+    assert!(lsn.0 > 100);  // Should continue from recovered LSN
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_wal_transactions() {
+    let tmp_dir = TempDir::new().unwrap();
+    let config = WalConfig::default()
+        .with_path(tmp_dir.path().join("wal"));
+
+    let wal = WalFactory::create_coordinated_wal(config).await.unwrap();
+
+    // Test transaction lifecycle
+    let tx = wal.begin_transaction().await.unwrap();
+
+    // Add lineage events
+    let events: Vec<_> = (0..5)
+        .map(|i| create_test_event(&format!("tx_event_{}", i)))
+        .collect();
+
+    let lsns = tx.add_lineage(events).await.unwrap();
+    assert_eq!(lsns.len(), 5);
+
+    // Prepare and commit
+    tx.prepare().await.unwrap();
+    tx.commit().await.unwrap();
+
+    // Verify transaction completed
+    assert_eq!(wal.active_transaction_count(), 0);
+
+    // Test transaction abort
+    let tx2 = wal.begin_transaction().await.unwrap();
+    let events: Vec<_> = (0..3)
+        .map(|i| create_test_event(&format!("abort_event_{}", i)))
+        .collect();
+
+    tx2.add_lineage(events).await.unwrap();
+    tx2.abort("Test abort".to_string()).await.unwrap();
+
+    assert_eq!(wal.active_transaction_count(), 0);
+}
+
+#[tokio::test]
+async fn test_wal_rotation() {
+    let tmp_dir = TempDir::new().unwrap();
+    let config = WalConfig::default()
+        .with_path(tmp_dir.path().join("wal"))
+        .with_max_file_size(1024 * 1024);  // 1MB for quick rotation
+
+    let metrics = Arc::new(WalMetricsCollector::new("test"));
+    let wal = FileWal::new(config.clone(), metrics).await.unwrap();
+
+    let rotation_manager = RotationManager::new(config.clone());
+
+    // Write enough data to trigger rotation
+    let mut total_size = 0;
+    let mut segments_created = 0;
+
+    while segments_created < 3 {
+        // Create large event
+        let mut event = create_test_event("large");
+        event.dataset = "x".repeat(10000);  // Make it large
+
+        let entry = graphica::storage::wal::WalEntry::lineage(
+            graphica::storage::wal::LogSequenceNumber::ZERO,
+            event,
+        );
+
+        wal.append(entry.clone()).await.unwrap();
+        total_size += entry.size_bytes();
+
+        if total_size > 1024 * 1024 {
+            segments_created += 1;
+            total_size = 0;
+        }
+    }
+
+    // Verify multiple segments exist
+    let segments_path = tmp_dir.path().join("wal");
+    let entries = std::fs::read_dir(segments_path).unwrap();
+    let segment_count = entries
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("wal_")
+        })
+        .count();
+
+    assert!(segment_count >= 2);
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_wal_corruption_handling() {
+    let tmp_dir = TempDir::new().unwrap();
+    let wal_path = tmp_dir.path().join("wal");
+    std::fs::create_dir_all(&wal_path).unwrap();
+
+    let config = WalConfig::default()
+        .with_path(wal_path.clone())
+        .with_corruption_tolerance(graphica::storage::wal::CorruptionTolerance::SkipCorrupted);
+
+    // Create WAL with some entries
+    {
+        let metrics = Arc::new(WalMetricsCollector::new("test"));
+        let wal = FileWal::new(config.clone(), metrics).await.unwrap();
+
+        for i in 0..50 {
+            let event = create_test_event(&format!("event_{}", i));
+            let entry = graphica::storage::wal::WalEntry::lineage(
+                graphica::storage::wal::LogSequenceNumber::ZERO,
+                event,
+            );
+            wal.append(entry).await.unwrap();
+        }
+
+        wal.sync().await.unwrap();
+    }
+
+    // Corrupt a segment file
+    let segment_path = wal_path.join("wal_00000000.log");
+    let mut data = std::fs::read(&segment_path).unwrap();
+
+    // Corrupt some bytes in the middle
+    if data.len() > 1000 {
+        data[500] ^= 0xFF;
+        data[501] ^= 0xFF;
+        data[502] ^= 0xFF;
+    }
+
+    std::fs::write(&segment_path, data).unwrap();
+
+    // Try to recover
+    let recovery_manager = RecoveryManager::new(config.clone());
+    let report = recovery_manager.recover().await.unwrap();
+
+    // Should have some recovered and some corrupted
+    assert!(report.result.recovered_entries.len() > 0);
+    assert!(report.result.corrupted_entries.len() > 0);
+
+    // Verify we can still write after recovery
+    let metrics = Arc::new(WalMetricsCollector::new("test"));
+    let wal = FileWal::new(config, metrics).await.unwrap();
+
+    let event = create_test_event("post_corruption");
+    let entry = graphica::storage::wal::WalEntry::lineage(
+        graphica::storage::wal::LogSequenceNumber::ZERO,
+        event,
+    );
+
+    wal.append(entry).await.unwrap();
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_wal_concurrent_writes() {
+    let tmp_dir = TempDir::new().unwrap();
+    let config = WalConfig::default()
+        .with_path(tmp_dir.path().join("wal"));
+
+    let metrics = Arc::new(WalMetricsCollector::new("test"));
+    let wal = Arc::new(FileWal::new(config, metrics).await.unwrap());
+
+    // Spawn multiple concurrent writers
+    let mut handles = Vec::new();
+
+    for thread_id in 0..10 {
+        let wal_clone = Arc::clone(&wal);
+        let handle = tokio::spawn(async move {
+            for i in 0..100 {
+                let event = create_test_event(&format!("thread_{}_event_{}", thread_id, i));
+                let entry = graphica::storage::wal::WalEntry::lineage(
+                    graphica::storage::wal::LogSequenceNumber::ZERO,
+                    event,
+                );
+
+                wal_clone.append(entry).await.unwrap();
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all writers
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // Verify all writes succeeded
+    let tail = wal.tail_lsn().await;
+    assert!(tail.0 >= 1000);  // 10 threads * 100 events
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_wal_performance_benchmark() {
+    let tmp_dir = TempDir::new().unwrap();
+    let config = WalConfig::high_throughput()
+        .with_path(tmp_dir.path().join("wal"));
+
+    let metrics = Arc::new(WalMetricsCollector::new("test"));
+    let wal = Arc::new(FileWal::new(config, metrics.clone()).await.unwrap());
+
+    // Warmup
+    for _ in 0..100 {
+        let event = create_test_event("warmup");
+        let entry = graphica::storage::wal::WalEntry::lineage(
+            graphica::storage::wal::LogSequenceNumber::ZERO,
+            event,
+        );
+        wal.append(entry).await.unwrap();
+    }
+
+    // Benchmark single writes
+    let start = std::time::Instant::now();
+    let iterations = 10000;
+
+    for i in 0..iterations {
+        let event = create_test_event(&format!("bench_{}", i));
+        let entry = graphica::storage::wal::WalEntry::lineage(
+            graphica::storage::wal::LogSequenceNumber::ZERO,
+            event,
+        );
+        wal.append(entry).await.unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    let throughput = iterations as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "Single write throughput: {:.2} ops/sec ({:?} for {} ops)",
+        throughput, elapsed, iterations
+    );
+
+    // Benchmark batch writes
+    let start = std::time::Instant::now();
+    let batch_size = 100;
+    let batch_count = 100;
+
+    for batch_id in 0..batch_count {
+        let entries: Vec<_> = (0..batch_size)
+            .map(|i| {
+                let event = create_test_event(&format!("batch_{}_{}", batch_id, i));
+                graphica::storage::wal::WalEntry::lineage(
+                    graphica::storage::wal::LogSequenceNumber::ZERO,
+                    event,
+                )
+            })
+            .collect();
+
+        wal.append_batch(entries).await.unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    let total_ops = batch_size * batch_count;
+    let throughput = total_ops as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "Batch write throughput: {:.2} ops/sec ({:?} for {} ops)",
+        throughput, elapsed, total_ops
+    );
+
+    // Get metrics snapshot
+    let snapshot = metrics.snapshot();
+    println!("Metrics: {:?}", snapshot);
+
+    wal.close().await.unwrap();
+
+    // Assert reasonable performance (>1000 ops/sec for batch)
+    assert!(throughput > 1000.0, "Throughput too low: {}", throughput);
+}
+
+// Helper function to create test lineage events
+fn create_test_event(id: &str) -> LineageEvent {
+    LineageEvent {
+        dataset: "test_dataset".to_string(),
+        record_id: id.to_string(),
+        source_refs: vec![
+            DataRef {
+                system: "test_source".to_string(),
+                path: "test/path".to_string(),
+                cdc_position: Some(format!("pos_{}", id)),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            }
+        ],
+        transforms: vec![],
+        model_refs: vec![],
+        output_ref: DataRef {
+            system: "test_output".to_string(),
+            path: "output/path".to_string(),
+            cdc_position: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        },
+        ts: chrono::Utc::now().timestamp_millis(),
+        run_id: format!("run_{}", id),
+    }
+}

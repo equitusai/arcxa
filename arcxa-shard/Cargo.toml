@@ -1,0 +1,57 @@
+[package]
+name = "arcxa-shard"
+version = "0.2.0"
+edition = "2021"
+authors = ["Equitus Corporation"]
+license-file = "../LICENSE.md"
+
+[[bin]]
+name = "arcxa-shard"
+path = "src/main.rs"
+
+[dependencies]
+# Internal dependency (path to graphica-core)
+graphica-core = { package = "arcxa-core", path = "../arcxa-core" }
+
+# Core utilities
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+tonic = { version = "0.11", features = ["gzip"] }
+tonic-reflection = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4.5", features = ["derive"] }
+parking_lot = "0.12.4"
+
+# ===================================================================
+# KEY DEPENDENCY: Oxigraph with RocksDB backend
+# This resolves to oxrocksdb-sys (RocksDB v6.x)
+# ===================================================================
+oxigraph = { version = "=0.4.11", features = ["rocksdb"] }
+
+# RDF support
+rio_api = "0.8"
+rio_turtle = "0.8"
+rio_xml = "0.8"
+
+# Minimal dependencies for lean binary
+futures = "0.3"
+tokio-stream = "0.1"
+prometheus = "0.14.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+num_cpus = "1.0"
+nix = { version = "0.29", features = ["fs"] }
+
+# CRITICAL: NO explicit rocksdb crate
+# Only oxrocksdb-sys (via oxigraph[rocksdb] feature)
+
+[dev-dependencies]
+tempfile = "3.0"
+
+# Empty workspace table to make this a standalone package
+# (not part of parent workspace due to RocksDB linking conflict)
+[workspace]

@@ -1,0 +1,56 @@
+[package]
+name = "arcxa-model-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["Equitus Corporation"]
+license-file = "../LICENSE.md"
+description = "Distributed model inference service for ARCXA semantic matching"
+
+[[bin]]
+name = "arcxa-model-service"
+path = "src/main.rs"
+
+[dependencies]
+# ML inference - ONNX Runtime (v2.0)
+# Use load-dynamic instead of download-binaries to avoid glibc compatibility issues
+ort = { version = "2.0.0-rc.10", features = ["half", "load-dynamic", "ndarray"] }
+ndarray = "0.16"
+tokenizers = "0.19"  # For tokenization
+
+# gRPC
+tonic = { version = "0.11", default-features = false, features = ["transport", "codegen", "prost"] }
+prost = "0.12"
+prost-types = "0.12"
+
+# Core utilities
+tokio = { version = "1.36", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# In-memory caching (will integrate with Milvus later)
+dashmap = "6.1.0"      # Concurrent HashMap
+parking_lot = "0.12"   # Faster Mutex
+lru = "0.12"           # LRU cache for embeddings
+
+# Configuration
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Monitoring
+prometheus = "0.14.0"
+lazy_static = "1.4"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.8"
+
+# Benchmarks will be added later
+# [[bench]]
+# name = "inference_benchmark"
+# harness = false

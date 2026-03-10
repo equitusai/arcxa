@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package graphica.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Lineage Service - Query and manage data lineage
+service LineageService {
+  // Get complete lineage for a record
+  rpc GetRecordLineage(GetRecordLineageRequest) returns (LineageResponse);
+
+  // Get impact analysis for a model
+  rpc GetModelImpact(GetModelImpactRequest) returns (ModelImpactResponse);
+
+  // Stream lineage events in real-time
+  rpc StreamLineage(StreamLineageRequest) returns (stream LineageEvent);
+
+  // Query lineage by time range
+  rpc QueryLineageByTime(QueryLineageByTimeRequest) returns (LineageResponse);
+}
+
+message GetRecordLineageRequest {
+  string record_id = 1;
+  string tenant_id = 2;
+}
+
+message GetModelImpactRequest {
+  string model_id = 1;
+  string version = 2;
+  string tenant_id = 3;
+}
+
+message StreamLineageRequest {
+  string dataset = 1;
+  string tenant_id = 2;
+}
+
+message QueryLineageByTimeRequest {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp end_time = 2;
+  string tenant_id = 3;
+}
+
+message LineageResponse {
+  repeated LineageEvent events = 1;
+}
+
+message ModelImpactResponse {
+  string model_id = 1;
+  string version = 2;
+  repeated LineageEvent affected_records = 3;
+  int64 total_records_affected = 4;
+}
+
+// Core lineage event with full provenance
+message LineageEvent {
+  string id = 1;
+  string dataset = 2;
+  string record_id = 3;
+  repeated DataRef source_refs = 4;
+  repeated TransformRef transforms = 5;
+  repeated ModelRef model_refs = 6;
+  DataRef output_ref = 7;
+  google.protobuf.Timestamp timestamp = 8;
+  string run_id = 9;
+  string tenant_id = 10;
+  map<string, string> metadata = 11;
+}
+
+message DataRef {
+  string system = 1;
+  string path = 2;
+  optional string version = 3;
+  google.protobuf.Timestamp extracted_at = 4;
+  optional CdcPosition cdc_position = 5;
+}
+
+message CdcPosition {
+  string topic = 1;
+  int32 partition = 2;
+  int64 offset = 3;
+  optional string lsn = 4;
+}
+
+message TransformRef {
+  string id = 1;
+  string transform_type = 2;
+  string rule_id = 3;
+  string version = 4;
+  map<string, string> parameters = 5;
+  google.protobuf.Timestamp applied_at = 6;
+  repeated string fields_modified = 7;
+}
+
+message ModelRef {
+  string model_id = 1;
+  string version = 2;
+  string model_type = 3;
+  string params_hash = 4;
+  repeated DataRef training_data = 5;
+  ModelMetrics metrics = 6;
+  string registry_uri = 7;
+  google.protobuf.Timestamp inference_at = 8;
+  repeated string features_used = 9;
+  repeated string outputs = 10;
+}
+
+message ModelMetrics {
+  optional double accuracy = 1;
+  optional double precision = 2;
+  optional double recall = 3;
+  optional double f1_score = 4;
+  optional double rmse = 5;
+  map<string, double> custom_metrics = 6;
+}
