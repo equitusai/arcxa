@@ -1,6 +1,6 @@
-# Graphica
+# ARCXA
 
-So this is a distributed data governance platform that uses RDF triples as storage. When you're tracking lineage through ML models and need to query "show me everything this model touched", having a graph database that speaks SPARQL actually makes sense. It's not about being academic, it's about not having to write 50 different JOIN queries.
+This is a distributed data governance platform that uses RDF triples as storage. When you're tracking lineage through ML models and need to query "show me everything this model touched", having a graph database that speaks SPARQL actually makes sense. It's not about being academic, it's about not having to write 50 different JOIN queries.
 
 The architecture: coordinator processes route queries to N shard processes. Each shard owns a chunk of the hash space and stores RDF triples in Oxigraph (which uses RocksDB). The coordinator maintains a shard registry (also in RocksDB) that tracks which shards exist and auto-assigns hash ranges when they register. Routing is deterministic consistent hashing with 150 virtual nodes per shard for even distribution.
 
