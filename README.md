@@ -2,6 +2,8 @@
 
 ARCXA is a data governance and orchestration platform built around a graph-native metadata layer, workflow execution, lineage tracking, and source-to-semantic mapping. It is designed for teams that need to connect operational data sources, materialize governed datasets, map them into semantic models, and run repeatable transformation or loading workflows with traceable provenance.
 
+One of the main reasons ARCXA exists is enterprise AI governance. In regulated or high-risk environments, multiple teams may be using LLMs, AI agents, model services, and transformation workflows against shared datasets. That creates a hard governance problem: what data was used where, what changed it, which workflow or service touched it, and what downstream systems or teams are now depending on it. ARCXA is built to make those relationships observable instead of implicit.
+
 This public repository combines the Rust backend services and the React frontend used to operate the platform. The repository layout reflects the deployable surface of the system rather than just library internals, so it is suitable as both a codebase and an operational reference.
 
 The codebase is organized for a distributed deployment model:
@@ -9,6 +11,18 @@ The codebase is organized for a distributed deployment model:
 - `arcxa-shard` is the RDF/SPARQL data plane for graph storage and distributed query execution.
 - `arcxa-model-service` provides the optional model-serving path used by semantic matching and ML-oriented workflow steps.
 - `frontend/` contains the ARCXA web application.
+
+## Why ARCXA
+
+Enterprise AI programs usually fail governance before they fail modeling. The operational problem is not just storing data or running an LLM call. It is maintaining an auditable understanding of:
+
+- which sources were connected
+- which datasets were materialized or transformed
+- which workflows changed them
+- which mappings or ontology terms were applied
+- which models, services, or downstream consumers used the resulting data
+
+ARCXA focuses on that control plane. It gives teams a shared system for cataloging sources, governing transformation flows, materializing datasets, and tracing lineage across those boundaries so that "what changed what" and "what is using what" are answerable questions.
 
 ## Core Architecture
 
@@ -98,6 +112,8 @@ Workflows can read from datasources or materialized datasets, execute transforma
 ### 6. Lineage and governance
 
 Once data has moved through the system, ARCXA exposes lineage and governance views so operators can trace what happened, which workflow or mapping session was involved, and how governed entities or datasets relate to their originating sources.
+
+That is the point where the platform becomes especially relevant for AI-heavy environments. When teams are training, enriching, validating, or operationalizing data through model-backed services and automated agents, ARCXA is intended to preserve the chain of custody across those steps rather than leaving it scattered across logs, notebooks, and one-off pipelines.
 
 ## Supported Source Classes
 
