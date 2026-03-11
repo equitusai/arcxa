@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Secret
 metadata:
-  name: graphica-pull
+  name: arcxa-pull
   annotations:
     "helm.sh/hook-weight": "-5"
 type: kubernetes.io/dockerconfigjson

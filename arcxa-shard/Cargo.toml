@@ -10,7 +10,7 @@ name = "arcxa-shard"
 path = "src/main.rs"
 
 [dependencies]
-# Internal dependency (path to graphica-core)
+# Internal dependency (path to arcxa-core)
 graphica-core = { package = "arcxa-core", path = "../arcxa-core" }
 
 # Core utilities

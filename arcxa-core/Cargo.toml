@@ -105,7 +105,7 @@ memmap2 = "0.9"
 
 # Machine Learning - REMOVED (TODO: Restore when ML dependencies are stable)
 # fastembed, ort, tract-onnx, ndarray - removed to fix OpenSSL build issues
-# Will be re-added to graphica-model-service once stable
+# Will be re-added to arcxa-model-service once stable
 
 # AWS Lambda SDK (optional, enable with "lambda" feature)
 aws-config = { version = "1.1", optional = true }

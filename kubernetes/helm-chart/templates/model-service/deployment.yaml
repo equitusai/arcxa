@@ -2,7 +2,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: graphica-model-service
+  name: arcxa-model-service
   namespace: {{ .Release.namespace }}
 spec:
   replicas: {{ .Values.graphica.modelService.replicas }}
@@ -18,13 +18,13 @@ spec:
     spec:
       serviceAccountName: {{ .Values.graphica.serviceAccountName }}
       imagePullSecrets:
-      - name: graphica-pull
+      - name: arcxa-pull
       containers:
-      - name: graphica-model-service
+      - name: arcxa-model-service
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         image: {{ .Values.graphica.modelService.imageTag }}
         args:
-          - ./graphica-model-service
+          - ./arcxa-model-service
         env:
         - name: RUST_LOG
           value: info

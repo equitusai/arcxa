@@ -1,6 +1,6 @@
 apiVersion: v2
-name: graphica
-description: Helm chart for Graphica
+name: arcxa
+description: Helm chart for ARCXA
 type: application
 version: 0.0.1
 appVersion: "2025.11.20"

@@ -2,8 +2,8 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: graphica-frontend
-  namespace: graphica
+  name: arcxa-frontend
+  namespace: {{ .Release.namespace }}
 spec:
   replicas: {{ .Values.graphica.frontend.replicas }}
   selector:
@@ -18,14 +18,14 @@ spec:
     spec:
       serviceAccountName: {{ .Values.graphica.serviceAccountName }}
       imagePullSecrets:
-      - name: graphica-pull
+      - name: arcxa-pull
       containers:
-      - name: graphica-frontend
+      - name: arcxa-frontend
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         image: {{ .Values.graphica.frontend.imageTag }}
         env:
         - name: VITE_API_URL
-          value: 'http://graphica-coordinator:8080/api/v1'
+          value: 'http://arcxa-coordinator:8080/api/v1'
         securityContext:
           runAsUser: 1000
 {{- end }}

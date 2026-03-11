@@ -1,8 +1,0 @@
-PRODUCT_ID,VARIANT_ID,PRODUCT_NAME,CATEGORY,SUBCATEGORY,UNIT_PRICE,COST_PRICE,IN_STOCK
-102,1,Athletic Shorts - Navy Small,Apparel,Shorts,29.99,12.00,120
-102,2,Athletic Shorts - Navy Medium,Apparel,Shorts,29.99,12.00,140
-102,3,Athletic Shorts - Navy Large,Apparel,Shorts,29.99,12.00,95
-103,1,Running Shoes - Black 9,Footwear,Shoes,89.99,40.00,50
-103,2,Running Shoes - Black 10,Footwear,Shoes,89.99,40.00,60
-103,3,Running Shoes - Black 11,Footwear,Shoes,89.99,40.00,45
-104,1,Yoga Mat - Purple,Sports,Accessories,24.99,10.00,200

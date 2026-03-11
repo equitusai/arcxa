@@ -78,7 +78,7 @@ async fn test_workflow_execution_with_in_memory_rdf_persistence() -> Result<()> 
     // 2. Create a persistence callback that writes to the store
     // 3. Attach the callback to the workflow engine using with_rdf_persistence()
     //
-    // Example (requires adding graphica-coordinator as dev-dependency):
+    // Example (requires adding arcxa-coordinator as dev-dependency):
     // ```
     // use graphica_coordinator::governance::InMemoryRdfStore;
     //
@@ -138,9 +138,9 @@ async fn test_workflow_rdf_persistence_documentation() {
 
     println!("\n=== How to Test Workflow RDF Persistence ===\n");
 
-    println!("1. Add graphica-coordinator as a dev-dependency to graphica-core:");
+    println!("1. Add arcxa-coordinator as a dev-dependency to arcxa-core:");
     println!("   [dev-dependencies]");
-    println!("   graphica-coordinator = {{ path = \"../graphica-coordinator\" }}\n");
+    println!("   arcxa-coordinator = {{ path = \"../arcxa-coordinator\" }}\n");
 
     println!("2. Import the InMemoryRdfStore:");
     println!("   use graphica_coordinator::governance::{{InMemoryRdfStore, RdfStore}};\n");

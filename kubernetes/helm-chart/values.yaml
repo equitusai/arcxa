@@ -19,7 +19,7 @@ kafka:
     size: "50Gi"
 
 graphica:
-  serviceAccountName: graphica
+  serviceAccountName: arcxa
   ingress:
       uri: "graphica.apps.ocp4-dev.equitus.org"
       certName: ""
@@ -48,4 +48,4 @@ graphica:
   frontend:
     enabled: true
     replicas: 1
-    imageTag: "registry.gitlab.com/equitus/fusion/graphica-frontend:add-ci"    
+    imageTag: "registry.gitlab.com/equitus/fusion/graphica-frontend:add-ci"

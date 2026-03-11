@@ -2,10 +2,10 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: graphica-coordinator
-  namespace: graphica
+  name: arcxa-coordinator
+  namespace: {{ .Release.namespace }}
 spec:
-  serviceName: graphica
+  serviceName: arcxa-coordinator
   replicas: {{ .Values.graphica.coordinator.replicas }}
   selector:
     matchLabels:
@@ -18,23 +18,23 @@ spec:
         component: coordinator
     spec:
       serviceAccountName: {{ .Values.graphica.serviceAccountName }}
-      serviceAccount: graphica
+      serviceAccount: {{ .Values.graphica.serviceAccountName }}
       imagePullSecrets:
-      - name: graphica-pull
+      - name: arcxa-pull
       containers:
-      - name: graphica-coordinator
+      - name: arcxa-coordinator
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         image: {{ .Values.graphica.coordinator.imageTag }}
         volumeMounts:
-          - name: graphica-coordinator-metadata
+          - name: arcxa-coordinator-metadata
             mountPath: /data
         args:
-          - ./graphica-coordinator
+          - ./arcxa-coordinator
         envFrom:
         - configMapRef:
-            name: graphica-coordinator-configmap
+            name: arcxa-coordinator-configmap
         - secretRef:
-            name: graphica-initial-admin
+            name: arcxa-initial-admin
         # livenessProbe:
         #   httpGet:
         #     path: /health/liveness
@@ -56,12 +56,12 @@ spec:
         runAsUser: 1000
         fsGroup: 1000
       volumes:
-        - name: graphica-coordinator-metadata
+        - name: arcxa-coordinator-metadata
           persistentVolumeClaim:
-            claimName: graphica-coordinator-metadata
+            claimName: arcxa-coordinator-metadata
   volumeClaimTemplates:
     - metadata:
-        name: graphica-coordinator-metadata
+        name: arcxa-coordinator-metadata
       spec:
         accessModes:
           - ReadWriteOnce

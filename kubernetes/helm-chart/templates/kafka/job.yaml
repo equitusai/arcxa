@@ -9,9 +9,9 @@ spec:
   ttlSecondsAfterFinished: 500
   template:
     spec:
-      serviceAccountName: graphica
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
       imagePullSecrets:
-        - name: graphica-pull
+        - name: arcxa-pull
       volumes:
         - name: kafka-init-script
           configMap:

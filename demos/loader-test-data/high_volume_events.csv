@@ -1,6 +1,0 @@
-EVENT_ID,CUSTOMER_ID,EVENT_TYPE,EVENT_TIMESTAMP,EVENT_DATA,SESSION_ID,IP_ADDRESS,USER_AGENT
-100001,1,page_view,2024-10-17 10:00:00,"{""page"": ""/products/100""}",sess_abc123,192.168.1.100,Mozilla/5.0
-100002,1,add_to_cart,2024-10-17 10:05:00,"{""product_id"": 100}",sess_abc123,192.168.1.100,Mozilla/5.0
-100003,2,page_view,2024-10-17 10:10:00,"{""page"": ""/home""}",sess_xyz789,192.168.1.101,Chrome/118.0
-100004,3,search,2024-10-17 10:15:00,"{""query"": ""running shoes""}",sess_def456,192.168.1.102,Safari/17.0
-100005,1,checkout,2024-10-17 10:20:00,"{""order_id"": 1001}",sess_abc123,192.168.1.100,Mozilla/5.0

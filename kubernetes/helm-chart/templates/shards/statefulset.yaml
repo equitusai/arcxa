@@ -2,10 +2,10 @@
 kind: StatefulSet
 apiVersion: apps/v1
 metadata:
-  name: graphica-shard
+  name: arcxa-shard
   namespace: {{ .Release.namespace }}
 spec:
-  serviceName: graphica
+  serviceName: arcxa-shard
   replicas: {{ .Values.graphica.shards.replicas }}
   selector:
     matchLabels:
@@ -22,33 +22,33 @@ spec:
     spec:
       serviceAccountName: {{ .Values.graphica.serviceAccountName }}
       imagePullSecrets:
-        - name: graphica-pull
+        - name: arcxa-pull
       securityContext:
         runAsUser: 1000
         fsGroup: 1000
       containers:
-        - name: graphica-shard
+        - name: arcxa-shard
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           volumeMounts:
-            - name: graphica-shard
+            - name: arcxa-shard
               mountPath: /data
           image: {{ .Values.graphica.shards.imageTag }}
           args:
-            - ./graphica-shard
+            - ./arcxa-shard
             - '--coordinator-url'
-            - 'http://graphica-coordinator:9090'
+            - 'http://arcxa-coordinator:9090'
             - --data-path
             - /data/
             - --port
             - '9100'
-      serviceAccount: graphica
+      serviceAccount: {{ .Values.graphica.serviceAccountName }}
       volumes:
-        - name: graphica-shard
+        - name: arcxa-shard
           persistentVolumeClaim:
-            claimName: graphica-shard
+            claimName: arcxa-shard
   volumeClaimTemplates:
     - metadata:
-        name: graphica-shard
+        name: arcxa-shard
       spec:
         accessModes:
           - ReadWriteOnce

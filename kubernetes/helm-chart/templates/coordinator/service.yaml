@@ -2,8 +2,8 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: graphica-coordinator
-  namespace: graphica
+  name: arcxa-coordinator
+  namespace: {{ .Release.namespace }}
 spec:
   ports:
   - port: 8080

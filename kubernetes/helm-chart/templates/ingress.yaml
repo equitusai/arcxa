@@ -10,7 +10,7 @@ metadata:
     {{ if .Values.openshiftMode.enabled }}
     route.openshift.io/termination: edge
     {{ end }}
-  name: graphica
+  name: arcxa
   namespace: {{ .Release.namespace }}
   labels:
     app: graphica
@@ -22,7 +22,7 @@ spec:
       {{ if .Values.graphica.ingress.certName }}
       secretName: {{.Values.graphica.ingress.certName}}
       {{ else }}
-      secretName: graphica-tls-secret
+      secretName: arcxa-tls-secret
       {{end}}
   rules:
     - host: {{ .Values.graphica.ingress.uri }}
@@ -32,20 +32,20 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: graphica-frontend
+                name: arcxa-frontend
                 port:
                   number: 8080
           - path: /api
             pathType: Prefix
             backend:
               service:
-                name: graphica-coordinator
+                name: arcxa-coordinator
                 port:
                   number: 8080
           - path: /auth
             pathType: Prefix
             backend:
               service:
-                name: graphica-coordinator
+                name: arcxa-coordinator
                 port:
                   number: 8080

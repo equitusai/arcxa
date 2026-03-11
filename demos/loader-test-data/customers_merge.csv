@@ -1,6 +1,0 @@
-CUSTOMER_ID,FIRST_NAME,LAST_NAME,EMAIL,PHONE,DATE_OF_BIRTH,LOYALTY_POINTS,CUSTOMER_SEGMENT
-1,Alice,Anderson-Updated,alice@example.com,555-0101,1985-03-15,2000,PLATINUM
-2,Bob,Brown,bob@example.com,555-0102,1990-07-22,1100,GOLD
-3,Charlie,Chen,charlie@example.com,555-0103-NEW,1988-11-30,500,SILVER
-201,Nora,Nelson,nora.nelson@example.com,555-0301,1990-03-12,850,SILVER
-202,Oscar,Olson,oscar.olson@example.com,555-0302,1985-11-08,420,BRONZE
