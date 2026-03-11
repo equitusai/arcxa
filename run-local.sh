@@ -14,7 +14,7 @@
 
 set -e
 
-VERSION="0.4.1"  # Memory optimization + GDPR refactor
+VERSION="1.0.0"
 
 run_cargo() {
     env -u CC \
