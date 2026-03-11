@@ -1,6 +1,8 @@
 # ARCXA
 
-ARCXA is a data governance and orchestration platform built around a graph-native metadata layer, workflow execution, lineage tracking, and source-to-semantic mapping. It is designed for teams that need to connect operational data sources, materialize governed datasets, map them into semantic models, and run repeatable transformation or loading workflows with traceable provenance.
+Mapping intelligence for enterprise data migrations: schema mapping, lineage, and transformation traceability that compounds across every project.
+
+ARCXA is a data governance and orchestration platform for teams that need to connect operational data sources, materialize governed datasets, map them into semantic models, and run repeatable transformation or loading workflows with traceable provenance.
 
 One of the main reasons ARCXA exists is enterprise AI governance. In regulated or high-risk environments, multiple teams may be using LLMs, AI agents, model services, and transformation workflows against shared datasets. That creates a hard governance problem: what data was used where, what changed it, which workflow or service touched it, and what downstream systems or teams are now depending on it. ARCXA is built to make those relationships observable instead of implicit.
 
