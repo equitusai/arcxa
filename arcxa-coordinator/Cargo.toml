@@ -13,10 +13,6 @@ path = "src/lib.rs"
 name = "arcxa-coordinator"
 path = "src/main.rs"
 
-[[bin]]
-name = "arcxa"
-path = "src/main.rs"
-
 # Migrate binary will be re-enabled after storage module migration
 # [[bin]]
 # name = "migrate"
