@@ -15,6 +15,29 @@
 set -e
 
 VERSION="1.0.0"
+MIN_RUST_VERSION="1.91.1"
+
+version_ge() {
+    [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+check_rust_version() {
+    if ! command -v rustc >/dev/null 2>&1; then
+        echo "rustc is not installed."
+        exit 1
+    fi
+
+    local current_version
+    current_version="$(rustc --version | awk '{print $2}')"
+
+    if ! version_ge "$current_version" "$MIN_RUST_VERSION"; then
+        echo "Rust ${MIN_RUST_VERSION}+ is required (found ${current_version})."
+        echo "Install and select the required toolchain:"
+        echo "  rustup toolchain install ${MIN_RUST_VERSION}"
+        echo "  rustup override set ${MIN_RUST_VERSION}"
+        exit 1
+    fi
+}
 
 run_cargo() {
     env -u CC \
@@ -155,6 +178,8 @@ done
 if [ "$INSPECT_ONLY" = true ]; then
     inspect_binaries
 fi
+
+check_rust_version
 
 if [ "$BUILD_MODE" == "debug" ]; then
     echo "🚀 Using DEBUG mode for faster builds"

@@ -10,6 +10,29 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 VERSION="1.0.0"
+MIN_RUST_VERSION="1.91.1"
+
+version_ge() {
+    [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+check_rust_version() {
+    if ! command -v rustc >/dev/null 2>&1; then
+        echo -e "${RED}rustc is not installed.${NC}"
+        exit 1
+    fi
+
+    local current_version
+    current_version="$(rustc --version | awk '{print $2}')"
+
+    if ! version_ge "$current_version" "$MIN_RUST_VERSION"; then
+        echo -e "${RED}Rust ${MIN_RUST_VERSION}+ is required (found ${current_version}).${NC}"
+        echo "Install and select the required toolchain:"
+        echo "  rustup toolchain install ${MIN_RUST_VERSION}"
+        echo "  rustup override set ${MIN_RUST_VERSION}"
+        exit 1
+    fi
+}
 
 run_cargo() {
     env -u CC \
@@ -156,6 +179,8 @@ if [ "$1" = "--status" ]; then
     show_status
     exit 0
 fi
+
+check_rust_version
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Building ARCXA Components v${VERSION}${NC}"

@@ -211,6 +211,10 @@ Notes:
 
 ## Local Development
 
+Toolchain requirement:
+- Rust `1.91.1` or newer is required for the current AWS SDK dependency set.
+- The repo includes `rust-toolchain.toml` pinned to `1.91.1` so `rustup` can select the right toolchain automatically.
+
 Build the backend components:
 
 ```bash
