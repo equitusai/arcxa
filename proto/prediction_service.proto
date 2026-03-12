@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package graphica.ml;
+
+// Generic ML Prediction Service
+//
+// Compatible with TensorFlow Serving, TorchServe, and custom model servers.
+// Provides a unified interface for invoking external ML models via gRPC.
+service PredictionService {
+    // Predict using a registered model
+    //
+    // Input features are passed as key-value pairs (field name -> value).
+    // Returns predictions as key-value pairs (output name -> predicted value).
+    rpc Predict(PredictRequest) returns (PredictResponse);
+
+    // Health check for model availability
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Prediction request
+message PredictRequest {
+    // Model identifier (name or ID)
+    string model_id = 1;
+
+    // Model version (optional, defaults to latest)
+    string model_version = 2;
+
+    // Input features as key-value pairs
+    // Key: feature name (e.g., "age", "income", "category")
+    // Value: feature value (supports string, number, array)
+    map<string, FeatureValue> features = 3;
+
+    // Request timeout in milliseconds (optional)
+    int64 timeout_ms = 4;
+}
+
+// Feature value (supports multiple types)
+message FeatureValue {
+    oneof value {
+        string string_value = 1;
+        double number_value = 2;
+        bool bool_value = 3;
+        StringList string_list = 4;
+        NumberList number_list = 5;
+    }
+}
+
+// List of strings
+message StringList {
+    repeated string values = 1;
+}
+
+// List of numbers
+message NumberList {
+    repeated double values = 1;
+}
+
+// Prediction response
+message PredictResponse {
+    // Model ID that served the prediction
+    string model_id = 1;
+
+    // Model version used
+    string model_version = 2;
+
+    // Predictions as key-value pairs
+    // Key: output name (e.g., "predicted_class", "probability", "score")
+    // Value: predicted value
+    map<string, PredictionValue> predictions = 3;
+
+    // Overall confidence score (0.0 to 1.0)
+    double confidence = 4;
+
+    // Inference latency in milliseconds
+    double inference_time_ms = 5;
+
+    // Whether this prediction was served from cache
+    bool from_cache = 6;
+}
+
+// Prediction value (supports multiple types)
+message PredictionValue {
+    oneof value {
+        string string_value = 1;
+        double number_value = 2;
+        bool bool_value = 3;
+        StringList string_list = 4;
+        NumberList number_list = 5;
+    }
+}
+
+// Health check request
+message HealthCheckRequest {
+    // Model ID to check (optional, checks all if empty)
+    string model_id = 1;
+}
+
+// Health check response
+message HealthCheckResponse {
+    // Service is healthy
+    bool healthy = 1;
+
+    // Model ID
+    string model_id = 2;
+
+    // Model status
+    ModelStatus status = 3;
+
+    // Service uptime in seconds
+    int64 uptime_seconds = 4;
+
+    // Total predictions served
+    int64 total_predictions = 5;
+
+    // Average latency (milliseconds)
+    double avg_latency_ms = 6;
+}
+
+// Model serving status
+enum ModelStatus {
+    MODEL_STATUS_UNKNOWN = 0;
+    MODEL_STATUS_LOADING = 1;
+    MODEL_STATUS_READY = 2;
+    MODEL_STATUS_ERROR = 3;
+    MODEL_STATUS_UNLOADING = 4;
+}

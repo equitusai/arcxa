@@ -1,0 +1,474 @@
+// Workflow State Service - Extension for workflow execution state persistence
+//
+// Manages workflow execution state as RDF triples in the shard,
+// providing SPARQL-queryable history and recovery capabilities.
+
+syntax = "proto3";
+
+package graphica.workflow.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// Workflow State Service - Exposed by shard for workflow persistence
+// ============================================================================
+
+service WorkflowStateService {
+    // Store execution checkpoint as RDF triples
+    rpc StoreCheckpoint(StoreCheckpointRequest) returns (StoreCheckpointResponse);
+
+    // Get latest checkpoint for an execution
+    rpc GetLatestCheckpoint(GetCheckpointRequest) returns (GetCheckpointResponse);
+
+    // Query executions by various criteria (returns SPARQL results)
+    rpc QueryExecutions(QueryExecutionsRequest) returns (stream QueryExecutionsResponse);
+
+    // Archive completed execution (move to cold storage graph)
+    rpc ArchiveExecution(ArchiveExecutionRequest) returns (ArchiveExecutionResponse);
+
+    // Get execution lineage graph (PROV-based)
+    rpc GetExecutionLineage(GetLineageRequest) returns (GetLineageResponse);
+
+    // Batch get multiple checkpoints (for recovery)
+    rpc BatchGetCheckpoints(BatchGetCheckpointsRequest) returns (BatchGetCheckpointsResponse);
+}
+
+// ============================================================================
+// Checkpoint Operations
+// ============================================================================
+
+// Store checkpoint request
+message StoreCheckpointRequest {
+    // Execution identifier
+    string execution_id = 1;
+
+    // Checkpoint sequence number (monotonic)
+    uint64 sequence = 2;
+
+    // Workflow ID for context
+    string workflow_id = 3;
+
+    // Execution status at checkpoint
+    ExecutionStatus status = 4;
+
+    // Step number in workflow
+    uint64 step_number = 5;
+
+    // Compressed execution context (MessagePack + LZ4)
+    bytes compressed_state = 6;
+
+    // SHA-256 hash of uncompressed state
+    string state_checksum = 7;
+
+    // Timestamp of checkpoint creation
+    google.protobuf.Timestamp created_at = 8;
+
+    // Metadata as RDF properties
+    map<string, string> metadata = 9;
+
+    // Named graph for storage (optional, uses default if empty)
+    string graph_uri = 10;
+}
+
+// Store checkpoint response
+message StoreCheckpointResponse {
+    // Success indicator
+    bool success = 1;
+
+    // Checkpoint URI in RDF store
+    string checkpoint_uri = 2;
+
+    // Number of triples created
+    uint32 triples_created = 3;
+
+    // Storage duration in milliseconds
+    uint32 duration_ms = 4;
+
+    // Error message if failed
+    string error = 5;
+}
+
+// Get checkpoint request
+message GetCheckpointRequest {
+    // Execution ID to get checkpoint for
+    string execution_id = 1;
+
+    // Specific sequence number (0 = latest)
+    uint64 sequence = 2;
+
+    // Include compressed state in response
+    bool include_state = 3;
+}
+
+// Get checkpoint response
+message GetCheckpointResponse {
+    // Found checkpoint
+    Checkpoint checkpoint = 1;
+
+    // True if checkpoint exists
+    bool found = 2;
+}
+
+// Checkpoint data structure
+message Checkpoint {
+    // Checkpoint identifier (RDF URI)
+    string checkpoint_uri = 1;
+
+    // Execution ID
+    string execution_id = 2;
+
+    // Sequence number
+    uint64 sequence = 3;
+
+    // Workflow ID
+    string workflow_id = 4;
+
+    // Status at checkpoint
+    ExecutionStatus status = 5;
+
+    // Step number
+    uint64 step_number = 6;
+
+    // Compressed state (optional based on request)
+    bytes compressed_state = 7;
+
+    // State checksum
+    string state_checksum = 8;
+
+    // Creation timestamp
+    google.protobuf.Timestamp created_at = 9;
+
+    // Metadata
+    map<string, string> metadata = 10;
+
+    // Previous checkpoint URI (for chain traversal)
+    string previous_checkpoint_uri = 11;
+}
+
+// ============================================================================
+// Query Operations
+// ============================================================================
+
+// Query executions request
+message QueryExecutionsRequest {
+    // SPARQL WHERE clause (without SELECT)
+    // Example: "?exec workflow:status 'Running' ; workflow:startedAt ?start . FILTER (?start > '2024-10-25T00:00:00Z'^^xsd:dateTime)"
+    string sparql_where = 1;
+
+    // Projection variables (what to return)
+    repeated string select_vars = 2;
+
+    // Limit results
+    uint32 limit = 3;
+
+    // Offset for pagination
+    uint32 offset = 4;
+
+    // Order by clause
+    string order_by = 5;
+
+    // Time range filter (optional)
+    TimeRange time_range = 6;
+
+    // Status filter (optional, more efficient than SPARQL)
+    repeated ExecutionStatus status_filter = 7;
+
+    // Include checkpoint data
+    bool include_checkpoints = 8;
+}
+
+// Query executions response (streaming)
+message QueryExecutionsResponse {
+    oneof result {
+        // Execution summary
+        ExecutionSummary execution = 1;
+
+        // Error during query
+        QueryError error = 2;
+
+        // Query statistics (sent at end)
+        QueryStats stats = 3;
+    }
+}
+
+// Execution summary from RDF
+message ExecutionSummary {
+    // Execution URI in RDF
+    string execution_uri = 1;
+
+    // Execution ID
+    string execution_id = 2;
+
+    // Workflow ID
+    string workflow_id = 3;
+
+    // Current status
+    ExecutionStatus status = 4;
+
+    // Started timestamp
+    google.protobuf.Timestamp started_at = 5;
+
+    // Completed timestamp (if finished)
+    google.protobuf.Timestamp completed_at = 6;
+
+    // Number of completed steps
+    uint64 completed_steps = 7;
+
+    // Latest checkpoint info
+    CheckpointInfo latest_checkpoint = 8;
+
+    // Error message (if failed)
+    string error = 9;
+
+    // Additional RDF properties as key-value
+    map<string, string> properties = 10;
+}
+
+// Checkpoint summary info
+message CheckpointInfo {
+    string checkpoint_uri = 1;
+    uint64 sequence = 2;
+    google.protobuf.Timestamp created_at = 3;
+    uint64 step_number = 4;
+}
+
+// Query error
+message QueryError {
+    enum ErrorCode {
+        UNKNOWN = 0;
+        SPARQL_PARSE_ERROR = 1;
+        TIMEOUT = 2;
+        STORAGE_ERROR = 3;
+    }
+
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+// Query statistics
+message QueryStats {
+    uint32 total_results = 1;
+    uint32 returned_results = 2;
+    uint64 query_time_ms = 3;
+    uint64 triples_scanned = 4;
+}
+
+// ============================================================================
+// Archive Operations
+// ============================================================================
+
+// Archive execution request
+message ArchiveExecutionRequest {
+    // Execution ID to archive
+    string execution_id = 1;
+
+    // Complete execution data (will be converted to RDF)
+    WorkflowExecutionData execution_data = 2;
+
+    // Target archive graph (e.g., "http://graphica.io/archive/2024/10")
+    string archive_graph = 3;
+
+    // Delete from hot storage after archive
+    bool delete_from_hot = 4;
+
+    // Include all checkpoints in archive
+    bool include_checkpoints = 5;
+
+    // Include event log in archive
+    bool include_events = 6;
+}
+
+// Archive execution response
+message ArchiveExecutionResponse {
+    // Success indicator
+    bool success = 1;
+
+    // Archive URI
+    string archive_uri = 2;
+
+    // Number of triples archived
+    uint64 triples_archived = 3;
+
+    // Archive size in bytes
+    uint64 archive_size_bytes = 4;
+
+    // Error message if failed
+    string error = 5;
+}
+
+// Complete workflow execution data
+message WorkflowExecutionData {
+    string execution_id = 1;
+    string workflow_id = 2;
+    string workflow_name = 3;
+    ExecutionStatus status = 4;
+    google.protobuf.Timestamp started_at = 5;
+    google.protobuf.Timestamp completed_at = 6;
+    string triggered_by = 7;
+    bytes context = 8;  // JSON context
+    bytes output = 9;   // JSON output
+    string error = 10;
+    repeated StepResult step_results = 11;
+    repeated ExecutionLog logs = 12;
+}
+
+// Step result
+message StepResult {
+    string step_id = 1;
+    string step_name = 2;
+    bool success = 3;
+    bytes output = 4;  // JSON
+    string error = 5;
+    google.protobuf.Timestamp started_at = 6;
+    google.protobuf.Timestamp completed_at = 7;
+}
+
+// Execution log entry
+message ExecutionLog {
+    google.protobuf.Timestamp timestamp = 1;
+    LogLevel level = 2;
+    string message = 3;
+    string step_id = 4;
+}
+
+// ============================================================================
+// Lineage Operations
+// ============================================================================
+
+// Get execution lineage request
+message GetLineageRequest {
+    // Execution ID
+    string execution_id = 1;
+
+    // Include upstream lineage (what influenced this execution)
+    bool include_upstream = 2;
+
+    // Include downstream lineage (what this execution influenced)
+    bool include_downstream = 3;
+
+    // Maximum depth to traverse
+    uint32 max_depth = 4;
+
+    // Output format
+    LineageFormat format = 5;
+}
+
+// Get lineage response
+message GetLineageResponse {
+    oneof result {
+        // RDF triples (Turtle format)
+        string turtle = 1;
+
+        // JSON-LD format
+        string json_ld = 2;
+
+        // Structured lineage graph
+        LineageGraph graph = 3;
+    }
+}
+
+// Lineage graph structure
+message LineageGraph {
+    // Root execution
+    string root_execution_id = 1;
+
+    // Nodes in the lineage graph
+    repeated LineageNode nodes = 2;
+
+    // Edges representing relationships
+    repeated LineageEdge edges = 3;
+}
+
+// Lineage node
+message LineageNode {
+    string node_id = 1;
+    NodeType type = 2;
+    string label = 3;
+    map<string, string> properties = 4;
+}
+
+// Lineage edge
+message LineageEdge {
+    string from_id = 1;
+    string to_id = 2;
+    string relationship = 3;  // PROV relationship (wasGeneratedBy, used, etc.)
+    map<string, string> properties = 4;
+}
+
+// ============================================================================
+// Batch Operations
+// ============================================================================
+
+// Batch get checkpoints request
+message BatchGetCheckpointsRequest {
+    // List of execution IDs
+    repeated string execution_ids = 1;
+
+    // Get only latest checkpoint for each
+    bool latest_only = 2;
+
+    // Include compressed state
+    bool include_state = 3;
+}
+
+// Batch get checkpoints response
+message BatchGetCheckpointsResponse {
+    // Map of execution_id to checkpoints
+    map<string, CheckpointList> checkpoints = 1;
+
+    // Execution IDs not found
+    repeated string not_found = 2;
+}
+
+// List of checkpoints
+message CheckpointList {
+    repeated Checkpoint checkpoints = 1;
+}
+
+// ============================================================================
+// Common Enums
+// ============================================================================
+
+// Execution status enum
+enum ExecutionStatus {
+    EXECUTION_STATUS_UNKNOWN = 0;
+    EXECUTION_STATUS_PENDING = 1;
+    EXECUTION_STATUS_RUNNING = 2;
+    EXECUTION_STATUS_PAUSED = 3;
+    EXECUTION_STATUS_COMPLETED = 4;
+    EXECUTION_STATUS_FAILED = 5;
+    EXECUTION_STATUS_CANCELLED = 6;
+}
+
+// Log level
+enum LogLevel {
+    LOG_LEVEL_UNKNOWN = 0;
+    LOG_LEVEL_DEBUG = 1;
+    LOG_LEVEL_INFO = 2;
+    LOG_LEVEL_WARN = 3;
+    LOG_LEVEL_ERROR = 4;
+}
+
+// Node type in lineage
+enum NodeType {
+    NODE_TYPE_UNKNOWN = 0;
+    NODE_TYPE_EXECUTION = 1;
+    NODE_TYPE_DATASET = 2;
+    NODE_TYPE_MODEL = 3;
+    NODE_TYPE_USER = 4;
+    NODE_TYPE_SYSTEM = 5;
+}
+
+// Lineage output format
+enum LineageFormat {
+    LINEAGE_FORMAT_UNKNOWN = 0;
+    LINEAGE_FORMAT_TURTLE = 1;
+    LINEAGE_FORMAT_JSON_LD = 2;
+    LINEAGE_FORMAT_GRAPH = 3;
+}
+
+// Time range for filtering
+message TimeRange {
+    google.protobuf.Timestamp start = 1;
+    google.protobuf.Timestamp end = 2;
+}

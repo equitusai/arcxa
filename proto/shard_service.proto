@@ -1,0 +1,443 @@
+// Graphica Shard Service Protocol
+//
+// High-performance gRPC protocol for distributed RDF triple store sharding.
+// Optimized for low latency (<10ms P99), high throughput (10K+ QPS),
+// and efficient bandwidth usage (gzip compression, streaming, batching).
+
+syntax = "proto3";
+
+package graphica.shard.v1;
+
+// ============================================================================
+// Shard Service - Each shard process exposes this service
+// ============================================================================
+
+service ShardService {
+    // Query triples using SPARQL
+    // Returns streaming results for memory efficiency and low latency
+    rpc Query(QueryRequest) returns (stream QueryResponse);
+
+    // Insert triples in batch (high throughput writes)
+    // Batching amortizes RPC overhead: 1000 triples/RPC vs 1000 RPCs
+    rpc InsertBatch(InsertBatchRequest) returns (InsertBatchResponse);
+
+    // Delete triples in batch
+    rpc DeleteBatch(DeleteBatchRequest) returns (DeleteBatchResponse);
+
+    // Execute SPARQL UPDATE operation (INSERT DATA, DELETE DATA, etc.)
+    // Supports full SPARQL 1.1 Update syntax
+    rpc ExecuteUpdate(ExecuteUpdateRequest) returns (ExecuteUpdateResponse);
+
+    // Count triples matching pattern (aggregation pushdown)
+    // Avoids transferring all results to coordinator
+    rpc Count(CountRequest) returns (CountResponse);
+
+    // Check if triple exists (existence check)
+    rpc Exists(ExistsRequest) returns (ExistsResponse);
+
+    // Health check for Kubernetes liveness/readiness probes
+    rpc Health(HealthRequest) returns (HealthResponse);
+
+    // Get shard statistics for monitoring and load balancing
+    rpc GetStats(StatsRequest) returns (StatsResponse);
+
+    // Graceful shutdown signal (for maintenance)
+    rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+// ============================================================================
+// Query Operations
+// ============================================================================
+
+// Query request with optimization hints from coordinator
+message QueryRequest {
+    // SPARQL query string
+    string sparql = 1;
+
+    // LIMIT pushdown - each shard returns at most this many results
+    // Coordinator merges and takes final LIMIT
+    uint32 limit = 2;
+
+    // OFFSET pushdown (less efficient than LIMIT)
+    uint32 offset = 3;
+
+    // Projection pushdown - only return these variables
+    // e.g., for "SELECT ?name ?age", projections = ["name", "age"]
+    repeated string projections = 4;
+
+    // Query plan hint from coordinator (opaque, for optimization)
+    bytes query_plan_hint = 5;
+
+    // Per-shard timeout in milliseconds (default 5000ms)
+    uint32 timeout_ms = 6;
+
+    // Request ID for tracing/debugging
+    string request_id = 7;
+
+    // Coordinator timestamp (for consistency)
+    uint64 timestamp = 8;
+}
+
+// Query response - streaming for memory efficiency
+message QueryResponse {
+    oneof response {
+        // Batch of triples (more efficient than individual triples)
+        TripleBatch triple_batch = 1;
+
+        // Single binding result (for SELECT queries)
+        BindingResult binding = 2;
+
+        // Error during execution
+        QueryError error = 3;
+
+        // End of stream marker (optional, for explicit termination)
+        EndOfStream end = 4;
+    }
+}
+
+// Batch of triples (amortizes serialization overhead)
+message TripleBatch {
+    // Triples in this batch (typically 100-1000)
+    repeated Triple triples = 1;
+
+    // True if more batches are coming
+    bool has_more = 2;
+
+    // Batch sequence number (for ordering)
+    uint64 sequence = 3;
+}
+
+// Single RDF triple
+message Triple {
+    // Subject URI or blank node
+    string subject = 1;
+
+    // Predicate URI
+    string predicate = 2;
+
+    // Object (URI, literal, or blank node)
+    string object = 3;
+
+    // Object datatype (for literals)
+    string object_datatype = 4;
+
+    // Object language tag (for language-tagged literals)
+    string object_language = 5;
+
+    // Named graph (optional, default graph if empty)
+    string graph = 6;
+}
+
+// Binding result for SELECT queries
+message BindingResult {
+    // Variable bindings (map from variable name to value)
+    map<string, BindingValue> bindings = 1;
+}
+
+// Value bound to a variable
+message BindingValue {
+    oneof value {
+        string uri = 1;
+        Literal literal = 2;
+        string blank_node = 3;
+    }
+}
+
+// RDF literal value
+message Literal {
+    string value = 1;
+    string datatype = 2;
+    string language = 3;
+}
+
+// Query error
+message QueryError {
+    enum ErrorCode {
+        UNKNOWN = 0;
+        PARSE_ERROR = 1;        // Invalid SPARQL syntax
+        TIMEOUT = 2;             // Query exceeded timeout
+        STORAGE_ERROR = 3;       // RocksDB/Oxigraph error
+        OUT_OF_MEMORY = 4;       // Query too large
+        INVALID_REQUEST = 5;     // Bad request parameters
+    }
+
+    ErrorCode code = 1;
+    string message = 2;
+    string details = 3;
+}
+
+// End of stream marker
+message EndOfStream {
+    // Total results returned
+    uint64 result_count = 1;
+
+    // Query execution time in milliseconds
+    uint64 execution_time_ms = 2;
+}
+
+// ============================================================================
+// Write Operations
+// ============================================================================
+
+// Batch insert request (up to 10K triples recommended)
+message InsertBatchRequest {
+    // Triples to insert
+    repeated Triple triples = 1;
+
+    // Transactional semantics (all-or-nothing)
+    // If false, continues on error (best-effort)
+    bool transactional = 2;
+
+    // Named graph for all triples (optional)
+    string default_graph = 3;
+
+    // Request ID for idempotency
+    string request_id = 4;
+}
+
+// Batch insert response
+message InsertBatchResponse {
+    // Number of triples successfully inserted
+    uint64 inserted_count = 1;
+
+    // Number of triples that failed
+    uint64 failed_count = 2;
+
+    // Indices of failed triples (if not transactional)
+    repeated uint32 failed_indices = 3;
+
+    // Total duration in milliseconds
+    uint64 duration_ms = 4;
+
+    // Error message (if transactional and failed)
+    string error = 5;
+}
+
+// Batch delete request
+message DeleteBatchRequest {
+    // Triples to delete (exact match)
+    repeated Triple triples = 1;
+
+    // Transactional semantics
+    bool transactional = 2;
+
+    // Request ID
+    string request_id = 3;
+}
+
+// Batch delete response
+message DeleteBatchResponse {
+    // Number of triples deleted
+    uint64 deleted_count = 1;
+
+    // Number that didn't exist
+    uint64 not_found_count = 2;
+
+    // Duration in milliseconds
+    uint64 duration_ms = 3;
+
+    // Error message
+    string error = 4;
+}
+
+// SPARQL UPDATE execution request
+message ExecuteUpdateRequest {
+    // SPARQL 1.1 UPDATE query string
+    // Supports: INSERT DATA, DELETE DATA, INSERT/DELETE WHERE, CLEAR, etc.
+    string sparql_update = 1;
+
+    // Named graph for context (optional)
+    string default_graph = 2;
+
+    // Request ID for idempotency and tracing
+    string request_id = 3;
+
+    // Timeout in milliseconds (default 30000ms)
+    uint32 timeout_ms = 4;
+}
+
+// SPARQL UPDATE execution response
+message ExecuteUpdateResponse {
+    // Number of triples inserted
+    uint64 inserted_count = 1;
+
+    // Number of triples deleted
+    uint64 deleted_count = 2;
+
+    // Number of triples modified
+    uint64 modified_count = 3;
+
+    // Execution duration in milliseconds
+    uint64 duration_ms = 4;
+
+    // Error message (empty if successful)
+    string error = 5;
+
+    // Success flag
+    bool success = 6;
+}
+
+// ============================================================================
+// Aggregation Operations (Pushdown)
+// ============================================================================
+
+// Count request (aggregation pushdown)
+message CountRequest {
+    // SPARQL WHERE clause pattern
+    // e.g., "?s rdf:type foaf:Person"
+    string pattern = 1;
+
+    // Named graph to count (optional, default graph if empty)
+    string graph = 2;
+
+    // Request ID
+    string request_id = 3;
+}
+
+// Count response
+message CountResponse {
+    // Number of matching triples
+    uint64 count = 1;
+
+    // Execution time
+    uint64 execution_time_ms = 2;
+}
+
+// Exists check (fast boolean query)
+message ExistsRequest {
+    // Triple to check
+    Triple triple = 1;
+
+    // Request ID
+    string request_id = 2;
+}
+
+// Exists response
+message ExistsResponse {
+    // True if triple exists
+    bool exists = 1;
+}
+
+// ============================================================================
+// Health & Monitoring
+// ============================================================================
+
+// Health check request
+message HealthRequest {
+    // Include detailed diagnostics
+    bool detailed = 1;
+}
+
+// Health check response
+message HealthResponse {
+    enum Status {
+        UNKNOWN = 0;
+        HEALTHY = 1;      // All systems operational
+        DEGRADED = 2;     // Partial functionality (e.g., high latency)
+        UNHEALTHY = 3;    // Critical failure
+    }
+
+    Status status = 1;
+    string message = 2;
+
+    // Shard metadata
+    uint32 shard_id = 3;
+    uint64 triple_count = 4;
+    uint64 disk_usage_bytes = 5;
+    uint64 memory_usage_bytes = 6;
+
+    // Last successful query timestamp
+    uint64 last_query_timestamp = 7;
+
+    // Uptime in seconds
+    uint64 uptime_seconds = 8;
+}
+
+// Statistics request
+message StatsRequest {
+    // Time window in seconds (0 = all time)
+    uint32 window_seconds = 1;
+}
+
+// Statistics response
+message StatsResponse {
+    // Shard identification
+    uint32 shard_id = 1;
+    HashRange hash_range = 2;
+
+    // Storage stats
+    uint64 triple_count = 3;
+    uint64 disk_usage_bytes = 4;
+    uint64 memory_usage_bytes = 5;
+
+    // Performance stats (within window)
+    uint64 queries_total = 6;
+    uint64 inserts_total = 7;
+    uint64 deletes_total = 8;
+
+    // Latency percentiles (milliseconds)
+    double p50_query_latency_ms = 9;
+    double p95_query_latency_ms = 10;
+    double p99_query_latency_ms = 11;
+
+    // Throughput (ops per second)
+    double queries_per_second = 12;
+    double inserts_per_second = 13;
+
+    // Error rates
+    uint64 query_errors = 14;
+    uint64 insert_errors = 15;
+
+    // RocksDB stats
+    RocksDbStats rocksdb_stats = 16;
+
+    // Timestamp
+    uint64 timestamp = 17;
+}
+
+// Hash range this shard owns
+message HashRange {
+    uint64 start = 1;  // Inclusive
+    uint64 end = 2;    // Exclusive
+}
+
+// RocksDB performance stats
+message RocksDbStats {
+    // Compaction stats
+    uint64 total_compaction_time_ms = 1;
+    uint64 pending_compaction_bytes = 2;
+
+    // Write stall stats
+    uint64 write_stall_count = 3;
+    uint64 write_stall_time_ms = 4;
+
+    // Cache stats
+    uint64 block_cache_hit_count = 5;
+    uint64 block_cache_miss_count = 6;
+
+    // Disk I/O
+    uint64 bytes_written = 7;
+    uint64 bytes_read = 8;
+}
+
+// ============================================================================
+// Administrative Operations
+// ============================================================================
+
+// Graceful shutdown request
+message ShutdownRequest {
+    // Timeout in seconds (wait for in-flight queries)
+    uint32 timeout_seconds = 1;
+
+    // Force shutdown even if queries pending
+    bool force = 2;
+}
+
+// Shutdown response
+message ShutdownResponse {
+    bool success = 1;
+    string message = 2;
+
+    // Number of in-flight queries aborted
+    uint64 aborted_queries = 3;
+}

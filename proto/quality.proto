@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package graphica.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Quality Service - Manage quality rules and violations
+service QualityService {
+  // Get quality scorecard for a dataset
+  rpc GetScorecard(GetScorecardRequest) returns (ScorecardResponse);
+
+  // List quality violations
+  rpc ListViolations(ListViolationsRequest) returns (ListViolationsResponse);
+
+  // Create or update quality rule
+  rpc UpsertRule(UpsertRuleRequest) returns (RuleResponse);
+
+  // Stream quality violations in real-time
+  rpc StreamViolations(StreamViolationsRequest) returns (stream QualityViolation);
+}
+
+message GetScorecardRequest {
+  string dataset = 1;
+  google.protobuf.Timestamp period_start = 2;
+  google.protobuf.Timestamp period_end = 3;
+  string tenant_id = 4;
+}
+
+message ScorecardResponse {
+  QualityScorecard scorecard = 1;
+}
+
+message ListViolationsRequest {
+  string dataset = 1;
+  optional string rule_id = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+  string tenant_id = 5;
+}
+
+message ListViolationsResponse {
+  repeated QualityViolation violations = 1;
+  string next_page_token = 2;
+}
+
+message UpsertRuleRequest {
+  QualityRule rule = 1;
+  string tenant_id = 2;
+}
+
+message RuleResponse {
+  QualityRule rule = 1;
+}
+
+message StreamViolationsRequest {
+  string dataset = 1;
+  string tenant_id = 2;
+}
+
+message QualityScorecard {
+  string dataset = 1;
+  google.protobuf.Timestamp period_start = 2;
+  google.protobuf.Timestamp period_end = 3;
+  double overall_score = 4;
+  map<string, double> dimension_scores = 5;
+  uint64 total_records = 6;
+  map<string, uint64> violation_counts = 7;
+  repeated RuleResult rule_results = 8;
+}
+
+message RuleResult {
+  string rule_id = 1;
+  uint64 passed = 2;
+  uint64 failed = 3;
+  double success_rate = 4;
+}
+
+message QualityRule {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  RuleType rule_type = 4;
+  Severity severity = 5;
+  string dataset = 6;
+  repeated string fields = 7;
+  string expression = 8;
+  bool enabled = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+enum RuleType {
+  RULE_TYPE_UNSPECIFIED = 0;
+  COMPLETENESS = 1;
+  VALIDITY = 2;
+  UNIQUENESS = 3;
+  CONSISTENCY = 4;
+  ACCURACY = 5;
+  TIMELINESS = 6;
+  CUSTOM = 7;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  INFO = 1;
+  WARNING = 2;
+  ERROR = 3;
+  CRITICAL = 4;
+}
+
+message QualityViolation {
+  string id = 1;
+  string rule_id = 2;
+  string dataset = 3;
+  string record_id = 4;
+  optional string field = 5;
+  optional string actual_value = 6;
+  optional string expected_value = 7;
+  string message = 8;
+  Severity severity = 9;
+  google.protobuf.Timestamp detected_at = 10;
+  optional google.protobuf.Timestamp resolved_at = 11;
+  optional string lineage_ref = 12;
+}

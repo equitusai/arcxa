@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package graphica.model;
+
+// Model Service - Distributed embedding generation for semantic matching
+//
+// This service provides transformer-based text embeddings using ONNX Runtime.
+// It can be scaled independently from the coordinator for better resource utilization.
+service ModelService {
+    // Generate embedding for a single text
+    //
+    // Returns a 384-dimensional embedding (for MiniLM) normalized to unit length.
+    rpc EmbedText(EmbedRequest) returns (EmbedResponse);
+
+    // Generate embeddings for multiple texts (batch processing)
+    //
+    // More efficient than multiple EmbedText calls due to batching optimizations.
+    rpc EmbedBatch(EmbedBatchRequest) returns (EmbedBatchResponse);
+
+    // Health check endpoint
+    //
+    // Used by load balancers and monitoring systems to verify service health.
+    rpc Health(HealthRequest) returns (HealthResponse);
+
+    // Get model information and statistics
+    //
+    // Returns metadata about the loaded model and service performance stats.
+    rpc GetModelInfo(ModelInfoRequest) returns (ModelInfoResponse);
+}
+
+// Request to embed a single text
+message EmbedRequest {
+    // Text to embed (e.g., "customer_email", "electronic mail address")
+    string text = 1;
+
+    // Model name to use (default: "minilm")
+    // Supported: "minilm", "bge", "mpnet"
+    string model_name = 2;
+}
+
+// Response containing the embedding vector
+message EmbedResponse {
+    // Embedding vector (384 dimensions for MiniLM, normalized to unit length)
+    repeated float embedding = 1;
+
+    // Embedding dimension (384 for MiniLM)
+    int32 dimension = 2;
+
+    // Inference time in milliseconds
+    float inference_time_ms = 3;
+
+    // Whether this was served from cache
+    bool from_cache = 4;
+}
+
+// Request to embed multiple texts in batch
+message EmbedBatchRequest {
+    // Texts to embed
+    repeated string texts = 1;
+
+    // Model name to use (default: "minilm")
+    string model_name = 2;
+
+    // Maximum batch size (if texts > max, will be split into multiple batches)
+    int32 max_batch_size = 3;
+}
+
+// Response containing multiple embeddings
+message EmbedBatchResponse {
+    // Embeddings in same order as input texts
+    repeated Embedding embeddings = 1;
+
+    // Total inference time for all texts (milliseconds)
+    float total_inference_time_ms = 2;
+
+    // Number of texts processed
+    int32 count = 3;
+}
+
+// Single embedding in a batch response
+message Embedding {
+    // Embedding vector
+    repeated float values = 1;
+
+    // Dimension
+    int32 dimension = 2;
+}
+
+// Health check request (empty)
+message HealthRequest {}
+
+// Health check response with service statistics
+message HealthResponse {
+    // Service health status
+    bool healthy = 1;
+
+    // Loaded model name
+    string model_name = 2;
+
+    // Model embedding dimension
+    int32 embedding_dimension = 3;
+
+    // Total requests served since startup
+    int64 total_requests = 4;
+
+    // Average inference latency (milliseconds)
+    float avg_latency_ms = 5;
+
+    // Cache hit rate (percentage)
+    float cache_hit_rate = 6;
+
+    // Service uptime (seconds)
+    int64 uptime_seconds = 7;
+}
+
+// Request for model information (empty)
+message ModelInfoRequest {}
+
+// Response with detailed model information
+message ModelInfoResponse {
+    // Model name (e.g., "all-MiniLM-L6-v2")
+    string model_name = 1;
+
+    // Model version
+    string version = 2;
+
+    // Embedding dimension
+    int32 embedding_dimension = 3;
+
+    // Maximum sequence length (tokens)
+    int32 max_sequence_length = 4;
+
+    // Model file size in bytes
+    int64 model_size_bytes = 5;
+
+    // Model architecture (e.g., "transformer")
+    string architecture = 6;
+
+    // Supported languages
+    repeated string languages = 7;
+
+    // Model description
+    string description = 8;
+}

@@ -1,0 +1,472 @@
+// Graphica Coordinator Service Protocol
+//
+// Service exposed by the coordinator for shard management, registration,
+// and cluster coordination operations.
+
+syntax = "proto3";
+
+package graphica.coordinator.v1;
+
+// ============================================================================
+// Coordinator Service - Exposed by coordinator for shard management
+// ============================================================================
+
+service CoordinatorService {
+    // Register a new shard or reconnect existing one
+    rpc RegisterShard(ShardRegistrationRequest) returns (ShardRegistrationResponse);
+
+    // Send heartbeat with statistics
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+    // Gracefully deregister shard
+    rpc DeregisterShard(DeregistrationRequest) returns (DeregistrationResponse);
+
+    // Get current cluster topology
+    rpc GetTopology(TopologyRequest) returns (TopologyResponse);
+
+    // Request hash range rebalancing
+    rpc RequestRebalance(RebalanceRequest) returns (RebalanceResponse);
+}
+
+// ============================================================================
+// Registration Messages
+// ============================================================================
+
+message ShardRegistrationRequest {
+    oneof registration_type {
+        NewShardRegistration new_shard = 1;
+        ExistingShardReconnection reconnect = 2;
+    }
+
+    // Optional authentication token
+    string auth_token = 3;
+}
+
+message NewShardRegistration {
+    // Unique machine identifier (UUID)
+    string machine_id = 1;
+
+    // gRPC endpoint address (e.g., "10.0.1.5:9100")
+    string address = 2;
+
+    // Shard capabilities
+    ShardCapabilities capabilities = 3;
+
+    // Data directory path (for debugging/monitoring)
+    string data_path = 4;
+
+    // Shard software version
+    string version = 5;
+
+    // Optional preferred shard_id (for migration compatibility)
+    uint32 preferred_shard_id = 6;
+}
+
+message ExistingShardReconnection {
+    // Previously assigned shard ID
+    uint32 shard_id = 1;
+
+    // Machine ID for verification
+    string machine_id = 2;
+
+    // Current address (may have changed)
+    string address = 3;
+
+    // Last checkpoint/position for resumption
+    uint64 last_checkpoint = 4;
+
+    // Shard software version
+    string version = 5;
+}
+
+message ShardCapabilities {
+    // Memory capacity in MB
+    uint64 max_memory_mb = 1;
+
+    // Available disk space in MB
+    uint64 disk_space_mb = 2;
+
+    // Number of CPU cores
+    uint32 cpu_cores = 3;
+
+    // Supported features
+    bool supports_compression = 4;
+    bool supports_encryption = 5;
+
+    // Supported index types
+    repeated string supported_indexes = 6; // ["spatial", "text", "temporal"]
+
+    // Network bandwidth in Mbps
+    uint32 network_bandwidth_mbps = 7;
+}
+
+message ShardRegistrationResponse {
+    // Success/failure flag
+    bool success = 1;
+
+    // Assigned shard ID
+    uint32 assigned_shard_id = 2;
+
+    // Hash range assignment
+    HashRange hash_range = 3;
+
+    // Coordinator version for compatibility
+    string coordinator_version = 4;
+
+    // Shard configuration
+    ShardConfiguration config = 5;
+
+    // Rejection reason if success=false
+    string rejection_reason = 6;
+
+    // Cluster topology version
+    uint64 topology_version = 7;
+}
+
+message ShardConfiguration {
+    // Heartbeat interval in seconds
+    uint32 heartbeat_interval_secs = 1;
+
+    // Statistics reporting interval in seconds
+    uint32 stats_reporting_interval_secs = 2;
+
+    // Feature flags
+    bool enable_compression = 3;
+    bool enable_encryption = 4;
+
+    // Operational parameters
+    uint32 batch_size = 5;
+    uint32 max_concurrent_queries = 6;
+    uint32 query_timeout_secs = 7;
+
+    // Feature flags as key-value pairs
+    map<string, string> feature_flags = 8;
+
+    // Replication settings
+    ReplicationSettings replication = 9;
+}
+
+message ReplicationSettings {
+    // Number of replicas
+    uint32 replication_factor = 1;
+
+    // Replica addresses
+    repeated string replica_addresses = 2;
+
+    // Replication mode
+    enum Mode {
+        ASYNC = 0;
+        SYNC = 1;
+        SEMI_SYNC = 2;
+    }
+    Mode mode = 3;
+}
+
+// ============================================================================
+// Heartbeat Messages
+// ============================================================================
+
+message HeartbeatRequest {
+    // Shard identifier
+    uint32 shard_id = 1;
+
+    // Machine ID for verification
+    string machine_id = 2;
+
+    // Current statistics
+    ShardStatistics stats = 3;
+
+    // Timestamp
+    uint64 timestamp = 4;
+
+    // Health status
+    HealthStatus health = 5;
+}
+
+message ShardStatistics {
+    // Storage metrics
+    uint64 triple_count = 1;
+    uint64 disk_usage_bytes = 2;
+    uint64 memory_usage_bytes = 3;
+
+    // Performance metrics (since last heartbeat)
+    uint64 queries_processed = 4;
+    uint64 inserts_processed = 5;
+    uint64 deletes_processed = 6;
+
+    // Latency percentiles (milliseconds)
+    double p50_latency_ms = 7;
+    double p95_latency_ms = 8;
+    double p99_latency_ms = 9;
+
+    // Error counts
+    uint64 query_errors = 10;
+    uint64 insert_errors = 11;
+
+    // Replication lag (if replica)
+    uint64 replication_lag_ms = 12;
+}
+
+message HealthStatus {
+    enum Status {
+        HEALTHY = 0;
+        DEGRADED = 1;
+        UNHEALTHY = 2;
+        MAINTENANCE = 3;
+    }
+    Status status = 1;
+
+    // Optional message
+    string message = 2;
+
+    // Component health breakdown
+    map<string, bool> component_health = 3;
+}
+
+message HeartbeatResponse {
+    // Acknowledgment
+    bool acknowledged = 1;
+
+    // Instructions from coordinator
+    repeated CoordinatorInstruction instructions = 2;
+
+    // Updated configuration (if changed)
+    ShardConfiguration updated_config = 3;
+
+    // Topology version for detecting changes
+    uint64 topology_version = 4;
+}
+
+message CoordinatorInstruction {
+    oneof instruction {
+        RebalanceInstruction rebalance = 1;
+        MaintenanceInstruction maintenance = 2;
+        ConfigUpdateInstruction config_update = 3;
+    }
+}
+
+message RebalanceInstruction {
+    // New hash range
+    HashRange new_hash_range = 1;
+
+    // Migration targets
+    repeated string target_shards = 2;
+
+    // Start after timestamp
+    uint64 start_after = 3;
+}
+
+message MaintenanceInstruction {
+    enum Type {
+        PREPARE_SHUTDOWN = 0;
+        ENTER_READONLY = 1;
+        COMPACT_STORAGE = 2;
+        REBUILD_INDEXES = 3;
+    }
+    Type type = 1;
+
+    // Deadline for completion
+    uint64 deadline = 2;
+}
+
+message ConfigUpdateInstruction {
+    // New configuration
+    ShardConfiguration new_config = 1;
+
+    // Apply immediately
+    bool immediate = 2;
+}
+
+// ============================================================================
+// Deregistration Messages
+// ============================================================================
+
+message DeregistrationRequest {
+    // Shard to deregister
+    uint32 shard_id = 1;
+
+    // Machine ID for verification
+    string machine_id = 2;
+
+    // Reason for deregistration
+    string reason = 3;
+
+    // Graceful shutdown with data migration
+    bool graceful = 4;
+}
+
+message DeregistrationResponse {
+    // Success flag
+    bool success = 1;
+
+    // Migration instructions (if graceful)
+    repeated MigrationTask migration_tasks = 2;
+
+    // Acknowledgment message
+    string message = 3;
+}
+
+message MigrationTask {
+    // Hash range to migrate
+    HashRange range = 1;
+
+    // Target shard
+    uint32 target_shard_id = 2;
+
+    // Target address
+    string target_address = 3;
+
+    // Priority
+    uint32 priority = 4;
+}
+
+// ============================================================================
+// Topology Messages
+// ============================================================================
+
+message TopologyRequest {
+    // Include inactive shards
+    bool include_inactive = 1;
+
+    // Include detailed statistics
+    bool include_stats = 2;
+}
+
+message TopologyResponse {
+    // Cluster topology version
+    uint64 version = 1;
+
+    // Total shards
+    uint32 total_shards = 2;
+
+    // Replication factor
+    uint32 replication_factor = 3;
+
+    // Shard information
+    repeated ShardInfo shards = 4;
+
+    // Cluster statistics
+    ClusterStatistics cluster_stats = 5;
+
+    // Last update timestamp
+    uint64 updated_at = 6;
+}
+
+message ShardInfo {
+    // Shard identifier
+    uint32 shard_id = 1;
+
+    // Machine identifier
+    string machine_id = 2;
+
+    // Hash range
+    HashRange hash_range = 3;
+
+    // Status
+    ShardStatus status = 4;
+
+    // Addresses
+    string leader_address = 5;
+    repeated string replica_addresses = 6;
+
+    // Statistics (if requested)
+    ShardStatistics stats = 7;
+
+    // Last heartbeat timestamp
+    uint64 last_heartbeat = 8;
+}
+
+message ShardStatus {
+    enum State {
+        ACTIVE = 0;
+        PROVISIONING = 1;
+        DRAINING = 2;
+        DEGRADED = 3;
+        DOWN = 4;
+        MAINTENANCE = 5;
+    }
+    State state = 1;
+
+    // Additional status message
+    string message = 2;
+}
+
+message ClusterStatistics {
+    // Total storage
+    uint64 total_triples = 1;
+    uint64 total_disk_bytes = 2;
+    uint64 total_memory_bytes = 3;
+
+    // Aggregate performance
+    uint64 queries_per_second = 4;
+    uint64 inserts_per_second = 5;
+
+    // Health metrics
+    uint32 healthy_shards = 6;
+    uint32 degraded_shards = 7;
+    uint32 down_shards = 8;
+
+    // Load distribution
+    double load_balance_ratio = 9; // 0.0 (perfect) to 1.0 (imbalanced)
+}
+
+// ============================================================================
+// Rebalancing Messages
+// ============================================================================
+
+message RebalanceRequest {
+    // Force immediate rebalancing
+    bool force = 1;
+
+    // Target balance ratio
+    double target_balance_ratio = 2;
+
+    // Maximum data to move (MB)
+    uint64 max_data_movement_mb = 3;
+
+    // Excluded shards (don't move data from/to)
+    repeated uint32 excluded_shard_ids = 4;
+}
+
+message RebalanceResponse {
+    // Whether rebalancing was initiated
+    bool initiated = 1;
+
+    // Rebalancing plan
+    repeated RebalanceMove planned_moves = 2;
+
+    // Estimated completion time
+    uint64 estimated_duration_secs = 3;
+
+    // Rejection reason if not initiated
+    string rejection_reason = 4;
+}
+
+message RebalanceMove {
+    // Source shard
+    uint32 from_shard_id = 1;
+
+    // Target shard
+    uint32 to_shard_id = 2;
+
+    // Hash range to move
+    HashRange range = 3;
+
+    // Estimated data size
+    uint64 estimated_size_bytes = 4;
+
+    // Priority
+    uint32 priority = 5;
+}
+
+// ============================================================================
+// Common Messages
+// ============================================================================
+
+message HashRange {
+    // Start of range (inclusive)
+    uint64 start = 1;
+
+    // End of range (exclusive)
+    uint64 end = 2;
+}
