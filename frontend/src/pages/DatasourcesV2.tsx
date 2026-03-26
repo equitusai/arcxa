@@ -141,6 +141,14 @@ export function DatasourcesV2() {
   const [showWizard, setShowWizard] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
+  const statusFilterLabel =
+    {
+      connected: 'Connected',
+      unverified: 'Unverified',
+      disconnected: 'Disconnected',
+      error: 'Error',
+      disabled: 'Disabled',
+    }[statusFilter] || statusFilter;
 
   // Data fetching
   const { data: datasources, isLoading } = useDatasources();
@@ -157,6 +165,7 @@ export function DatasourcesV2() {
     const matchesStatus =
       statusFilter === 'all' ||
       (statusFilter === 'connected' && ds.status === 'Connected') ||
+      (statusFilter === 'unverified' && ds.status === 'Unverified') ||
       (statusFilter === 'disconnected' && ds.status === 'Disconnected') ||
       (statusFilter === 'error' && typeof ds.status === 'object' && 'Error' in ds.status) ||
       (statusFilter === 'disabled' && !ds.enabled);
@@ -332,6 +341,7 @@ export function DatasourcesV2() {
               <SelectContent>
                 <SelectItem value="all">All Status</SelectItem>
                 <SelectItem value="connected">Connected</SelectItem>
+                <SelectItem value="unverified">Unverified</SelectItem>
                 <SelectItem value="disconnected">Disconnected</SelectItem>
                 <SelectItem value="error">Error</SelectItem>
                 <SelectItem value="disabled">Disabled</SelectItem>
@@ -371,7 +381,7 @@ export function DatasourcesV2() {
               )}
               {statusFilter !== 'all' && (
                 <Badge variant="secondary" className="gap-1">
-                  Status: {statusFilter}
+                  Status: {statusFilterLabel}
                 </Badge>
               )}
               {typeFilter !== 'all' && (

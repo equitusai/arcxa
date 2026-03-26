@@ -12,7 +12,7 @@ use super::common::{
     materialize_target_records, resolve_target_datasource_from_catalog, target_table_key_fields,
 };
 
-fn databricks_load_strategy_for_table(
+pub(crate) fn databricks_load_strategy_for_table(
     table_config: &TargetTableConfig,
 ) -> (crate::etl::traits::LoadMode, Option<Vec<String>>) {
     let key_fields = target_table_key_fields(table_config);

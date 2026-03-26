@@ -26,6 +26,11 @@ import { DiscoveryProgressMonitor } from './DiscoveryProgressMonitor';
 import { DiscoveryResults } from './DiscoveryResults';
 import { useStartDiscovery } from '@/hooks/useSchemaDiscovery';
 import {
+  getDatasourceReadinessMessage,
+  getDatasourceStatusLabel,
+  isDatasourceReadyForOperation,
+} from '@/api/datasources';
+import {
   useDatasource,
   useTestConnection as useDatasourceTestConnection,
 } from '@/hooks/useDatasources';
@@ -91,10 +96,16 @@ export function SchemaDiscoveryWizard({
 
   const datasource = datasourceQuery.data;
   const datasourceSummary = useMemo(
-    () => getDatasourceSummary(datasource?.config),
-    [datasource?.config]
+    () => getDatasourceSummary(datasource?.config?.connection),
+    [datasource?.config?.connection]
   );
-  const canInferSchema = datasource?.instance_capabilities?.canInferSchema ?? false;
+  const canInferSchema = datasource
+    ? isDatasourceReadyForOperation(datasource, 'schemaInference')
+    : false;
+  const canQuery = datasource ? isDatasourceReadyForOperation(datasource, 'query') : false;
+  const discoveryReadinessMessage = datasource
+    ? getDatasourceReadinessMessage(datasource, 'schemaInference')
+    : null;
 
   const handleReset = () => {
     setCurrentStep(1);
@@ -141,8 +152,8 @@ export function SchemaDiscoveryWizard({
         return;
       }
 
-      if (!canInferSchema) {
-        toast.error('This datasource does not currently support schema discovery');
+      if (!(datasource.instance_capabilities?.canTest ?? false)) {
+        toast.error('This datasource cannot be tested from the coordinator');
         return;
       }
     }
@@ -240,8 +251,8 @@ export function SchemaDiscoveryWizard({
                   {datasource.plugin_name} · {datasource.source_type || 'Unknown'}
                 </div>
               </div>
-              <Badge variant={canInferSchema ? 'outline' : 'destructive'}>
-                {canInferSchema ? 'Discovery Supported' : 'Discovery Unsupported'}
+              <Badge variant={canInferSchema ? 'outline' : 'secondary'}>
+                {getDatasourceStatusLabel(datasource.status)}
               </Badge>
             </div>
           </CardHeader>
@@ -264,11 +275,11 @@ export function SchemaDiscoveryWizard({
               />
               <CapabilityItem
                 label="Can Infer Schema"
-                enabled={datasource.instance_capabilities?.canInferSchema ?? false}
+                enabled={canInferSchema}
               />
               <CapabilityItem
                 label="Can Query"
-                enabled={datasource.instance_capabilities?.canQuery ?? false}
+                enabled={canQuery}
               />
               <CapabilityItem
                 label="Can Read Workflow"
@@ -280,7 +291,7 @@ export function SchemaDiscoveryWizard({
               <Alert variant="destructive">
                 <AlertTriangle className="h-4 w-4" />
                 <AlertDescription>
-                  The coordinator reports that this datasource cannot infer schema yet.
+                  {discoveryReadinessMessage}
                 </AlertDescription>
               </Alert>
             )}

@@ -545,6 +545,40 @@ impl ConnectorRegistry {
                     default_value: None,
                     validation_regex: None,
                 },
+                ConfigField {
+                    name: "metadata.odbc_driver".to_string(),
+                    description:
+                        "Optional Oracle ODBC driver override (for example, Oracle 19/21 Instant Client driver name)"
+                            .to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "metadata.odbc_dsn".to_string(),
+                    description: "Optional Oracle ODBC DSN override".to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "metadata.odbc_connection_string".to_string(),
+                    description:
+                        "Optional raw Oracle ODBC connection string override. When provided, it takes precedence over host/serviceName/sid assembly."
+                            .to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "metadata.odbc_options".to_string(),
+                    description:
+                        "Optional extra Oracle ODBC connection-string segments appended to the resolved connection."
+                            .to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
             ],
             registered_at: Utc::now(),
             tags: vec![

@@ -11,6 +11,7 @@ pub mod connectors;
 pub mod ontology;
 pub mod ontology_extensions; // Phase 1: Semantic type ontology extensions
 pub mod ontology_registry; // Phase 1: Custom ontology management
+pub mod oracle_runtime;
 pub mod postgres_tls;
 pub mod schema_to_rdf;
 pub mod secrets;
@@ -30,6 +31,11 @@ pub use ontology_extensions::{
 };
 pub use ontology_registry::{
     OntologyMetadata, OntologyRegistry, RegisteredOntology, ValidationStatus,
+};
+pub use oracle_runtime::{
+    apply_credentials_to_connection_string, normalize_optional_string, odbc_driver_registered,
+    odbc_dsn_registered, resolve_oracle_odbc_resolution, resolve_oracle_target,
+    OracleOdbcResolution, OracleTarget, OracleTargetKind, DEFAULT_ORACLE_ODBC_DRIVER,
 };
 pub use schema_to_rdf::{RdfNode, RdfTriple, SchemaRdfConverter};
 pub use secrets::{EnvSecretProvider, InMemorySecretProvider, SecretProvider};

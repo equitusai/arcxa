@@ -21,6 +21,7 @@ use crate::catalog::{
     connector_v2::{
         ConnectorV2Result, DataSourceConnectorV2, DataStream, ExportConfig, ExportFormat, RowBatch,
     },
+    oracle_runtime::resolve_oracle_odbc_resolution,
     types::{DataSource, OracleConfig, SourceConfig},
 };
 use crate::errors::GraphicaError;
@@ -45,15 +46,11 @@ impl OracleConnector {
 
     /// Build Oracle connection string (Easy Connect format)
     fn build_connection_string(config: &OracleConfig) -> ConnectorResult<String> {
-        if let Some(ref service_name) = config.service_name {
-            Ok(format!("{}:{}/{}", config.host, config.port, service_name))
-        } else if let Some(ref sid) = config.sid {
-            Ok(format!("{}:{}/{}", config.host, config.port, sid))
-        } else {
-            Err(GraphicaError::Configuration(
-                "Missing service_name or sid".to_string(),
-            ))
-        }
+        let normalized = config.normalized();
+        let target = normalized.resolved_target().ok_or_else(|| {
+            GraphicaError::Configuration("Missing non-empty serviceName or sid".to_string())
+        })?;
+        Ok(target.dbq(&normalized.host, normalized.port))
     }
 
     fn build_odbc_connection_string(
@@ -61,70 +58,8 @@ impl OracleConnector {
         credentials: &Credentials,
     ) -> ConnectorResult<String> {
         let config = Self::extract_config(source)?;
-
-        if let Some(raw) = source.metadata.get("odbc_connection_string") {
-            let mut conn = raw.clone();
-            let upper = conn.to_uppercase();
-            if !upper.contains("UID=") {
-                if !conn.ends_with(';') {
-                    conn.push(';');
-                }
-                conn.push_str(&format!("UID={}", credentials.username));
-            }
-            if !upper.contains("PWD=") {
-                if !conn.ends_with(';') {
-                    conn.push(';');
-                }
-                conn.push_str(&format!("PWD={}", credentials.password));
-            }
-            return Ok(conn);
-        }
-
-        let driver = source
-            .metadata
-            .get("odbc_driver")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_ORACLE_ODBC_DRIVER").ok())
-            .unwrap_or_else(|| "Oracle in OraClient19Home1".to_string());
-
-        let dsn = source
-            .metadata
-            .get("odbc_dsn")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_ORACLE_ODBC_DSN").ok());
-
-        let mut conn = if let Some(dsn) = dsn {
-            format!(
-                "DSN={};UID={};PWD={}",
-                dsn, credentials.username, credentials.password
-            )
-        } else {
-            let dbq = if let Some(service) = &config.service_name {
-                format!("//{}:{}/{}", config.host, config.port, service)
-            } else if let Some(sid) = &config.sid {
-                format!("{}:{}/{}", config.host, config.port, sid)
-            } else {
-                return Err(GraphicaError::Configuration(
-                    "Oracle configuration requires serviceName or sid".to_string(),
-                ));
-            };
-
-            format!(
-                "DRIVER={{{}}};DBQ={};UID={};PWD={};",
-                driver, dbq, credentials.username, credentials.password
-            )
-        };
-
-        if let Some(options) = source.metadata.get("odbc_options") {
-            if !options.is_empty() {
-                if !conn.ends_with(';') {
-                    conn.push(';');
-                }
-                conn.push_str(options);
-            }
-        }
-
-        Ok(conn)
+        let resolution = resolve_oracle_odbc_resolution(config, &source.metadata)?;
+        Ok(resolution.build_connection_string(&credentials.username, &credentials.password))
     }
 
     fn validate_identifier(value: &str, field_name: &str) -> ConnectorResult<()> {
@@ -302,19 +237,21 @@ impl DataSourceConnector for OracleConnector {
                 }
 
                 // Must have either service_name or SID
-                if oracle_config.service_name.is_none() && oracle_config.sid.is_none() {
+                let normalized = oracle_config.normalized();
+
+                if normalized.resolved_target().is_none() {
                     errors.push("Either serviceName or sid must be specified".to_string());
                 }
 
                 // Warn if both provided
-                if oracle_config.service_name.is_some() && oracle_config.sid.is_some() {
+                if normalized.service_name.is_some() && normalized.sid.is_some() {
                     warnings.push(
                         "Both serviceName and sid specified, serviceName will be used".to_string(),
                     );
                 }
 
                 // Warn if no schema specified
-                if oracle_config.schema.is_none() {
+                if normalized.schema.is_none() {
                     warnings
                         .push("No schema specified, will use user's default schema".to_string());
                 }
@@ -340,6 +277,7 @@ impl DataSourceConnector for OracleConnector {
         let start = Instant::now();
 
         let easy_connect = Self::build_connection_string(config)?;
+        let odbc_resolution = resolve_oracle_odbc_resolution(config, &source.metadata)?;
         let odbc_connection_string = Self::build_odbc_connection_string(source, &credentials)?;
 
         tracing::info!(
@@ -375,14 +313,29 @@ impl DataSourceConnector for OracleConnector {
                 ("port".to_string(), config.port.to_string()),
                 (
                     "connection_type".to_string(),
-                    if config.service_name.is_some() {
-                        "service_name"
-                    } else {
-                        "sid"
-                    }
-                    .to_string(),
+                    odbc_resolution.target.connection_type().to_string(),
                 ),
-                ("connection_string".to_string(), easy_connect),
+                ("connection_string".to_string(), easy_connect.clone()),
+                ("dbq".to_string(), odbc_resolution.dbq),
+                ("odbc_driver".to_string(), odbc_resolution.driver),
+                (
+                    "odbc_dsn".to_string(),
+                    odbc_resolution.dsn.unwrap_or_default(),
+                ),
+                (
+                    "odbc_driver_registered".to_string(),
+                    odbc_resolution
+                        .driver_registered
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                (
+                    "odbc_dsn_registered".to_string(),
+                    odbc_resolution
+                        .dsn_registered
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
                 ("odbc_enabled".to_string(), "true".to_string()),
             ]),
             tested_at: Utc::now(),
@@ -401,7 +354,8 @@ impl DataSourceConnector for OracleConnector {
             Self::validate_identifier(table, "table_name")?;
         }
 
-        let schema_name = config
+        let normalized = config.normalized();
+        let schema_name = normalized
             .schema
             .as_deref()
             .unwrap_or(&credentials.username)
@@ -914,6 +868,22 @@ mod tests {
         assert_eq!(
             OracleConnector::build_connection_string(&config_sid).unwrap(),
             "db.example.com:1521/ORCL"
+        );
+    }
+
+    #[test]
+    fn test_build_connection_string_falls_back_to_sid_when_service_name_blank() {
+        let config = OracleConfig {
+            host: "db.example.com".to_string(),
+            port: 1521,
+            service_name: Some("   ".to_string()),
+            sid: Some("XE".to_string()),
+            schema: None,
+        };
+
+        assert_eq!(
+            OracleConnector::build_connection_string(&config).unwrap(),
+            "db.example.com:1521/XE"
         );
     }
 

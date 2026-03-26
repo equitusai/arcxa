@@ -148,7 +148,11 @@ export async function request<T = any>(config: AxiosRequestConfig): Promise<T> {
 function normalizeError(error: unknown): ApiClientError {
   if (axios.isAxiosError(error)) {
     const status = error.response?.status || 0;
-    const message = error.response?.data?.error || error.message || 'An unknown error occurred';
+    const message =
+      error.response?.data?.message ||
+      error.response?.data?.error ||
+      error.message ||
+      'An unknown error occurred';
     const code = error.response?.data?.code;
     const details = error.response?.data?.details;
 

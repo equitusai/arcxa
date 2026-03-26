@@ -13,6 +13,7 @@
 //! Current implementation uses batched multi-row INSERTs with configurable batch size.
 //! This provides significant performance improvement while maintaining transaction safety.
 
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use crate::governance::rdf_store::GraphicaRdfStore;
 use crate::mapping::loader::odbc_db2_connection::OdbcDB2Connection;
 use crate::mapping::loader::{DB2Connection, SqlParam, SqlParamType};
@@ -594,6 +595,11 @@ pub fn create_db_loader_callback(
                 let datasource_response = resolve_datasource(&catalog, &datasource_id)
                     .await
                     .with_context(|| format!("Failed to resolve datasource: {}", datasource_id))?;
+                evaluate_datasource_readiness(
+                    &datasource_response,
+                    DatasourceOperation::WorkflowWrite,
+                )
+                .map_err(|failure| anyhow!(failure.message))?;
 
                 let credentials =
                     resolve_credentials(&datasource_response.source, secret_store_registry.clone())

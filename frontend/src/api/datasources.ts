@@ -18,6 +18,7 @@ import type {
   SchemaInfo,
   AvailablePlugin,
   DatasourceStats,
+  ConnectionStatus,
 } from './types';
 import { transformSchemaDiscoveryRequest } from './adapters/backend-adapter';
 
@@ -153,6 +154,12 @@ export interface DatasourceQueryPreview {
   columns: WorkflowSchemaField[];
 }
 
+export type DatasourceOperation =
+  | 'schemaInference'
+  | 'query'
+  | 'workflowRead'
+  | 'workflowWrite';
+
 async function getConnectorMap(): Promise<Map<string, BackendConnector>> {
   try {
     const response = await api.get<{ connectors: BackendConnector[] }>('/connectors');
@@ -184,9 +191,13 @@ export async function getDatasources(): Promise<Datasource[]> {
 function mapBackendStatusToConnectionStatus(
   status: string,
   lastTestResult?: BackendConnectionTestResult
-): import('./types').ConnectionStatus {
+): ConnectionStatus {
   if (status === 'testing') {
     return 'Connecting';
+  }
+
+  if (status === 'unverified') {
+    return 'Unverified';
   }
 
   if (status === 'disabled') {
@@ -206,6 +217,114 @@ function mapBackendStatusToConnectionStatus(
   }
 
   return 'Disconnected';
+}
+
+function getOperationCapability(
+  datasource: Datasource,
+  operation: DatasourceOperation
+): boolean {
+  const capabilities = datasource.instance_capabilities;
+  switch (operation) {
+    case 'schemaInference':
+      return capabilities?.canInferSchema ?? false;
+    case 'query':
+      return capabilities?.canQuery ?? false;
+    case 'workflowRead':
+      return capabilities?.canReadWorkflow ?? false;
+    case 'workflowWrite':
+      return capabilities?.canWriteWorkflow ?? false;
+    default:
+      return false;
+  }
+}
+
+function getOperationLabel(operation: DatasourceOperation): string {
+  switch (operation) {
+    case 'schemaInference':
+      return 'infer schema';
+    case 'query':
+      return 'preview or query data';
+    case 'workflowRead':
+      return 'use this datasource as a workflow source';
+    case 'workflowWrite':
+      return 'use this datasource as a workflow target';
+    default:
+      return 'use this datasource';
+  }
+}
+
+export function getDatasourceStatusLabel(status: ConnectionStatus): string {
+  if (status === 'Connected') {
+    return 'Connected';
+  }
+  if (status === 'Connecting') {
+    return 'Connecting';
+  }
+  if (status === 'Disconnected') {
+    return 'Disconnected';
+  }
+  if (status === 'Unverified') {
+    return 'Unverified';
+  }
+  if (typeof status === 'object' && 'Degraded' in status) {
+    return 'Degraded';
+  }
+  if (typeof status === 'object' && 'Error' in status) {
+    return 'Error';
+  }
+  return 'Unknown';
+}
+
+export function isDatasourceReadyForOperation(
+  datasource: Datasource,
+  operation: DatasourceOperation
+): boolean {
+  if (!datasource.enabled) {
+    return false;
+  }
+
+  if (datasource.status !== 'Connected') {
+    return false;
+  }
+
+  return getOperationCapability(datasource, operation);
+}
+
+export function getDatasourceReadinessMessage(
+  datasource: Datasource,
+  operation: DatasourceOperation
+): string {
+  const action = getOperationLabel(operation);
+
+  if (!datasource.enabled) {
+    return `${datasource.name} is disabled. Re-enable it before you ${action}.`;
+  }
+
+  if (typeof datasource.status === 'object' && 'Error' in datasource.status) {
+    return datasource.status.Error;
+  }
+
+  if (typeof datasource.status === 'object' && 'Degraded' in datasource.status) {
+    return datasource.status.Degraded;
+  }
+
+  if (datasource.status === 'Unverified') {
+    return `Run a successful connection test before you ${action}.`;
+  }
+
+  if (datasource.status === 'Connecting') {
+    return `A connection test is still in progress for ${datasource.name}.`;
+  }
+
+  if (datasource.status === 'Disconnected') {
+    return `${datasource.name} is not currently operational.`;
+  }
+
+  if (!getOperationCapability(datasource, operation)) {
+    return `${datasource.name} is not currently enabled to ${action}.`;
+  }
+
+  return `${datasource.name} is ready to ${action}.`;
 }
 
 /**
@@ -436,7 +555,9 @@ export async function getDatasourceStats(): Promise<DatasourceStats> {
   const connected = sources.filter(
     (source) => source.status === 'active' && source.lastTestResult?.success !== false
   ).length;
-  const disconnected = sources.filter((source) => source.status === 'disabled').length;
+  const disconnected = sources.filter(
+    (source) => source.status === 'disabled' || source.status === 'unverified'
+  ).length;
   const errors = sources.filter(
     (source) => source.status === 'error' || source.lastTestResult?.success === false
   ).length;

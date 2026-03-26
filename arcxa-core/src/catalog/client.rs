@@ -247,7 +247,7 @@ mod tests {
         async fn register_source(&self, source: DataSource) -> CatalogResult<DataSourceResponse> {
             let response = DataSourceResponse {
                 source: source.clone(),
-                status: DataSourceStatus::Active,
+                status: DataSourceStatus::Unverified,
                 last_test_result: None,
                 capabilities: None,
             };
@@ -405,7 +405,7 @@ mod tests {
 
         // Register source
         let response = catalog.register_source(source.clone()).await.unwrap();
-        assert_eq!(response.status, DataSourceStatus::Active);
+        assert_eq!(response.status, DataSourceStatus::Unverified);
 
         // Retrieve source
         let retrieved = catalog.get_source(&source.id).await.unwrap();

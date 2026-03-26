@@ -45,7 +45,7 @@ export interface UnifiedDataSource {
 
   // Status & Health
   status: 'active' | 'inactive' | 'error' | 'registered' | 'unregistered';
-  connection_status?: 'Connected' | 'Disconnected' | 'Connecting' | 'Error';
+  connection_status?: 'Connected' | 'Disconnected' | 'Connecting' | 'Unverified' | 'Error';
 
   // Classification
   datasource_category?: string; // 'Relational', 'Document', 'ObjectStorage', etc.
@@ -170,8 +170,14 @@ function datasourceToUnifiedSource(datasource: Datasource): UnifiedDataSource {
   let connectionStatus: UnifiedDataSource['connection_status'] = 'Disconnected';
 
   if (typeof datasource.status === 'string') {
-    connectionStatus = datasource.status as any;
-    status = datasource.enabled ? 'active' : 'inactive';
+    connectionStatus = datasource.status as UnifiedDataSource['connection_status'];
+    if (datasource.status === 'Connected') {
+      status = 'active';
+    } else if (datasource.status === 'Unverified') {
+      status = 'registered';
+    } else {
+      status = 'inactive';
+    }
   } else if (datasource.status && typeof datasource.status === 'object') {
     if ('Error' in datasource.status) {
       status = 'error';

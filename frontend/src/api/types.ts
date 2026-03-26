@@ -1840,6 +1840,7 @@ export type DatasourceType =
 export type ConnectionStatus =
   | 'Disconnected'
   | 'Connecting'
+  | 'Unverified'
   | 'Connected'
   | { Degraded: string }
   | { Error: string };

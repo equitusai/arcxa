@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
+
 /// Database Extract executor
 pub struct DbExtractExecutor {
     config: DbExtractConfig,
@@ -48,8 +50,10 @@ impl DbExtractExecutor {
         let source = catalog
             .get_source(&self.config.datasource_id)
             .await
-            .context("Failed to load datasource for query generation")?
-            .source;
+            .context("Failed to load datasource for query generation")?;
+        evaluate_datasource_readiness(&source, DatasourceOperation::WorkflowRead)
+            .map_err(|failure| anyhow::anyhow!(failure.message))?;
+        let source = source.source;
         let query = self.build_query_for_source(Some(&source.source_type))?;
 
         // Execute query against datasource

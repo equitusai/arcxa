@@ -38,6 +38,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::api::ApiState;
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use crate::mapping::discovery::{
     DiscoveredTable, DiscoveryConfig, DiscoveryOrchestrator, DiscoveryProgress,
     DiscoveryStateManager,
@@ -138,6 +139,8 @@ pub struct PaginatedDiscoveryResultResponse {
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub error: String,
     pub details: Option<String>,
 }
@@ -145,6 +148,7 @@ pub struct ErrorResponse {
 impl ErrorResponse {
     fn new(error: impl Into<String>) -> Self {
         Self {
+            code: None,
             error: error.into(),
             details: None,
         }
@@ -152,6 +156,19 @@ impl ErrorResponse {
 
     fn with_details(error: impl Into<String>, details: impl Into<String>) -> Self {
         Self {
+            code: None,
+            error: error.into(),
+            details: Some(details.into()),
+        }
+    }
+
+    fn with_code(
+        code: impl Into<String>,
+        error: impl Into<String>,
+        details: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: Some(code.into()),
             error: error.into(),
             details: Some(details.into()),
         }
@@ -216,6 +233,19 @@ pub async fn start_discovery(
             )),
         )
     })?;
+
+    evaluate_datasource_readiness(&datasource_response, DatasourceOperation::Discovery).map_err(
+        |failure| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::with_code(
+                    failure.code,
+                    "Datasource not ready",
+                    failure.message,
+                )),
+            )
+        },
+    )?;
 
     let datasource = datasource_response.source;
 

@@ -15,10 +15,14 @@ use crate::api::workflow::materialization::{
     finalize_execution_result, persist_execution_record_if_possible,
 };
 use crate::api::ApiState;
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use crate::governance::WorkflowResultPersistence;
 use crate::workflows::dataset_input::build_input_adapter;
 use graphica_core::{
-    catalog::{api_types::DataSourceCapabilities, DataSourceCatalog},
+    catalog::{
+        api_types::{DataSourceCapabilities, DataSourceStatus},
+        DataSourceCatalog,
+    },
     errors::GraphicaError,
     orchestration::workflow::{
         definition::{DbExtractConfig, DbLoaderConfig, LoadMode, StepConfig},
@@ -83,6 +87,27 @@ fn datasource_capabilities(capabilities: Option<DataSourceCapabilities>) -> Data
         supports_incremental: false,
         supports_cancellation: false,
     })
+}
+
+fn push_datasource_readiness_issue(
+    issues: &mut Vec<WorkflowValidationIssue>,
+    source: &graphica_core::catalog::DataSourceResponse,
+    step_id: &str,
+    datasource_id: &str,
+    operation: DatasourceOperation,
+) {
+    if let Err(failure) = evaluate_datasource_readiness(source, operation) {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "datasource_not_ready",
+            format!(
+                "Datasource '{}' is not ready: {}",
+                datasource_id, failure.message
+            ),
+            Some("datasource_id"),
+        ));
+    }
 }
 
 fn normalize_identifier_variants(value: &str) -> Vec<String> {
@@ -373,10 +398,24 @@ async fn validate_db_extract_datasource(
         }
     };
 
-    let capabilities = datasource_capabilities(source.capabilities);
+    let capabilities = datasource_capabilities(source.capabilities.clone());
     let query = optional_non_empty(config.query.as_deref());
     let table_name = optional_non_empty(config.table_name.as_deref());
     let schema_table = optional_non_empty(config.schema_table.as_deref());
+
+    if source.status != DataSourceStatus::Active
+        || (source.source.source_type.eq_ignore_ascii_case("Oracle")
+            && !capabilities.can_read_workflow)
+    {
+        push_datasource_readiness_issue(
+            &mut issues,
+            &source,
+            step_id,
+            datasource_id,
+            DatasourceOperation::WorkflowRead,
+        );
+        return issues;
+    }
 
     if !capabilities.can_read_workflow {
         issues.push(validation_issue(
@@ -518,7 +557,21 @@ async fn validate_db_loader_datasource(
         }
     };
 
-    let capabilities = datasource_capabilities(source.capabilities);
+    let capabilities = datasource_capabilities(source.capabilities.clone());
+
+    if source.status != DataSourceStatus::Active
+        || (source.source.source_type.eq_ignore_ascii_case("Oracle")
+            && !capabilities.can_write_workflow)
+    {
+        push_datasource_readiness_issue(
+            &mut issues,
+            &source,
+            step_id,
+            datasource_id,
+            DatasourceOperation::WorkflowWrite,
+        );
+        return issues;
+    }
 
     if !capabilities.can_write_workflow {
         issues.push(validation_issue(
@@ -2028,7 +2081,10 @@ mod tests {
             DataSourceStatus, ListDataSourcesRequest, ListDataSourcesResponse, QueryResult,
             SchemaDefinition, TableDefinition, UpdateDataSourcePatch,
         },
-        types::{ConnectionDetails, DataSource, DatabricksConfig, PostgreSQLConfig, SourceConfig},
+        types::{
+            ConnectionDetails, DataSource, DatabricksConfig, OracleConfig, PostgreSQLConfig,
+            SourceConfig,
+        },
         DataSourceCatalog,
     };
     use graphica_core::errors::GraphicaError;
@@ -2574,6 +2630,71 @@ mod tests {
         assert!(response.issues.iter().any(|issue| {
             issue.code == "datasource_not_workflow_writable" && issue.step_id == "load_customers"
         }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_flags_unverified_oracle_datasource_as_not_ready() {
+        let capabilities = DataSourceCapabilities {
+            can_test: true,
+            can_infer_schema: false,
+            can_query: false,
+            can_read_workflow: false,
+            can_write_workflow: false,
+            supports_parameters: true,
+            supports_tls: false,
+            supports_incremental: true,
+            supports_cancellation: false,
+        };
+        let mut source = test_datasource_response_with_config(
+            "oracle_source",
+            capabilities,
+            SourceConfig::Oracle(OracleConfig {
+                host: "localhost".to_string(),
+                port: 1521,
+                service_name: Some("".to_string()),
+                sid: Some("XE".to_string()),
+                schema: None,
+            }),
+        );
+        source.status = DataSourceStatus::Unverified;
+
+        let catalog = Arc::new(MockValidationCatalog::new().with_source(source));
+        let (state, _, _) = create_test_api_state_with_catalog(catalog);
+
+        let definition = WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "extract_customers".to_string(),
+                step_type: StepType::DbExtract,
+                config: StepConfig::DbExtract(DbExtractConfig {
+                    datasource_id: "oracle_source".to_string(),
+                    table_name: Some("customers".to_string()),
+                    schema_table: None,
+                    query: None,
+                    incremental: None,
+                    incremental_column: None,
+                    last_value: None,
+                    batch_size: 10_000,
+                    columns: None,
+                    include_schema: None,
+                    schema_sample_size: None,
+                }),
+                depends_on: Vec::new(),
+            }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!response.valid);
+        assert!(response
+            .issues
+            .iter()
+            .any(|issue| issue.code == "datasource_not_ready"
+                && issue.message.contains("has not been verified")));
     }
 
     #[tokio::test]

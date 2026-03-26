@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::databricks::build_loader_connection_string;
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use crate::etl::loaders::database::{DatabaseLoader, DatabaseLoaderFactory};
 use crate::etl::sources::csv::CsvSourceExecutor;
 use crate::etl::transformers::field::FieldTransformerExecutor;
@@ -248,6 +249,8 @@ impl LoadOrchestrator {
                     .get_source(source_id)
                     .await
                     .context(format!("Failed to resolve datasource {}", source_id))?;
+                evaluate_datasource_readiness(&datasource, DatasourceOperation::WorkflowWrite)
+                    .map_err(|failure| anyhow::anyhow!(failure.message))?;
 
                 // Build connection string from datasource configuration (with credentials from secret store)
                 self.build_connection_string(pipeline, &datasource.source)
@@ -1245,6 +1248,13 @@ impl LoadOrchestrator {
             datasource_id,
             query
         );
+
+        let datasource = catalog
+            .get_source(datasource_id)
+            .await
+            .context(format!("Failed to resolve datasource {}", datasource_id))?;
+        evaluate_datasource_readiness(&datasource, DatasourceOperation::WorkflowRead)
+            .map_err(|failure| anyhow::anyhow!(failure.message))?;
 
         // Execute query via catalog
         let result = catalog

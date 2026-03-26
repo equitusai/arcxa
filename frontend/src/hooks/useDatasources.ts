@@ -15,12 +15,18 @@ function getErrorMessage(error: unknown): string {
     message?: string;
     response?: {
       data?: {
+        message?: string;
         error?: string;
       };
     };
   };
 
-  return apiError.response?.data?.error || apiError.message || 'Request failed';
+  return (
+    apiError.response?.data?.message ||
+    apiError.response?.data?.error ||
+    apiError.message ||
+    'Request failed'
+  );
 }
 
 /**
@@ -58,9 +64,15 @@ export function useRegisterDatasource() {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['datasources'] });
       queryClient.invalidateQueries({ queryKey: ['datasources', 'stats'] });
-      toast.success('Data source registered', {
-        description: `${data.name} has been registered successfully`,
-      });
+      if (data.status === 'Unverified') {
+        toast.success('Data source registered', {
+          description: `${data.name} is saved. Run a connection test before schema discovery or workflows.`,
+        });
+      } else {
+        toast.success('Data source registered', {
+          description: `${data.name} has been registered successfully`,
+        });
+      }
     },
     onError: (error: unknown) => {
       toast.error('Failed to register data source', {
@@ -118,9 +130,14 @@ export function useDeleteDatasource() {
  * Test datasource connection
  */
 export function useTestConnection() {
+  const queryClient = useQueryClient();
+
   return useMutation({
     mutationFn: (id: string) => datasourceApi.testConnection(id),
-    onSuccess: (data) => {
+    onSuccess: (data, id) => {
+      queryClient.invalidateQueries({ queryKey: ['datasources'] });
+      queryClient.invalidateQueries({ queryKey: ['datasources', 'stats'] });
+      queryClient.invalidateQueries({ queryKey: ['datasources', id] });
       if (data.success) {
         toast.success('Connection successful', {
           description: `Connected in ${data.latency_ms}ms`,

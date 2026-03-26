@@ -2095,6 +2095,8 @@ mod tests {
     use super::*;
     use crate::api::auth::AuthConfig;
     use crate::api::setup_token::SetupTokenManager;
+    use crate::api::unified_mapping::internal_load::common::target_table_key_fields;
+    use crate::api::unified_mapping::internal_load::databricks::databricks_load_strategy_for_table;
     use crate::mapping::bindings::BindingService;
     use crate::mapping::bindings::BindingStore;
     use crate::mapping::multi_source::storage::UnifiedMappingStorage;

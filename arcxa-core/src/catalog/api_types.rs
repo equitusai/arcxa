@@ -86,6 +86,9 @@ pub struct DataSourceCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DataSourceStatus {
+    /// Registered but not yet verified with a successful connection test
+    Unverified,
+
     /// Active and ready for use
     Active,
 
@@ -519,6 +522,10 @@ mod tests {
 
     #[test]
     fn test_data_source_status_serialization() {
+        let status = DataSourceStatus::Unverified;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"unverified\"");
+
         let status = DataSourceStatus::Active;
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(json, "\"active\"");

@@ -32,6 +32,10 @@ import { useFiles } from '@/hooks/useFileLibrary';
 import { Datasource, FileMetadata } from '@/api/types';
 import { discoverSchema } from '@/api/discovery';
 import { importDatasourceTable, pollImportUntilComplete } from '@/api/imports';
+import {
+  getDatasourceStatusLabel,
+  isDatasourceReadyForOperation,
+} from '@/api/datasources';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { FieldMappingStep } from '@/components/field-mapping/FieldMappingStep';
@@ -92,8 +96,8 @@ export function DatasetImportWizard({
     () =>
       (datasources || []).filter(
         (datasource) =>
-          (datasource.instance_capabilities?.canQuery ?? false) &&
-          (datasource.instance_capabilities?.canInferSchema ?? false)
+          isDatasourceReadyForOperation(datasource, 'query') &&
+          isDatasourceReadyForOperation(datasource, 'schemaInference')
       ),
     [datasources]
   );
@@ -458,13 +462,13 @@ export function DatasetImportWizard({
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-3">
                               <Database className="h-5 w-5 text-primary" />
-                              <div>
-                                <div className="font-medium">{datasource.name}</div>
-                                <div className="text-sm text-muted-foreground">
-                                  {datasource.plugin_name} • {datasource.status === 'Connected' ? '🟢 Connected' : '🔴 Disconnected'}
+                                <div>
+                                  <div className="font-medium">{datasource.name}</div>
+                                  <div className="text-sm text-muted-foreground">
+                                    {datasource.plugin_name} • {getDatasourceStatusLabel(datasource.status)}
+                                  </div>
                                 </div>
                               </div>
-                            </div>
                             <ArrowRight className="h-4 w-4 text-muted-foreground" />
                           </div>
                         </button>
@@ -478,8 +482,9 @@ export function DatasetImportWizard({
                     <Alert>
                       <AlertCircle className="h-4 w-4" />
                       <AlertDescription>
-                        No connected data sources currently support end-to-end dataset import.
-                        Choose a datasource with schema discovery and query execution enabled.
+                        No datasources are currently ready for dataset import. Run a successful
+                        connection test, then choose a datasource with schema discovery and query
+                        execution enabled.
                       </AlertDescription>
                     </Alert>
                   ) : (

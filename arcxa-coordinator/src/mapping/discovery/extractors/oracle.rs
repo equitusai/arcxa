@@ -2,8 +2,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use graphica_core::catalog::connector::Credentials;
 use graphica_core::catalog::types::{DataSource, SourceConfig};
+use graphica_core::catalog::{connector::Credentials, resolve_oracle_odbc_resolution};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
@@ -21,15 +21,18 @@ impl OracleExtractor {
 
     fn get_oracle_config(
         source: &DataSource,
-    ) -> Result<(&str, u16, Option<&str>, Option<&str>, Option<&str>)> {
+    ) -> Result<(String, u16, Option<String>, Option<String>, Option<String>)> {
         match &source.connection.config {
-            SourceConfig::Oracle(config) => Ok((
-                config.host.as_str(),
-                config.port,
-                config.service_name.as_deref(),
-                config.sid.as_deref(),
-                config.schema.as_deref(),
-            )),
+            SourceConfig::Oracle(config) => {
+                let normalized = config.normalized();
+                Ok((
+                    normalized.host,
+                    normalized.port,
+                    normalized.service_name,
+                    normalized.sid,
+                    normalized.schema,
+                ))
+            }
             _ => Err(anyhow!("Expected Oracle configuration")),
         }
     }
@@ -53,81 +56,13 @@ impl OracleExtractor {
         source: &DataSource,
         credentials: &Credentials,
     ) -> Result<String> {
-        let (host, port, service_name, sid, _schema) = Self::get_oracle_config(source)?;
-
-        if let Some(raw) = source.metadata.get("odbc_connection_string") {
-            return Ok(Self::apply_credentials_to_connection_string(
-                raw,
-                credentials,
-            ));
-        }
-
-        let driver = source
-            .metadata
-            .get("odbc_driver")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_ORACLE_ODBC_DRIVER").ok())
-            .unwrap_or_else(|| "Oracle in OraClient19Home1".to_string());
-
-        let dsn = source
-            .metadata
-            .get("odbc_dsn")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_ORACLE_ODBC_DSN").ok());
-
-        let mut conn = if let Some(dsn) = dsn {
-            format!(
-                "DSN={};UID={};PWD={}",
-                dsn, credentials.username, credentials.password
-            )
-        } else {
-            let dbq = if let Some(service) = service_name {
-                format!("//{}:{}/{}", host, port, service)
-            } else if let Some(sid) = sid {
-                format!("{}:{}/{}", host, port, sid)
-            } else {
-                return Err(anyhow!(
-                    "Oracle configuration requires serviceName or sid for ODBC connection"
-                ));
-            };
-
-            format!(
-                "DRIVER={{{}}};DBQ={};UID={};PWD={};",
-                driver, dbq, credentials.username, credentials.password
-            )
+        let config = match &source.connection.config {
+            SourceConfig::Oracle(config) => config,
+            _ => return Err(anyhow!("Expected Oracle configuration")),
         };
-
-        if let Some(options) = source.metadata.get("odbc_options") {
-            if !options.is_empty() {
-                if !conn.ends_with(';') {
-                    conn.push(';');
-                }
-                conn.push_str(options);
-            }
-        }
-
-        Ok(conn)
-    }
-
-    fn apply_credentials_to_connection_string(
-        connection_string: &str,
-        credentials: &Credentials,
-    ) -> String {
-        let mut conn = connection_string.to_string();
-        let upper = conn.to_uppercase();
-        if !upper.contains("UID=") {
-            if !conn.ends_with(';') {
-                conn.push(';');
-            }
-            conn.push_str(&format!("UID={}", credentials.username));
-        }
-        if !upper.contains("PWD=") {
-            if !conn.ends_with(';') {
-                conn.push(';');
-            }
-            conn.push_str(&format!("PWD={}", credentials.password));
-        }
-        conn
+        let resolution = resolve_oracle_odbc_resolution(config, &source.metadata)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(resolution.build_connection_string(&credentials.username, &credentials.password))
     }
 
     fn build_metadata_query(schema: &str, table_filter: Option<&str>) -> String {
@@ -411,7 +346,7 @@ impl SchemaExtractor for OracleExtractor {
         }
 
         let schema_name = schema_filter
-            .or(default_schema)
+            .or(default_schema.as_deref())
             .unwrap_or(&credentials.username)
             .to_uppercase();
 
@@ -456,6 +391,7 @@ impl SchemaExtractor for OracleExtractor {
 
         let (_host, _port, _service, _sid, default_schema) = Self::get_oracle_config(source)?;
         let schema_name = default_schema
+            .as_deref()
             .unwrap_or(&credentials.username)
             .to_uppercase();
 
@@ -485,6 +421,7 @@ impl SchemaExtractor for OracleExtractor {
 
         let (_host, _port, _service, _sid, default_schema) = Self::get_oracle_config(source)?;
         let schema_name = default_schema
+            .as_deref()
             .unwrap_or(&credentials.username)
             .to_uppercase();
 

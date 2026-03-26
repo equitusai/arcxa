@@ -11,6 +11,7 @@ use graphica_core::catalog::{
     client::{CatalogResult, DataSourceCatalog, UsageStatistics},
     connector::{Credentials, DataSourceConnector},
     connectors::ConnectorRegistry,
+    resolve_oracle_odbc_resolution,
     types::{normalize_source_type_name, ConnectionDetails, DataSource, SourceConfig},
 };
 use graphica_core::errors::GraphicaError;
@@ -562,7 +563,26 @@ impl InMemoryDataSourceCatalog {
             })
     }
 
-    fn catalog_capabilities_for_source(&self, source: &DataSource) -> DataSourceCapabilities {
+    fn source_runtime_ready(&self, source: &DataSource) -> bool {
+        match &source.connection.config {
+            SourceConfig::Oracle(config) => {
+                resolve_oracle_odbc_resolution(config, &source.metadata)
+                    .map(|resolution| {
+                        resolution.driver_registered.unwrap_or(true)
+                            && resolution.dsn_registered.unwrap_or(true)
+                    })
+                    .unwrap_or(false)
+            }
+            _ => true,
+        }
+    }
+
+    fn catalog_capabilities_for_response(
+        &self,
+        response: &DataSourceResponse,
+    ) -> DataSourceCapabilities {
+        let source = &response.source;
+        let connector_available = self.get_connector(source).is_ok();
         let connector_capabilities = self
             .get_connector(source)
             .map(|connector| connector.capabilities())
@@ -608,13 +628,15 @@ impl InMemoryDataSourceCatalog {
         } else {
             base_can_infer_schema && connector_capabilities.schema_inference
         };
+        let operational_ready = matches!(response.status, DataSourceStatus::Active)
+            && self.source_runtime_ready(source);
 
         DataSourceCapabilities {
-            can_test: true,
-            can_infer_schema,
-            can_query,
-            can_read_workflow,
-            can_write_workflow,
+            can_test: connector_available,
+            can_infer_schema: can_infer_schema && operational_ready,
+            can_query: can_query && operational_ready,
+            can_read_workflow: can_read_workflow && operational_ready,
+            can_write_workflow: can_write_workflow && operational_ready,
             supports_parameters,
             supports_tls: matches!(
                 source.connection.config,
@@ -638,7 +660,7 @@ impl InMemoryDataSourceCatalog {
 
     fn enrich_response(&self, mut response: DataSourceResponse) -> DataSourceResponse {
         response.source.source_type = response.source.connection.config.source_type().to_string();
-        response.capabilities = Some(self.catalog_capabilities_for_source(&response.source));
+        response.capabilities = Some(self.catalog_capabilities_for_response(&response));
         response
     }
 
@@ -1336,6 +1358,7 @@ impl InMemoryDataSourceCatalog {
 impl DataSourceCatalog for InMemoryDataSourceCatalog {
     async fn register_source(&self, mut source: DataSource) -> CatalogResult<DataSourceResponse> {
         source.source_type = source.connection.config.source_type().to_string();
+        source.connection.config.normalize();
 
         let secret_store_registry = { self.secret_store_registry.read().clone() };
 
@@ -1349,10 +1372,11 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
 
         let response = DataSourceResponse {
             source: source.clone(),
-            status: DataSourceStatus::Active,
+            status: DataSourceStatus::Unverified,
             last_test_result: None,
-            capabilities: Some(self.catalog_capabilities_for_source(&source)),
+            capabilities: None,
         };
+        let response = self.enrich_response(response);
 
         // Persist to RocksDB first
         if let Err(e) = self.save_to_db(&source.id, &response) {
@@ -1404,6 +1428,10 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
             return self.get_source(id).await;
         }
 
+        let connection_impacted = updates.connection.is_some()
+            || updates.metadata.is_some()
+            || updates.source_type.is_some();
+
         let updated_response = {
             let mut sources = self.sources.write();
 
@@ -1419,6 +1447,7 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
             }
             if let Some(connection) = updates.connection {
                 response.source.connection = connection;
+                response.source.connection.config.normalize();
             }
             if let Some(schema_ref) = updates.schema_ref {
                 response.source.schema_ref = Some(schema_ref);
@@ -1455,7 +1484,11 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
                 .map_err(|errors| GraphicaError::Configuration(errors.join(", ")))?;
 
             response.source.updated_at = Some(Utc::now());
-            response.capabilities = Some(self.catalog_capabilities_for_source(&response.source));
+            if connection_impacted {
+                response.status = DataSourceStatus::Unverified;
+                response.last_test_result = None;
+            }
+            response.capabilities = Some(self.catalog_capabilities_for_response(response));
 
             response.clone()
         };
@@ -1580,7 +1613,7 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
                 } else {
                     DataSourceStatus::Error
                 };
-                Some(response.clone())
+                Some(self.enrich_response(response.clone()))
             } else {
                 None
             }
@@ -1748,7 +1781,7 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
                     .insert("last_error".to_string(), error);
             }
 
-            response.clone()
+            self.enrich_response(response.clone())
         };
 
         // Persist status update to RocksDB
@@ -1871,7 +1904,7 @@ mod tests {
 
         // Register source
         let response = catalog.register_source(source.clone()).await.unwrap();
-        assert_eq!(response.status, DataSourceStatus::Active);
+        assert_eq!(response.status, DataSourceStatus::Unverified);
 
         // Retrieve source
         let retrieved = catalog.get_source(&source.id).await.unwrap();
@@ -1944,9 +1977,34 @@ mod tests {
                 ]),
             },
         );
+        let mut source = source;
+        source.metadata.insert(
+            "odbc_connection_string".to_string(),
+            "DRIVER={Oracle in OraClient19Home1};DBQ=oracle.example.com:1521/ORCL;".to_string(),
+        );
 
         let source_id = source.id.clone();
-        catalog.register_source(source).await.unwrap();
+        let created = catalog.register_source(source).await.unwrap();
+        assert_eq!(created.status, DataSourceStatus::Unverified);
+
+        let created_capabilities = created
+            .capabilities
+            .expect("capabilities should be populated after registration");
+        assert_eq!(
+            created_capabilities.supports_parameters,
+            cfg!(feature = "odbc")
+        );
+        assert_eq!(
+            created_capabilities.supports_incremental,
+            cfg!(feature = "odbc")
+        );
+        assert!(!created_capabilities.can_infer_schema);
+        assert!(!created_capabilities.can_write_workflow);
+
+        catalog
+            .update_status(&source_id, DataSourceStatus::Active, None)
+            .await
+            .unwrap();
 
         let response = catalog.get_source(&source_id).await.unwrap();
         let capabilities = response
@@ -1955,6 +2013,90 @@ mod tests {
         assert_eq!(capabilities.supports_parameters, cfg!(feature = "odbc"));
         assert_eq!(capabilities.supports_incremental, cfg!(feature = "odbc"));
         assert_eq!(capabilities.can_write_workflow, cfg!(feature = "odbc"));
+    }
+
+    #[tokio::test]
+    async fn test_update_source_resets_status_and_last_test_result_when_connection_changes() {
+        let registry = Arc::new(RwLock::new(ConnectorRegistry::new()));
+        let catalog = InMemoryDataSourceCatalog::new(registry);
+
+        let source = DataSource::new(
+            "Oracle Source".to_string(),
+            "Oracle".to_string(),
+            ConnectionDetails {
+                secret_ref: "vault://oracle".to_string(),
+                config: SourceConfig::Oracle(graphica_core::catalog::types::OracleConfig {
+                    host: "oracle.example.com".to_string(),
+                    port: 1521,
+                    service_name: Some("ORCL".to_string()),
+                    sid: None,
+                    schema: Some("APP".to_string()),
+                }),
+                encryption_enabled: true,
+                credentials: HashMap::new(),
+            },
+        );
+        let mut source = source;
+        source.metadata.insert(
+            "odbc_connection_string".to_string(),
+            "DRIVER={Oracle in OraClient19Home1};DBQ=oracle.example.com:1521/ORCL;".to_string(),
+        );
+
+        let source_id = source.id.clone();
+        catalog.register_source(source).await.unwrap();
+        catalog
+            .update_status(&source_id, DataSourceStatus::Active, None)
+            .await
+            .unwrap();
+
+        {
+            let mut sources = catalog.sources.write();
+            let response = sources.get_mut(&source_id).unwrap();
+            response.last_test_result = Some(ConnectionTestResult {
+                success: true,
+                duration_ms: 10,
+                error: None,
+                metadata: HashMap::new(),
+                tested_at: Utc::now(),
+            });
+        }
+
+        let updated = catalog
+            .update_source(
+                &source_id,
+                UpdateDataSourcePatch {
+                    title: None,
+                    description: None,
+                    source_type: None,
+                    connection: Some(ConnectionDetails {
+                        secret_ref: "vault://oracle".to_string(),
+                        config: SourceConfig::Oracle(graphica_core::catalog::types::OracleConfig {
+                            host: "oracle2.example.com".to_string(),
+                            port: 1521,
+                            service_name: Some("".to_string()),
+                            sid: Some("XE".to_string()),
+                            schema: None,
+                        }),
+                        encryption_enabled: true,
+                        credentials: HashMap::new(),
+                    }),
+                    schema_ref: None,
+                    tags: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.status, DataSourceStatus::Unverified);
+        assert!(updated.last_test_result.is_none());
+        match updated.source.connection.config {
+            SourceConfig::Oracle(config) => {
+                assert_eq!(config.service_name, None);
+                assert_eq!(config.sid.as_deref(), Some("XE"));
+            }
+            other => panic!("expected Oracle config, got {:?}", other),
+        }
     }
 
     #[tokio::test]

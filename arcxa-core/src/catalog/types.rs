@@ -285,6 +285,13 @@ pub struct RDFNTriplesConfig {
 }
 
 impl SourceConfig {
+    /// Normalize source-specific configuration in place.
+    pub fn normalize(&mut self) {
+        if let SourceConfig::Oracle(config) = self {
+            config.normalize();
+        }
+    }
+
     /// Validate configuration for this source type
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -310,7 +317,7 @@ impl SourceConfig {
                 if config.host.is_empty() {
                     errors.push("Oracle host cannot be empty".to_string());
                 }
-                if config.service_name.is_none() && config.sid.is_none() {
+                if config.resolved_target().is_none() {
                     errors.push("Oracle requires either serviceName or sid".to_string());
                 }
             }
@@ -436,7 +443,8 @@ pub fn normalize_source_type_name(source_type: &str) -> Option<&'static str> {
 
 impl DataSource {
     /// Create a new data source with generated ID
-    pub fn new(title: String, _source_type: String, connection: ConnectionDetails) -> Self {
+    pub fn new(title: String, _source_type: String, mut connection: ConnectionDetails) -> Self {
+        connection.config.normalize();
         let id = format!("urn:graphica:datasource:{}", uuid::Uuid::new_v4());
         let source_type = connection.config.source_type().to_string();
 
@@ -561,6 +569,68 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.service_name.as_deref(), Some("ORCL"));
+    }
+
+    #[test]
+    fn test_oracle_config_validation_rejects_blank_service_name_without_sid() {
+        let config = SourceConfig::Oracle(OracleConfig {
+            host: "localhost".to_string(),
+            port: 1521,
+            service_name: Some("   ".to_string()),
+            sid: None,
+            schema: None,
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("serviceName or sid")));
+    }
+
+    #[test]
+    fn test_oracle_config_blank_service_name_is_normalized_on_deserialize() {
+        let config: OracleConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "port": 1521,
+            "serviceName": "   ",
+            "sid": "XE",
+            "schema": " "
+        }))
+        .unwrap();
+
+        let normalized = config.normalized();
+        assert_eq!(normalized.service_name, None);
+        assert_eq!(normalized.sid.as_deref(), Some("XE"));
+        assert_eq!(normalized.schema, None);
+    }
+
+    #[test]
+    fn test_data_source_new_normalizes_oracle_config() {
+        let source = DataSource::new(
+            "Oracle DS".to_string(),
+            "Oracle".to_string(),
+            ConnectionDetails {
+                secret_ref: "vault://oracle".to_string(),
+                config: SourceConfig::Oracle(OracleConfig {
+                    host: "localhost".to_string(),
+                    port: 1521,
+                    service_name: Some(String::new()),
+                    sid: Some("XE".to_string()),
+                    schema: Some(" ".to_string()),
+                }),
+                encryption_enabled: false,
+                credentials: HashMap::new(),
+            },
+        );
+
+        match source.connection.config {
+            SourceConfig::Oracle(config) => {
+                assert_eq!(config.service_name, None);
+                assert_eq!(config.sid.as_deref(), Some("XE"));
+                assert_eq!(config.schema, None);
+            }
+            other => panic!("expected Oracle config, got {:?}", other),
+        }
     }
 
     #[test]

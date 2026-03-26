@@ -41,6 +41,7 @@ export function DatasourceCard({
   const typeConfig = getTypeConfig(datasource.metadata.datasource_type);
 
   const isConnected = datasource.status === 'Connected';
+  const isUnverified = datasource.status === 'Unverified';
   const hasError = typeof datasource.status === 'object' && 'Error' in datasource.status;
 
   return (
@@ -129,11 +130,15 @@ export function DatasourceCard({
               <div className={cn(
                 'w-2 h-2 rounded-full',
                 isConnected && 'bg-green-500 shadow-lg shadow-green-500/50',
+                isUnverified && 'bg-amber-500 shadow-lg shadow-amber-500/50',
                 hasError && 'bg-red-500 shadow-lg shadow-red-500/50',
-                !isConnected && !hasError && 'bg-gray-300'
+                !isConnected && !isUnverified && !hasError && 'bg-gray-300'
               )} />
               {isConnected && (
                 <span className="text-[10px] text-green-600 font-medium">LIVE</span>
+              )}
+              {isUnverified && (
+                <span className="text-[10px] text-amber-600 font-medium">VERIFY</span>
               )}
             </div>
           </div>
@@ -269,6 +274,16 @@ function getStatusConfig(status: ConnectionStatus) {
       iconBgClass: 'bg-gray-500/10',
       iconClass: 'text-gray-600',
       barClass: 'bg-gradient-to-r from-gray-400 to-gray-500',
+    };
+  } else if (status === 'Unverified') {
+    return {
+      label: 'Unverified',
+      badgeClass: 'bg-amber-50 text-amber-700 border-amber-300',
+      borderClass: 'border-amber-500/30 hover:border-amber-500/50',
+      gradientClass: 'bg-gradient-to-br from-amber-500 to-orange-600',
+      iconBgClass: 'bg-amber-500/10',
+      iconClass: 'text-amber-600',
+      barClass: 'bg-gradient-to-r from-amber-500 to-orange-600',
     };
   } else if (typeof status === 'object' && 'Degraded' in status) {
     return {

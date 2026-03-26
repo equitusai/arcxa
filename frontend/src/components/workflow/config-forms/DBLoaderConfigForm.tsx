@@ -11,6 +11,8 @@ import { Label } from '@/components/ui/label';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
+  getDatasourceReadinessMessage,
+  isDatasourceReadyForOperation,
   inferDatasourceSchemaForWorkflow,
   type WorkflowDatasourceSchema,
 } from '@/api/datasources';
@@ -63,17 +65,24 @@ export function DBLoaderConfigForm({
 
   const selectedDatasource = datasources?.find((datasource) => datasource.id === datasourceId);
   const writableDatasources = (datasources || []).filter(
-    (datasource) => datasource.instance_capabilities?.canWriteWorkflow ?? false
+    (datasource) => isDatasourceReadyForOperation(datasource, 'workflowWrite')
   );
   const selectedDatasourceSupported =
-    !selectedDatasource || (selectedDatasource.instance_capabilities?.canWriteWorkflow ?? false);
+    !selectedDatasource || isDatasourceReadyForOperation(selectedDatasource, 'workflowWrite');
   const datasourceOptions =
     selectedDatasource && !selectedDatasourceSupported
       ? [selectedDatasource, ...writableDatasources]
       : writableDatasources;
 
-  const capabilities = selectedDatasource?.instance_capabilities;
-  const canInferSchema = capabilities?.canInferSchema ?? false;
+  const canInferSchema = selectedDatasource
+    ? isDatasourceReadyForOperation(selectedDatasource, 'schemaInference')
+    : false;
+  const workflowWriteReadinessMessage = selectedDatasource
+    ? getDatasourceReadinessMessage(selectedDatasource, 'workflowWrite')
+    : null;
+  const schemaReadinessMessage = selectedDatasource
+    ? getDatasourceReadinessMessage(selectedDatasource, 'schemaInference')
+    : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -242,7 +251,7 @@ export function DBLoaderConfigForm({
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800">
-            The selected datasource is no longer eligible for workflow loading.
+            {workflowWriteReadinessMessage}
           </div>
         </div>
       )}
@@ -259,7 +268,9 @@ export function DBLoaderConfigForm({
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground">Workflow write</span>
             <span className="font-medium text-foreground">
-              {selectedDatasource.instance_capabilities?.canWriteWorkflow ? 'Enabled' : 'Blocked'}
+              {isDatasourceReadyForOperation(selectedDatasource, 'workflowWrite')
+                ? 'Enabled'
+                : 'Blocked'}
             </span>
           </div>
         </div>
@@ -334,8 +345,7 @@ export function DBLoaderConfigForm({
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800">
-            This datasource does not expose target schema inference. Table and key-field selection
-            stay manual.
+            {schemaReadinessMessage}
           </div>
         </div>
       )}

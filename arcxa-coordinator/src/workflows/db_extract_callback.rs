@@ -20,6 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use crate::common::postgres::{
     quote_postgres_identifier_segment, quote_postgres_qualified_identifier,
 };
@@ -44,6 +45,8 @@ pub fn create_db_extract_callback(catalog: Arc<dyn DataSourceCatalog>) -> Arc<Db
                     })?;
 
                 let source_type = source_response.source.source_type.clone();
+                evaluate_datasource_readiness(&source_response, DatasourceOperation::WorkflowRead)
+                    .map_err(|failure| anyhow!(failure.message))?;
                 let db_type = map_database_type(&source_type);
 
                 let table_identifier = config

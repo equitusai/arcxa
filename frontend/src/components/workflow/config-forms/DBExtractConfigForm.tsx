@@ -14,6 +14,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import {
+  getDatasourceReadinessMessage,
+  isDatasourceReadyForOperation,
   inferDatasourceSchemaForWorkflow,
   previewDatasourceQuery,
   type DatasourceQueryPreview,
@@ -113,20 +115,33 @@ export function DBExtractConfigForm({ config, onUpdate }: DBExtractConfigFormPro
 
   const selectedDatasource = datasources?.find((datasource) => datasource.id === datasourceId);
   const readableDatasources = (datasources || []).filter(
-    (datasource) => datasource.instance_capabilities?.canReadWorkflow ?? false
+    (datasource) => isDatasourceReadyForOperation(datasource, 'workflowRead')
   );
   const selectedDatasourceSupported =
-    !selectedDatasource || (selectedDatasource.instance_capabilities?.canReadWorkflow ?? false);
+    !selectedDatasource || isDatasourceReadyForOperation(selectedDatasource, 'workflowRead');
   const datasourceOptions =
     selectedDatasource && !selectedDatasourceSupported
       ? [selectedDatasource, ...readableDatasources]
       : readableDatasources;
 
   const capabilities = selectedDatasource?.instance_capabilities;
-  const canInferSchema = capabilities?.canInferSchema ?? false;
-  const canQuery = capabilities?.canQuery ?? false;
+  const canInferSchema = selectedDatasource
+    ? isDatasourceReadyForOperation(selectedDatasource, 'schemaInference')
+    : false;
+  const canQuery = selectedDatasource
+    ? isDatasourceReadyForOperation(selectedDatasource, 'query')
+    : false;
   const supportsIncremental = capabilities?.supportsIncremental ?? false;
   const useCustomQuery = Boolean(query && !tableName);
+  const workflowReadinessMessage = selectedDatasource
+    ? getDatasourceReadinessMessage(selectedDatasource, 'workflowRead')
+    : null;
+  const schemaReadinessMessage = selectedDatasource
+    ? getDatasourceReadinessMessage(selectedDatasource, 'schemaInference')
+    : null;
+  const queryReadinessMessage = selectedDatasource
+    ? getDatasourceReadinessMessage(selectedDatasource, 'query')
+    : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -384,7 +399,7 @@ export function DBExtractConfigForm({ config, onUpdate }: DBExtractConfigFormPro
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800">
-            The selected datasource is no longer eligible for workflow extraction.
+            {workflowReadinessMessage}
           </div>
         </div>
       )}
@@ -431,8 +446,7 @@ export function DBExtractConfigForm({ config, onUpdate }: DBExtractConfigFormPro
         <div className="flex items-start gap-2 p-3 bg-background-secondary border border-border rounded text-xs">
           <AlertCircle className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-0.5" />
           <div className="text-muted-foreground">
-            Custom query mode is not available for this datasource because interactive query
-            execution is not advertised by the coordinator.
+            {queryReadinessMessage}
           </div>
         </div>
       )}
@@ -514,8 +528,7 @@ export function DBExtractConfigForm({ config, onUpdate }: DBExtractConfigFormPro
             <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
               <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
               <div className="text-amber-800">
-                This datasource does not expose schema inference. Table and column configuration
-                stays manual.
+                {schemaReadinessMessage}
               </div>
             </div>
           )}
@@ -630,8 +643,7 @@ export function DBExtractConfigForm({ config, onUpdate }: DBExtractConfigFormPro
             <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
               <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
               <div className="text-amber-800">
-                This datasource does not support interactive query preview. You can still save the
-                workflow as a draft, but execution remains blocked until validation passes.
+                {queryReadinessMessage}
               </div>
             </div>
           )}

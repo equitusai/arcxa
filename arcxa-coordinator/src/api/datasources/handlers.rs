@@ -8,11 +8,12 @@ use axum::{
 use std::sync::Arc;
 
 use crate::api::ApiState;
+use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use graphica_core::catalog::{
     CatalogErrorResponse, ConnectionTestResult, CreateDataSourceRequest, Credentials, DataSource,
-    DataSourceResponse, DataSourceStatus, ExecuteQueryRequest, InferSchemaRequest,
-    ListDataSourcesRequest, ListDataSourcesResponse, QueryResult, SchemaDefinition,
-    TestConnectionRequest, UpdateDataSourcePatch, UpdateDataSourceRequest,
+    DataSourceResponse, ExecuteQueryRequest, InferSchemaRequest, ListDataSourcesRequest,
+    ListDataSourcesResponse, QueryResult, SchemaDefinition, TestConnectionRequest,
+    UpdateDataSourcePatch, UpdateDataSourceRequest,
 };
 use graphica_core::errors::GraphicaError;
 use graphica_core::secrets::SecretValue;
@@ -320,8 +321,6 @@ pub async fn test_connection(
     // Otherwise, test inline connection config
     if let (Some(connection_json), Some(source_type)) = (request.connection, request.source_type) {
         // Parse connection details
-        use graphica_core::catalog::Credentials;
-
         let connection_details: graphica_core::catalog::ConnectionDetails =
             serde_json::from_value(connection_json).map_err(|e| {
                 create_error(
@@ -408,6 +407,7 @@ pub async fn test_connection(
     responses(
         (status = 200, description = "Schema inferred successfully", body = SchemaDefinition),
         (status = 400, description = "Invalid request - invalid parameters", body = CatalogErrorResponse),
+        (status = 409, description = "Datasource is not operationally ready", body = CatalogErrorResponse),
         (status = 404, description = "Data source not found", body = CatalogErrorResponse),
         (status = 500, description = "Internal error - schema inference failed", body = CatalogErrorResponse),
     ),
@@ -425,6 +425,13 @@ pub async fn infer_schema(
             "Data source catalog not available",
         )
     })?;
+
+    require_datasource_ready(
+        catalog.as_ref(),
+        &source_id,
+        DatasourceOperation::SchemaInference,
+    )
+    .await?;
 
     let schema = catalog
         .infer_schema(
@@ -455,6 +462,7 @@ pub async fn infer_schema(
     responses(
         (status = 200, description = "Enhanced schema inferred successfully with semantic types and RDF triples", body = serde_json::Value),
         (status = 400, description = "Invalid request - invalid parameters", body = CatalogErrorResponse),
+        (status = 409, description = "Datasource is not operationally ready", body = CatalogErrorResponse),
         (status = 404, description = "Data source not found", body = CatalogErrorResponse),
         (status = 500, description = "Internal error - enhanced schema inference failed", body = CatalogErrorResponse),
     ),
@@ -475,6 +483,13 @@ pub async fn infer_schema_enhanced(
             "Data source catalog not available",
         )
     })?;
+
+    require_datasource_ready(
+        catalog.as_ref(),
+        &source_id,
+        DatasourceOperation::SchemaInference,
+    )
+    .await?;
 
     // Step 1: Basic schema inference
     let mut schema = catalog
@@ -605,6 +620,7 @@ pub async fn infer_schema_enhanced(
     responses(
         (status = 200, description = "Query executed successfully", body = QueryResult),
         (status = 400, description = "Invalid request - invalid query or parameters", body = CatalogErrorResponse),
+        (status = 409, description = "Datasource is not operationally ready", body = CatalogErrorResponse),
         (status = 404, description = "Data source not found", body = CatalogErrorResponse),
         (status = 500, description = "Internal error - query execution failed", body = CatalogErrorResponse),
     ),
@@ -622,6 +638,8 @@ pub async fn execute_query(
             "Data source catalog not available",
         )
     })?;
+
+    require_datasource_ready(catalog.as_ref(), &source_id, DatasourceOperation::Query).await?;
 
     let result = catalog
         .execute_query(
@@ -763,6 +781,22 @@ fn map_catalog_error(
     };
 
     create_error(status, code, &format!("{}: {}", message, error))
+}
+
+async fn require_datasource_ready(
+    catalog: &dyn graphica_core::catalog::DataSourceCatalog,
+    source_id: &str,
+    operation: DatasourceOperation,
+) -> Result<DataSourceResponse, (StatusCode, Json<CatalogErrorResponse>)> {
+    let response = catalog
+        .get_source(source_id)
+        .await
+        .map_err(|error| map_catalog_error("GET_FAILED", "Failed to get data source", error))?;
+
+    evaluate_datasource_readiness(&response, operation)
+        .map_err(|failure| create_error(StatusCode::CONFLICT, failure.code, &failure.message))?;
+
+    Ok(response)
 }
 
 fn redact_metadata(metadata: &mut std::collections::HashMap<String, String>) {
@@ -968,8 +1002,16 @@ fn create_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graphica_core::catalog::types::PostgreSQLConfig;
-    use graphica_core::catalog::{ConnectionDetails, SourceConfig};
+    use graphica_core::catalog::{
+        api_types::{
+            ConnectionTestResult, DataSourceCapabilities, DataSourceStatus, ListDataSourcesRequest,
+            ListDataSourcesResponse,
+        },
+        client::{CatalogResult, UsageStatistics},
+        types::{DataSource, PostgreSQLConfig},
+        ConnectionDetails, DataSourceCatalog, DataSourceResponse, QueryResult, SchemaDefinition,
+        SourceConfig, UpdateDataSourcePatch,
+    };
 
     #[test]
     fn test_create_error() {
@@ -1021,5 +1063,132 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code, "SOURCE_TYPE_MISMATCH");
         assert!(body.message.contains("does not match connection type"));
+    }
+
+    #[tokio::test]
+    async fn test_require_datasource_ready_rejects_unverified_datasource() {
+        struct ReadyCatalog;
+
+        #[async_trait::async_trait]
+        impl DataSourceCatalog for ReadyCatalog {
+            async fn register_source(
+                &self,
+                _source: DataSource,
+            ) -> CatalogResult<DataSourceResponse> {
+                unreachable!()
+            }
+            async fn get_source(&self, _id: &str) -> CatalogResult<DataSourceResponse> {
+                Ok(DataSourceResponse {
+                    source: DataSource::new(
+                        "Oracle".to_string(),
+                        "Oracle".to_string(),
+                        ConnectionDetails {
+                            secret_ref: "vault://oracle".to_string(),
+                            config: SourceConfig::PostgreSQL(PostgreSQLConfig {
+                                host: "localhost".to_string(),
+                                port: 5432,
+                                database: "app".to_string(),
+                                schema: None,
+                                ssl_mode: None,
+                            }),
+                            encryption_enabled: false,
+                            credentials: Default::default(),
+                        },
+                    ),
+                    status: DataSourceStatus::Unverified,
+                    last_test_result: None,
+                    capabilities: Some(graphica_core::catalog::api_types::DataSourceCapabilities {
+                        can_test: true,
+                        can_infer_schema: false,
+                        can_query: false,
+                        can_read_workflow: false,
+                        can_write_workflow: false,
+                        supports_parameters: true,
+                        supports_tls: false,
+                        supports_incremental: true,
+                        supports_cancellation: false,
+                    }),
+                })
+            }
+            async fn update_source(
+                &self,
+                _id: &str,
+                _updates: UpdateDataSourcePatch,
+            ) -> CatalogResult<DataSourceResponse> {
+                unreachable!()
+            }
+            async fn delete_source(&self, _id: &str) -> CatalogResult<()> {
+                unreachable!()
+            }
+            async fn list_sources(
+                &self,
+                _request: &ListDataSourcesRequest,
+            ) -> CatalogResult<ListDataSourcesResponse> {
+                unreachable!()
+            }
+            async fn test_connection(&self, _id: &str) -> CatalogResult<ConnectionTestResult> {
+                unreachable!()
+            }
+            async fn infer_schema(
+                &self,
+                _id: &str,
+                _table_name: Option<&str>,
+                _sample_size: usize,
+            ) -> CatalogResult<SchemaDefinition> {
+                unreachable!()
+            }
+            async fn execute_query(
+                &self,
+                _id: &str,
+                _query: &str,
+                _parameters: std::collections::HashMap<String, serde_json::Value>,
+                _limit: Option<usize>,
+            ) -> CatalogResult<QueryResult> {
+                unreachable!()
+            }
+            async fn mark_synced(&self, _id: &str) -> CatalogResult<()> {
+                unreachable!()
+            }
+            async fn update_status(
+                &self,
+                _id: &str,
+                _status: DataSourceStatus,
+                _error_message: Option<String>,
+            ) -> CatalogResult<()> {
+                unreachable!()
+            }
+            async fn search_sources(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> CatalogResult<Vec<DataSourceResponse>> {
+                unreachable!()
+            }
+            async fn get_sources_by_tag(
+                &self,
+                _tag: &str,
+            ) -> CatalogResult<Vec<DataSourceResponse>> {
+                unreachable!()
+            }
+            async fn get_usage_stats(&self, _id: &str) -> CatalogResult<UsageStatistics> {
+                unreachable!()
+            }
+            async fn get_source_by_title(&self, _title: &str) -> CatalogResult<DataSourceResponse> {
+                unreachable!()
+            }
+        }
+
+        let error = require_datasource_ready(
+            &ReadyCatalog,
+            "urn:graphica:datasource:test",
+            DatasourceOperation::SchemaInference,
+        )
+        .await
+        .unwrap_err();
+        let (status, Json(body)) = error;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, "DATASOURCE_NOT_READY");
+        assert!(body.message.contains("has not been verified"));
     }
 }

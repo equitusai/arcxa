@@ -72,6 +72,29 @@ interface WizardConfigField {
   credential?: boolean;
 }
 
+function normalizeConfiguredValue(
+  value: DatasourceFormValue,
+  schema?: WizardConfigField
+): DatasourceFormValue {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (schema?.type === 'string' && typeof value === 'string') {
+    if (schema.credential) {
+      return value === '' ? undefined : value;
+    }
+
+    const trimmed = value.trim();
+    if (!schema.required && trimmed === '') {
+      return undefined;
+    }
+    return trimmed;
+  }
+
+  return value;
+}
+
 const STEPS: StepInfo[] = [
   {
     id: 1,
@@ -109,7 +132,7 @@ const CONNECTOR_DEFAULTS: Record<string, Record<string, DatasourceFormValue>> = 
   Oracle: {
     host: 'localhost',
     port: 1521,
-    serviceName: 'ORCL',
+    sid: 'XE',
   },
   'IBM DB2': {
     host: 'localhost',
@@ -225,14 +248,24 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
 
       const connectionConfig: Record<string, DatasourceFormValue> = {};
       const credentials: Record<string, string> = {};
+      const metadata: Record<string, DatasourceFormValue> = {};
       Object.entries(config).forEach(([key, value]) => {
         const schema = (selectedPlugin.config_schema as Record<string, WizardConfigField>)[key];
+        const normalizedValue = normalizeConfiguredValue(value, schema);
+
         if (schema?.credential) {
-          if (value !== undefined && value !== '') {
-            credentials[key] = String(value);
+          if (normalizedValue !== undefined && normalizedValue !== '') {
+            credentials[key] = String(normalizedValue);
+          }
+        } else if (key.startsWith('metadata.')) {
+          const metadataKey = key.replace(/^metadata\./, '');
+          if (normalizedValue !== undefined) {
+            metadata[metadataKey] = normalizedValue;
           }
         } else {
-          connectionConfig[key] = value;
+          if (normalizedValue !== undefined) {
+            connectionConfig[key] = normalizedValue;
+          }
         }
       });
 
@@ -262,6 +295,7 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
           },
           encryptionEnabled,
         },
+        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
       handleClose();
     } catch (error) {
@@ -588,7 +622,8 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
                         </p>
                         <p className="text-sm text-blue-700">
                           Your connection credentials will be securely stored in the secret vault.
-                          The connection will be validated during registration.
+                          The datasource will be registered first. Run a connection test before
+                          schema discovery or workflow use.
                         </p>
                       </div>
                     </div>
