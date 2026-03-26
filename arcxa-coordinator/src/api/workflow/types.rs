@@ -301,6 +301,36 @@ pub struct TestWorkflowStepRequest {
     pub context: ExecutionContextParams,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowValidationIssueLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkflowValidationIssue {
+    pub level: WorkflowValidationIssueLevel,
+    pub step_id: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ValidateWorkflowResponse {
+    pub valid: bool,
+    pub message: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub step_count: usize,
+    pub has_conditional_logic: bool,
+    pub has_error_handling: bool,
+    #[serde(default)]
+    pub issues: Vec<WorkflowValidationIssue>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TestWorkflowStepResponse {
     pub success: bool,

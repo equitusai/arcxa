@@ -10,6 +10,7 @@ use super::row_storage::StorageManager;
 use super::row_storage::{
     estimate_memory_size, RowAccessor, RowReference, RowStorage, StorageType,
 };
+use super::runtime::frame::BatchFrame;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,6 +49,9 @@ pub struct ExecutionContextV2 {
 
     /// Row storage reference (replaces _rows in working_data)
     pub row_storage: Option<RowStorage>,
+
+    /// Cached batch-oriented view of the current row set.
+    pub batch_frame: Option<BatchFrame>,
 
     /// Step outputs (metadata only)
     pub step_outputs: HashMap<String, serde_json::Value>,
@@ -97,6 +101,7 @@ impl ExecutionContextV2 {
             input_data: input_data.clone(),
             working_data: input_data,
             row_storage: None,
+            batch_frame: None,
             step_outputs: HashMap::new(),
             step_row_storage: HashMap::new(),
             metadata: HashMap::new(),
@@ -163,8 +168,26 @@ impl ExecutionContextV2 {
         }
     }
 
+    /// Get the current rows as a batch-oriented frame.
+    pub fn get_batch_frame(&self) -> Result<BatchFrame> {
+        if let Some(frame) = &self.batch_frame {
+            return Ok(frame.clone());
+        }
+
+        let rows = self.get_rows()?.to_vec()?;
+        BatchFrame::from_json_values(&rows)
+    }
+
     /// Set rows with automatic tiering based on size
     pub fn set_rows(&mut self, rows: Vec<serde_json::Value>) -> Result<()> {
+        self.set_rows_with_batch_frame(rows, None)
+    }
+
+    fn set_rows_with_batch_frame(
+        &mut self,
+        rows: Vec<serde_json::Value>,
+        batch_frame: Option<BatchFrame>,
+    ) -> Result<()> {
         let row_count = rows.len();
         let estimated_size = estimate_memory_size(&rows);
 
@@ -205,6 +228,7 @@ impl ExecutionContextV2 {
         };
 
         self.row_storage = Some(storage);
+        self.batch_frame = batch_frame;
 
         // Update working_data metadata
         if let serde_json::Value::Object(ref mut obj) = self.working_data {
@@ -223,6 +247,12 @@ impl ExecutionContextV2 {
         }
 
         Ok(())
+    }
+
+    /// Store a batch-oriented frame using the existing row storage path.
+    pub fn set_batch_frame(&mut self, frame: BatchFrame) -> Result<()> {
+        let rows = frame.to_json_values()?;
+        self.set_rows_with_batch_frame(rows, Some(frame))
     }
 
     /// Store intermediate results for a step
@@ -454,6 +484,53 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn test_batch_frame_bridge_round_trip() {
+        let mut ctx = ExecutionContextV2::new(json!({}));
+        let rows = vec![
+            json!({"id": 1, "name": "alice", "active": true}),
+            json!({"id": 2, "name": "bob", "active": false}),
+        ];
+
+        let frame = super::BatchFrame::from_json_values(&rows).expect("frame to build");
+        ctx.set_batch_frame(frame).expect("frame to store");
+
+        let round_tripped = ctx
+            .get_batch_frame()
+            .expect("frame to load")
+            .to_json_values()
+            .expect("frame to convert");
+
+        assert_eq!(round_tripped, rows);
+    }
+
+    #[test]
+    fn test_batch_frame_bridge_preserves_metadata() {
+        let mut ctx = ExecutionContextV2::new(json!({}));
+        let rows = vec![json!({"id": 1, "name": "alice"})];
+
+        let frame = super::BatchFrame::from_json_values(&rows)
+            .expect("frame to build")
+            .with_metadata(super::super::runtime::frame::BatchFrameMetadata {
+                source_step_id: Some("extract_1".to_string()),
+                source_kind: Some("db_extract".to_string()),
+                source_id: None,
+            });
+
+        ctx.set_batch_frame(frame).expect("frame to store");
+
+        let round_tripped = ctx.get_batch_frame().expect("frame to load");
+        assert_eq!(round_tripped.row_count(), 1);
+        assert_eq!(
+            round_tripped.metadata().source_step_id.as_deref(),
+            Some("extract_1")
+        );
+        assert_eq!(
+            round_tripped.metadata().source_kind.as_deref(),
+            Some("db_extract")
+        );
     }
 
     #[test]

@@ -464,7 +464,8 @@ pub fn parse_row_key(key: &str) -> anyhow::Result<RowId> {
             let row_number = row_num.parse::<u64>()?;
             Ok(RowId::csv(path.to_string(), row_number))
         }
-        "db2" | "postgres" | "oracle" | "mysql" | "snowflake" => {
+        "db2" | "postgres" | "oracle" | "hana" | "saphana" | "mysql" | "snowflake"
+        | "databricks" => {
             // For database, format is db_type:table:pk_part
             let parts: Vec<&str> = rest.split(':').collect();
             if parts.len() < 2 {
@@ -488,6 +489,7 @@ pub fn parse_row_key(key: &str) -> anyhow::Result<RowId> {
                 "hana" | "saphana" => DatabaseType::SAPHANA,
                 "mysql" => DatabaseType::MySQL,
                 "snowflake" => DatabaseType::Snowflake,
+                "databricks" => DatabaseType::Databricks,
                 _ => unreachable!(),
             };
 

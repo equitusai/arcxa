@@ -5,6 +5,10 @@
 
 use super::types::*;
 use crate::api::dto::ApiError;
+use crate::api::unified_mapping::internal_load::{
+    common::resolve_target_datasource_from_catalog, databricks::load_unified_session_to_databricks,
+    oracle::load_unified_session_to_oracle,
+};
 use crate::api::ApiState;
 use crate::mapping::bindings::{
     BindingProvenance as DomainBindingProvenance, UpsertBindingRequest,
@@ -19,12 +23,15 @@ use crate::mapping::planner::{
     GoalFilter as PlannerGoalFilter, GoalRequest as PlannerGoalRequest, GoalSqlPlanner,
     PhysicalFieldBinding, SqlDialect as PlannerSqlDialect,
 };
+use anyhow::Context;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
 use chrono::Utc;
+use graphica_core::catalog::DataSourceCatalog;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use utoipa;
 
@@ -116,8 +123,8 @@ fn database_type_to_execution_backend(database_type: &DatabaseType) -> Option<Ex
     match database_type {
         DatabaseType::DB2 => Some(ExecutionBackend::Db2),
         DatabaseType::Oracle => Some(ExecutionBackend::Oracle),
-        DatabaseType::Databricks => Some(ExecutionBackend::Databricks),
         DatabaseType::PostgreSQL => None,
+        DatabaseType::Databricks => None,
     }
 }
 
@@ -169,8 +176,246 @@ fn execution_backend_label(backend: ExecutionBackend) -> &'static str {
     match backend {
         ExecutionBackend::Db2 => "db2",
         ExecutionBackend::Oracle => "oracle",
-        ExecutionBackend::Databricks => "databricks",
     }
+}
+
+fn uses_internal_unified_load(database_type: &DatabaseType) -> bool {
+    matches!(
+        database_type,
+        DatabaseType::PostgreSQL | DatabaseType::Databricks
+    ) || (matches!(database_type, DatabaseType::Oracle) && cfg!(feature = "odbc"))
+}
+
+fn build_effective_load_session(
+    session: &crate::mapping::multi_source::UnifiedMappingSession,
+) -> crate::mapping::multi_source::UnifiedMappingSession {
+    let mut effective = session.clone();
+
+    for mapping in &effective.field_mappings {
+        let table_name = mapping.target_column.table_name.clone();
+        let column_name = mapping.target_column.column_name.clone();
+        let data_type = normalize_target_column_type(&mapping.target_column.data_type);
+
+        let table = effective
+            .target_database
+            .tables
+            .entry(table_name.clone())
+            .or_insert_with(|| TargetTableConfig {
+                name: table_name.clone(),
+                columns: HashMap::new(),
+                primary_keys: Vec::new(),
+                foreign_keys: Vec::new(),
+            });
+
+        table
+            .columns
+            .entry(column_name.clone())
+            .or_insert_with(|| TargetColumnConfig {
+                name: column_name,
+                data_type,
+                nullable: true,
+                is_primary_key: false,
+                default_value: None,
+            });
+    }
+
+    effective
+}
+
+fn normalize_target_column_type(data_type: &str) -> String {
+    let normalized = data_type.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "TEXT" | "STRING" | "VARCHAR" => "VARCHAR(255)".to_string(),
+        "INT" | "INTEGER" => "INTEGER".to_string(),
+        "BIGINT" => "BIGINT".to_string(),
+        "FLOAT" | "REAL" => "REAL".to_string(),
+        "DOUBLE" => "DOUBLE PRECISION".to_string(),
+        "DECIMAL" | "NUMERIC" => "DECIMAL(18,2)".to_string(),
+        "BOOL" | "BOOLEAN" => "BOOLEAN".to_string(),
+        "DATE" => "DATE".to_string(),
+        "TIMESTAMP" | "DATETIME" => "TIMESTAMP".to_string(),
+        "JSON" | "JSONB" => "TEXT".to_string(),
+        _ => data_type.to_string(),
+    }
+}
+
+fn validate_identifier_segment(segment: &str) -> anyhow::Result<&str> {
+    if segment.is_empty() {
+        return Err(anyhow::anyhow!("SQL identifier cannot be empty"));
+    }
+
+    let valid = segment
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '#'));
+
+    if !valid {
+        return Err(anyhow::anyhow!(
+            "Invalid identifier '{}': only alphanumeric, underscore, $, and # are allowed",
+            segment
+        ));
+    }
+
+    Ok(segment)
+}
+
+fn validate_compound_identifier(identifier: &str) -> anyhow::Result<String> {
+    let parts: Vec<&str> = identifier
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return Err(anyhow::anyhow!("Identifier cannot be empty"));
+    }
+
+    for part in &parts {
+        validate_identifier_segment(part)?;
+    }
+
+    Ok(parts.join("."))
+}
+
+fn build_source_select_query(
+    table_name: &str,
+    fields: &BTreeSet<String>,
+) -> anyhow::Result<String> {
+    let validated_table = validate_compound_identifier(table_name)?;
+    let select_list = if fields.is_empty() {
+        "*".to_string()
+    } else {
+        let mut columns = Vec::with_capacity(fields.len());
+        for field in fields {
+            columns.push(validate_identifier_segment(field)?.to_string());
+        }
+        columns.join(", ")
+    };
+
+    Ok(format!("SELECT {} FROM {}", select_list, validated_table))
+}
+
+fn query_value_to_optional_string(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+async fn extract_unified_source_rows(
+    catalog: Arc<dyn DataSourceCatalog>,
+    session: &crate::mapping::multi_source::UnifiedMappingSession,
+) -> anyhow::Result<HashMap<String, Vec<crate::mapping::loader::SourceRow>>> {
+    let mut fields_by_source: BTreeMap<(String, String, String), BTreeSet<String>> =
+        BTreeMap::new();
+
+    for mapping in &session.field_mappings {
+        for source_ref in &mapping.source_fields {
+            fields_by_source
+                .entry((
+                    source_ref.session_id.clone(),
+                    source_ref.datasource_id.clone(),
+                    source_ref.table_name.clone(),
+                ))
+                .or_default()
+                .insert(source_ref.field_name.clone());
+        }
+    }
+
+    let mut extracted = HashMap::new();
+
+    for ((session_id, datasource_id, table_name), fields) in fields_by_source {
+        let query = build_source_select_query(&table_name, &fields).with_context(|| {
+            format!(
+                "Failed to build unified source query for session '{}' datasource '{}' table '{}'",
+                session_id, datasource_id, table_name
+            )
+        })?;
+
+        let result = catalog
+            .execute_query(&datasource_id, &query, HashMap::new(), None)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to extract unified source rows from datasource '{}' table '{}'",
+                    datasource_id, table_name
+                )
+            })?;
+
+        let group_key = format!("{}|{}", session_id, table_name);
+        let mut rows = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            let object = row.as_object().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unified source query for datasource '{}' returned a non-object row",
+                    datasource_id
+                )
+            })?;
+
+            let values = object
+                .iter()
+                .map(|(key, value)| (key.clone(), query_value_to_optional_string(value.clone())))
+                .collect();
+
+            rows.push(crate::mapping::loader::SourceRow {
+                session_id: session_id.clone(),
+                table_name: table_name.clone(),
+                values,
+            });
+        }
+
+        extracted.insert(group_key, rows);
+    }
+
+    Ok(extracted)
+}
+
+fn extracted_rows_to_bulk_loader_input(
+    source_rows: &HashMap<String, Vec<crate::mapping::loader::SourceRow>>,
+) -> HashMap<String, Vec<HashMap<String, String>>> {
+    source_rows
+        .iter()
+        .map(|(group, rows)| {
+            let simplified_rows = rows
+                .iter()
+                .map(|row| {
+                    row.values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone().unwrap_or_default()))
+                        .collect::<HashMap<_, _>>()
+                })
+                .collect::<Vec<_>>();
+            (group.clone(), simplified_rows)
+        })
+        .collect()
+}
+
+fn build_postgres_connection_string_from_datasource(
+    source: &graphica_core::catalog::types::DataSource,
+    credentials: &graphica_core::catalog::connector::Credentials,
+) -> anyhow::Result<String> {
+    let config = match &source.connection.config {
+        graphica_core::catalog::types::SourceConfig::PostgreSQL(config) => config,
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unified PostgreSQL load requires a PostgreSQL target datasource, found {:?}",
+                other
+            ));
+        }
+    };
+
+    let mut connection_string = format!(
+        "host={} port={} dbname={} user={} password={}",
+        config.host, config.port, config.database, credentials.username, credentials.password
+    );
+
+    if let Some(ssl_mode) = &config.ssl_mode {
+        connection_string.push_str(&format!(" sslmode={}", ssl_mode));
+    }
+
+    Ok(connection_string)
 }
 
 fn emit_external_execution_observability_event(event: &ExecutionTelemetryEvent) {
@@ -1022,9 +1267,11 @@ pub async fn resolve_conflicts(
 /// Load unified session to target database
 ///
 /// Initiates a background job to load unified session data to the target database.
-/// Supports PostgreSQL, DB2, and Oracle databases with high-performance bulk loading
-/// (COPY for PostgreSQL). The session must be in ReadyToLoad status with all conflicts
-/// resolved before loading can begin.
+/// PostgreSQL and Databricks use the registered target datasource stored on the
+/// unified session. PostgreSQL, Databricks, and Oracle run through internal
+/// catalog-backed loaders; DB2 remains on the external adapter callback flow.
+/// The session must be in ReadyToLoad status with all conflicts resolved before
+/// loading can begin.
 #[utoipa::path(
     post,
     path = "/api/v1/mapping/unified-sessions/{id}/load",
@@ -1076,6 +1323,102 @@ pub async fn load_to_database(
         )));
     }
 
+    if uses_internal_unified_load(&request.database_type) && state.datasource_catalog.is_none() {
+        return Err(ApiError::service_unavailable(
+            "Data source catalog is required for unified session loading".to_string(),
+        ));
+    }
+
+    let mut internal_postgres_connection_string = None;
+
+    match request.database_type {
+        DatabaseType::PostgreSQL | DatabaseType::Databricks => {
+            if session.target_database.datasource_id.trim().is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "Unified {:?} load requires target_database.datasource_id",
+                    request.database_type
+                )));
+            }
+
+            let catalog = state.datasource_catalog.as_ref().ok_or_else(|| {
+                ApiError::service_unavailable(
+                    "Data source catalog is required for unified session loading".to_string(),
+                )
+            })?;
+
+            let (target_source, credentials) = resolve_target_datasource_from_catalog(
+                catalog.clone(),
+                state.secret_store_registry.clone(),
+                &session.target_database.datasource_id,
+            )
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+            match request.database_type {
+                DatabaseType::PostgreSQL => {
+                    internal_postgres_connection_string = Some(
+                        build_postgres_connection_string_from_datasource(
+                            &target_source,
+                            &credentials,
+                        )
+                        .map_err(|e| ApiError::bad_request(e.to_string()))?,
+                    );
+                }
+                DatabaseType::Databricks => {
+                    if !matches!(
+                        target_source.connection.config,
+                        graphica_core::catalog::types::SourceConfig::Databricks(_)
+                    ) {
+                        return Err(ApiError::bad_request(format!(
+                            "Target datasource '{}' is not a Databricks datasource",
+                            session.target_database.datasource_id
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        DatabaseType::Oracle if cfg!(feature = "odbc") => {
+            if session.target_database.datasource_id.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "Unified Oracle load requires target_database.datasource_id".to_string(),
+                ));
+            }
+
+            let catalog = state.datasource_catalog.as_ref().ok_or_else(|| {
+                ApiError::service_unavailable(
+                    "Data source catalog is required for unified session loading".to_string(),
+                )
+            })?;
+
+            let (target_source, _) = resolve_target_datasource_from_catalog(
+                catalog.clone(),
+                state.secret_store_registry.clone(),
+                &session.target_database.datasource_id,
+            )
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+            if !matches!(
+                target_source.connection.config,
+                graphica_core::catalog::types::SourceConfig::Oracle(_)
+            ) {
+                return Err(ApiError::bad_request(format!(
+                    "Target datasource '{}' is not an Oracle datasource",
+                    session.target_database.datasource_id
+                )));
+            }
+        }
+        DatabaseType::DB2 | DatabaseType::Oracle => {
+            if request.connection_config.is_none() {
+                return Err(ApiError::bad_request(format!(
+                    "{:?} load requires connection_config",
+                    request.database_type
+                )));
+            }
+        }
+    }
+
     // Persist load job and mark session as loading.
     let load_job = coordinator
         .create_load_job(&id, database_type_storage_value(&request.database_type))
@@ -1100,22 +1443,6 @@ pub async fn load_to_database(
     // Initialize conflict resolver (for future use)
     let _conflict_resolver = ConflictResolver::new();
 
-    // Build connection string from connection config
-    let connection_string = format!(
-        "host={} port={} dbname={} user={} password={}{}",
-        request.connection_config.host,
-        request.connection_config.port,
-        request.connection_config.database,
-        request.connection_config.username,
-        request.connection_config.password,
-        request
-            .connection_config
-            .ssl_mode
-            .as_ref()
-            .map(|mode| format!(" sslmode={}", mode))
-            .unwrap_or_default()
-    );
-
     // Spawn background task to perform the actual load
     let session_clone = session.clone();
     let coordinator_clone = coordinator.clone();
@@ -1123,10 +1450,14 @@ pub async fn load_to_database(
     let load_job_id_clone = load_job_id.clone();
     let batch_size = request.batch_size;
     let create_tables = request.create_tables;
+    let validate_data = request.validate_data;
+    let internal_postgres_connection_string = internal_postgres_connection_string.clone();
     let connection_config = request.connection_config.clone();
     let lineage_generator = state.lineage_generator.clone();
+    let datasource_catalog = state.datasource_catalog.clone();
+    let secret_store_registry = state.secret_store_registry.clone();
 
-    let response_message = if request.database_type == DatabaseType::PostgreSQL {
+    let response_message = if uses_internal_unified_load(&request.database_type) {
         "Load job queued successfully. Use the load job ID to check status.".to_string()
     } else {
         format!(
@@ -1171,7 +1502,17 @@ pub async fn load_to_database(
             use crate::mapping::loader::postgres_bulk::{
                 LoadMode as PgLoadMode, PostgreSQLBulkConfig, PostgreSQLBulkLoader,
             };
-            use std::collections::HashMap;
+
+            let effective_session = build_effective_load_session(&session_clone);
+
+            let extracted_source_rows = if uses_internal_unified_load(&database_type) {
+                let catalog = datasource_catalog.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Datasource catalog not available for unified load")
+                })?;
+                extract_unified_source_rows(catalog, &effective_session).await?
+            } else {
+                HashMap::new()
+            };
 
             // Create loader based on database type
             match &database_type {
@@ -1183,7 +1524,13 @@ pub async fn load_to_database(
 
                     // Configure PostgreSQL bulk loader
                     let bulk_config = PostgreSQLBulkConfig {
-                        connection_string,
+                        connection_string: internal_postgres_connection_string
+                            .clone()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Resolved PostgreSQL target datasource connection string missing"
+                                )
+                            })?,
                         load_mode: PgLoadMode::Copy, // Use high-performance COPY
                         batch_size,
                         create_tables,
@@ -1199,15 +1546,13 @@ pub async fn load_to_database(
                         anyhow::anyhow!("Failed to create PostgreSQL loader: {}", e)
                     })?;
 
-                    // TODO: Extract source data from CSV files
-                    // For now, we use empty source data - this will be populated in Phase 2
-                    let source_data: HashMap<String, Vec<HashMap<String, String>>> = HashMap::new();
+                    let source_data = extracted_rows_to_bulk_loader_input(&extracted_source_rows);
 
                     tracing::info!("Loading data to PostgreSQL database...");
 
                     // Load data from unified session
                     let load_result = loader
-                        .load_from_session(&session_clone, source_data)
+                        .load_from_session(&effective_session, source_data)
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to load data: {}", e))?;
 
@@ -1236,10 +1581,94 @@ pub async fn load_to_database(
 
                     Ok::<(), anyhow::Error>(())
                 }
-                DatabaseType::DB2 | DatabaseType::Oracle | DatabaseType::Databricks => {
+                DatabaseType::Databricks => {
+                    tracing::info!(
+                        "Creating internal Databricks loader for unified session {}",
+                        effective_session.id
+                    );
+
+                    let load_result = load_unified_session_to_databricks(
+                        datasource_catalog
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Datasource catalog not available"))?,
+                        secret_store_registry.clone(),
+                        &effective_session,
+                        &extracted_source_rows,
+                        create_tables,
+                        validate_data,
+                        batch_size,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to load data to Databricks: {}", e))?;
+
+                    if let Err(e) = coordinator_clone.update_load_job_progress(
+                        &load_job_id_clone,
+                        crate::mapping::multi_source::UnifiedLoadProgress {
+                            total_rows: load_result.rows_processed,
+                            rows_processed: load_result.rows_processed,
+                            rows_succeeded: load_result.rows_inserted,
+                            rows_failed: load_result.rows_skipped,
+                            percentage_complete: 100.0,
+                        },
+                    ) {
+                        tracing::warn!(
+                            "Failed to update progress for load job {}: {}",
+                            load_job_id_clone,
+                            e
+                        );
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                }
+                DatabaseType::Oracle if cfg!(feature = "odbc") => {
+                    tracing::info!(
+                        "Creating internal Oracle loader for unified session {}",
+                        effective_session.id
+                    );
+
+                    let load_result = load_unified_session_to_oracle(
+                        datasource_catalog
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Datasource catalog not available"))?,
+                        secret_store_registry.clone(),
+                        &effective_session,
+                        &extracted_source_rows,
+                        create_tables,
+                        validate_data,
+                        batch_size,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to load data to Oracle: {}", e))?;
+
+                    if let Err(e) = coordinator_clone.update_load_job_progress(
+                        &load_job_id_clone,
+                        crate::mapping::multi_source::UnifiedLoadProgress {
+                            total_rows: load_result.rows_processed,
+                            rows_processed: load_result.rows_processed,
+                            rows_succeeded: load_result.rows_inserted,
+                            rows_failed: load_result.rows_skipped,
+                            percentage_complete: 100.0,
+                        },
+                    ) {
+                        tracing::warn!(
+                            "Failed to update progress for load job {}: {}",
+                            load_job_id_clone,
+                            e
+                        );
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                }
+                DatabaseType::DB2 | DatabaseType::Oracle => {
                     let backend = database_type_to_execution_backend(&database_type)
                         .ok_or_else(|| anyhow::anyhow!("No execution backend mapping found"))?;
                     let executors = ExecutorRegistry::default_scaffold();
+                    let connection_config = connection_config.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{:?} external load requires connection_config",
+                            database_type
+                        )
+                    })?;
 
                     let mut executor_options = std::collections::HashMap::new();
                     if let Some(ssl_mode) = connection_config.ssl_mode.clone() {
@@ -1326,7 +1755,7 @@ pub async fn load_to_database(
 
         match result {
             Ok(_) => {
-                let terminal_status = if matches!(database_type, DatabaseType::PostgreSQL) {
+                let terminal_status = if uses_internal_unified_load(&database_type) {
                     crate::mapping::multi_source::UnifiedLoadJobStatus::Completed
                 } else {
                     crate::mapping::multi_source::UnifiedLoadJobStatus::Submitted
@@ -1343,7 +1772,7 @@ pub async fn load_to_database(
                         e
                     );
                 }
-                if matches!(database_type, DatabaseType::PostgreSQL) {
+                if uses_internal_unified_load(&database_type) {
                     if let Err(e) = coordinator_clone.update_unified_session_status(
                         &session_clone.id,
                         crate::mapping::multi_source::UnifiedSessionStatus::Completed,
@@ -1452,7 +1881,7 @@ pub async fn get_load_job_status(
 
 /// Callback endpoint for external executor job updates.
 ///
-/// External backends (DB2/Oracle/Databricks) call this endpoint to report
+/// External backends (DB2) call this endpoint to report
 /// status transitions after asynchronous submission.
 #[utoipa::path(
     post,
@@ -1483,9 +1912,9 @@ pub async fn external_load_job_callback(
         .map_err(|e| ApiError::internal(format!("Failed to fetch load job: {}", e)))?
         .ok_or_else(|| ApiError::not_found(format!("Load job not found: {}", job_id)))?;
 
-    if existing.database_type.eq_ignore_ascii_case("postgresql") {
+    if !existing.database_type.eq_ignore_ascii_case("db2") {
         return Err(ApiError::bad_request(
-            "External callback is only valid for DB2/Oracle/Databricks load jobs".to_string(),
+            "External callback is only valid for DB2 load jobs".to_string(),
         ));
     }
 
@@ -1684,7 +2113,9 @@ mod tests {
         TableDefinition, UpdateDataSourcePatch,
     };
     use graphica_core::catalog::client::{DataSourceCatalog, UsageStatistics};
-    use graphica_core::catalog::types::DataSource;
+    use graphica_core::catalog::types::{
+        ConnectionDetails, DataSource, DatabricksConfig, PostgreSQLConfig, SourceConfig,
+    };
     use graphica_core::errors::GraphicaError;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -1692,11 +2123,27 @@ mod tests {
 
     struct MockSchemaCatalog {
         schema: SchemaDefinition,
+        sources: HashMap<String, DataSourceResponse>,
+        query_rows: HashMap<String, Vec<serde_json::Value>>,
     }
 
     impl MockSchemaCatalog {
         fn new(schema: SchemaDefinition) -> Self {
-            Self { schema }
+            Self {
+                schema,
+                sources: HashMap::new(),
+                query_rows: HashMap::new(),
+            }
+        }
+
+        fn with_source(mut self, source: DataSourceResponse) -> Self {
+            self.sources.insert(source.source.id.clone(), source);
+            self
+        }
+
+        fn with_query_rows(mut self, datasource_id: &str, rows: Vec<serde_json::Value>) -> Self {
+            self.query_rows.insert(datasource_id.to_string(), rows);
+            self
         }
     }
 
@@ -1711,10 +2158,11 @@ mod tests {
             ))
         }
 
-        async fn get_source(&self, _id: &str) -> Result<DataSourceResponse, GraphicaError> {
-            Err(GraphicaError::NotFound(
-                "get_source not implemented".to_string(),
-            ))
+        async fn get_source(&self, id: &str) -> Result<DataSourceResponse, GraphicaError> {
+            self.sources
+                .get(id)
+                .cloned()
+                .ok_or_else(|| GraphicaError::NotFound(format!("Datasource '{}' not found", id)))
         }
 
         async fn update_source(
@@ -1759,14 +2207,23 @@ mod tests {
 
         async fn execute_query(
             &self,
-            _id: &str,
+            id: &str,
             _query: &str,
             _parameters: HashMap<String, serde_json::Value>,
             _limit: Option<usize>,
         ) -> Result<QueryResult, GraphicaError> {
-            Err(GraphicaError::NotFound(
-                "execute_query not implemented".to_string(),
-            ))
+            let rows =
+                self.query_rows.get(id).cloned().ok_or_else(|| {
+                    GraphicaError::NotFound(format!("No query rows for '{}'", id))
+                })?;
+
+            Ok(QueryResult {
+                row_count: rows.len(),
+                rows,
+                execution_time_ms: 1,
+                truncated: false,
+                columns: None,
+            })
         }
 
         async fn mark_synced(&self, _id: &str) -> Result<(), GraphicaError> {
@@ -1887,6 +2344,36 @@ mod tests {
             applied_at: None,
             config: MappingSessionConfig::default(),
             summary: MappingSessionSummary::default(),
+        }
+    }
+
+    fn mock_datasource_response(id: &str, title: &str, config: SourceConfig) -> DataSourceResponse {
+        DataSourceResponse {
+            source: DataSource {
+                id: id.to_string(),
+                title: title.to_string(),
+                description: None,
+                source_type: config.source_type().to_string(),
+                connection: ConnectionDetails {
+                    secret_ref: String::new(),
+                    config,
+                    encryption_enabled: true,
+                    credentials: HashMap::from([
+                        ("username".to_string(), "tester".to_string()),
+                        ("password".to_string(), "secret".to_string()),
+                        ("token".to_string(), "secret-token".to_string()),
+                    ]),
+                },
+                schema_ref: None,
+                tags: Vec::new(),
+                metadata: HashMap::new(),
+                created_at: Some(Utc::now()),
+                updated_at: None,
+                last_synced_at: None,
+            },
+            status: DataSourceStatus::Active,
+            last_test_result: None,
+            capabilities: None,
         }
     }
 
@@ -2292,7 +2779,275 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_to_database_databricks_external_submission_path() {
+    async fn test_extract_unified_source_rows_uses_catalog_query_results() {
+        let unified_session = crate::mapping::multi_source::UnifiedMappingSession {
+            id: "unified_test".to_string(),
+            source_sessions: vec!["seed_session_001".to_string()],
+            target_database: TargetDatabaseConfig {
+                datasource_id: "target-postgres".to_string(),
+                schema: "public".to_string(),
+                tables: HashMap::new(),
+            },
+            field_mappings: vec![UnifiedFieldMapping {
+                id: "mapping_001".to_string(),
+                source_fields: vec![SourceFieldRef {
+                    session_id: "seed_session_001".to_string(),
+                    datasource_id: "source-a".to_string(),
+                    table_name: "orders".to_string(),
+                    field_name: "order_total".to_string(),
+                    source_data_type: "DECIMAL".to_string(),
+                }],
+                ontology_term_uri: "http://example.org/orderTotal".to_string(),
+                target_column: TargetColumnRef {
+                    table_name: "orders".to_string(),
+                    column_name: "order_total".to_string(),
+                    data_type: "DECIMAL".to_string(),
+                },
+                conflict_resolution: ConflictResolution::NoConflict,
+                transformation: None,
+                confidence: 0.98,
+            }],
+            conflicts: vec![],
+            status: crate::mapping::multi_source::UnifiedSessionStatus::ReadyToLoad,
+            created_at: Utc::now().timestamp(),
+            created_by: "tester".to_string(),
+            updated_at: Utc::now().timestamp(),
+        };
+
+        let catalog = MockSchemaCatalog::new(schema_for_plan_tests()).with_query_rows(
+            "source-a",
+            vec![
+                serde_json::json!({"order_total": "42.00"}),
+                serde_json::json!({"order_total": "84.00"}),
+            ],
+        );
+
+        let extracted = extract_unified_source_rows(Arc::new(catalog), &unified_session)
+            .await
+            .expect("extract rows");
+
+        let group_rows = extracted
+            .get("seed_session_001|orders")
+            .expect("grouped rows");
+        assert_eq!(group_rows.len(), 2);
+        assert_eq!(
+            group_rows[0]
+                .values
+                .get("order_total")
+                .and_then(|value| value.as_deref()),
+            Some("42.00")
+        );
+    }
+
+    #[test]
+    fn test_build_effective_load_session_derives_target_tables() {
+        let session = crate::mapping::multi_source::UnifiedMappingSession {
+            id: "unified_test".to_string(),
+            source_sessions: vec!["seed_session_001".to_string()],
+            target_database: TargetDatabaseConfig {
+                datasource_id: "target-databricks".to_string(),
+                schema: "main".to_string(),
+                tables: HashMap::new(),
+            },
+            field_mappings: vec![UnifiedFieldMapping {
+                id: "mapping_001".to_string(),
+                source_fields: vec![SourceFieldRef {
+                    session_id: "seed_session_001".to_string(),
+                    datasource_id: "source-a".to_string(),
+                    table_name: "orders".to_string(),
+                    field_name: "order_total".to_string(),
+                    source_data_type: "DECIMAL".to_string(),
+                }],
+                ontology_term_uri: "http://example.org/orderTotal".to_string(),
+                target_column: TargetColumnRef {
+                    table_name: "orders".to_string(),
+                    column_name: "order_total".to_string(),
+                    data_type: "DECIMAL(18,2)".to_string(),
+                },
+                conflict_resolution: ConflictResolution::NoConflict,
+                transformation: None,
+                confidence: 0.98,
+            }],
+            conflicts: vec![],
+            status: crate::mapping::multi_source::UnifiedSessionStatus::ReadyToLoad,
+            created_at: Utc::now().timestamp(),
+            created_by: "tester".to_string(),
+            updated_at: Utc::now().timestamp(),
+        };
+
+        let effective = build_effective_load_session(&session);
+        let table = effective
+            .target_database
+            .tables
+            .get("orders")
+            .expect("derived table");
+        let column = table.columns.get("order_total").expect("derived column");
+
+        assert_eq!(column.data_type, "DECIMAL(18,2)");
+    }
+
+    #[test]
+    fn test_target_table_key_fields_prefers_declared_primary_keys() {
+        let table = TargetTableConfig {
+            name: "orders".to_string(),
+            columns: HashMap::from([
+                (
+                    "order_id".to_string(),
+                    TargetColumnConfig {
+                        name: "order_id".to_string(),
+                        data_type: "BIGINT".to_string(),
+                        nullable: false,
+                        is_primary_key: false,
+                        default_value: None,
+                    },
+                ),
+                (
+                    "tenant_id".to_string(),
+                    TargetColumnConfig {
+                        name: "tenant_id".to_string(),
+                        data_type: "VARCHAR(64)".to_string(),
+                        nullable: false,
+                        is_primary_key: true,
+                        default_value: None,
+                    },
+                ),
+            ]),
+            primary_keys: vec!["order_id".to_string()],
+            foreign_keys: vec![],
+        };
+
+        assert_eq!(
+            target_table_key_fields(&table),
+            Some(vec!["order_id".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_databricks_load_strategy_uses_upsert_when_keys_exist() {
+        let table = TargetTableConfig {
+            name: "orders".to_string(),
+            columns: HashMap::from([
+                (
+                    "order_id".to_string(),
+                    TargetColumnConfig {
+                        name: "order_id".to_string(),
+                        data_type: "BIGINT".to_string(),
+                        nullable: false,
+                        is_primary_key: true,
+                        default_value: None,
+                    },
+                ),
+                (
+                    "amount".to_string(),
+                    TargetColumnConfig {
+                        name: "amount".to_string(),
+                        data_type: "DECIMAL(18,2)".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                        default_value: None,
+                    },
+                ),
+            ]),
+            primary_keys: vec!["order_id".to_string()],
+            foreign_keys: vec![],
+        };
+
+        let (mode, key_fields) = databricks_load_strategy_for_table(&table);
+        assert_eq!(mode, crate::etl::traits::LoadMode::Upsert);
+        assert_eq!(key_fields, Some(vec!["order_id".to_string()]));
+    }
+
+    #[test]
+    fn test_databricks_load_strategy_falls_back_to_insert_without_keys() {
+        let table = TargetTableConfig {
+            name: "orders".to_string(),
+            columns: HashMap::from([(
+                "amount".to_string(),
+                TargetColumnConfig {
+                    name: "amount".to_string(),
+                    data_type: "DECIMAL(18,2)".to_string(),
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: None,
+                },
+            )]),
+            primary_keys: vec![],
+            foreign_keys: vec![],
+        };
+
+        let (mode, key_fields) = databricks_load_strategy_for_table(&table);
+        assert_eq!(mode, crate::etl::traits::LoadMode::Insert);
+        assert_eq!(key_fields, None);
+    }
+
+    #[test]
+    fn test_build_postgres_connection_string_from_datasource_uses_catalog_config() {
+        let source = mock_datasource_response(
+            "target-postgres",
+            "Target Postgres",
+            SourceConfig::PostgreSQL(PostgreSQLConfig {
+                host: "pg.internal".to_string(),
+                port: 5432,
+                database: "warehouse".to_string(),
+                schema: Some("public".to_string()),
+                ssl_mode: Some("require".to_string()),
+            }),
+        );
+
+        let credentials = graphica_core::catalog::connector::Credentials::new(
+            "loader".to_string(),
+            "secret".to_string(),
+        );
+
+        let connection_string =
+            build_postgres_connection_string_from_datasource(&source.source, &credentials)
+                .expect("postgres connection string");
+
+        assert!(connection_string.contains("host=pg.internal"));
+        assert!(connection_string.contains("dbname=warehouse"));
+        assert!(connection_string.contains("user=loader"));
+        assert!(connection_string.contains("password=secret"));
+        assert!(connection_string.contains("sslmode=require"));
+    }
+
+    #[tokio::test]
+    async fn test_load_to_database_postgresql_requires_target_postgres_datasource() {
+        let state = create_test_api_state();
+
+        let create_response = create_unified_session(
+            State(state.clone()),
+            Json(CreateUnifiedSessionRequest {
+                source_session_ids: vec!["seed_session_001".to_string()],
+                target_database: TargetDatabaseConfig {
+                    datasource_id: String::new(),
+                    schema: "public".to_string(),
+                    tables: HashMap::new(),
+                },
+                created_by: "tester".to_string(),
+            }),
+        )
+        .await
+        .expect("unified session create")
+        .0;
+
+        let result = load_to_database(
+            State(state),
+            Path(create_response.id),
+            Json(LoadToDatabaseRequest {
+                database_type: DatabaseType::PostgreSQL,
+                connection_config: None,
+                batch_size: 500,
+                create_tables: true,
+                validate_data: true,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_load_to_database_databricks_requires_catalog() {
         let state = create_test_api_state();
 
         let create_response = create_unified_session(
@@ -2311,17 +3066,12 @@ mod tests {
         .expect("unified session create")
         .0;
 
-        assert_eq!(
-            create_response.status,
-            crate::mapping::multi_source::UnifiedSessionStatus::ReadyToLoad
-        );
-
-        let load_response = load_to_database(
-            State(state.clone()),
+        let result = load_to_database(
+            State(state),
             Path(create_response.id),
             Json(LoadToDatabaseRequest {
                 database_type: DatabaseType::Databricks,
-                connection_config: DatabaseConnectionConfig {
+                connection_config: Some(DatabaseConnectionConfig {
                     host: "https://adb-123.azuredatabricks.net".to_string(),
                     port: 443,
                     database: "lakehouse".to_string(),
@@ -2329,49 +3079,15 @@ mod tests {
                     password: "test_token".to_string(),
                     ssl_mode: Some("require".to_string()),
                     pool_size: Some(4),
-                },
+                }),
                 batch_size: 500,
                 create_tables: true,
                 validate_data: true,
             }),
         )
-        .await
-        .expect("load queued")
-        .0;
+        .await;
 
-        assert_eq!(load_response.status, LoadJobStatus::Queued);
-        assert!(load_response.load_job_id.starts_with("loadjob_"));
-        assert!(load_response.message.to_lowercase().contains("external"));
-        assert!(load_response.message.to_lowercase().contains("databricks"));
-
-        // Background task runs asynchronously; poll until submission is persisted.
-        let mut latest_status = LoadJobStatus::Queued;
-        let mut latest_external_run_id = None;
-        for _ in 0..20 {
-            let status_response = get_load_job_status(
-                State(state.clone()),
-                Path(load_response.load_job_id.clone()),
-            )
-            .await
-            .expect("load status")
-            .0;
-
-            latest_external_run_id = status_response.external_run_id.clone();
-            latest_status = status_response.status.clone();
-
-            if matches!(
-                latest_status,
-                LoadJobStatus::Submitted | LoadJobStatus::Completed | LoadJobStatus::Failed
-            ) {
-                assert_eq!(status_response.database_type.as_deref(), Some("databricks"));
-                break;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        assert_eq!(latest_status, LoadJobStatus::Submitted);
-        assert!(latest_external_run_id.is_some());
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -2383,7 +3099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_external_load_job_callback_completes_external_job() {
+    async fn test_external_load_job_callback_completes_db2_job() {
         let state = create_test_api_state();
 
         let create_response = create_unified_session(
@@ -2391,8 +3107,8 @@ mod tests {
             Json(CreateUnifiedSessionRequest {
                 source_session_ids: vec!["seed_session_001".to_string()],
                 target_database: TargetDatabaseConfig {
-                    datasource_id: "target-databricks".to_string(),
-                    schema: "main".to_string(),
+                    datasource_id: "target-db2".to_string(),
+                    schema: "public".to_string(),
                     tables: HashMap::new(),
                 },
                 created_by: "tester".to_string(),
@@ -2402,50 +3118,17 @@ mod tests {
         .expect("unified session create")
         .0;
 
-        let load_response = load_to_database(
-            State(state.clone()),
-            Path(create_response.id.clone()),
-            Json(LoadToDatabaseRequest {
-                database_type: DatabaseType::Databricks,
-                connection_config: DatabaseConnectionConfig {
-                    host: "https://adb-123.azuredatabricks.net".to_string(),
-                    port: 443,
-                    database: "lakehouse".to_string(),
-                    username: "svc_graphica".to_string(),
-                    password: "test_token".to_string(),
-                    ssl_mode: Some("require".to_string()),
-                    pool_size: Some(4),
-                },
-                batch_size: 500,
-                create_tables: true,
-                validate_data: true,
-            }),
-        )
-        .await
-        .expect("load queued")
-        .0;
-
-        // Wait until background submit path persists Submitted.
-        let mut ready_for_callback = false;
-        for _ in 0..20 {
-            let status_response = get_load_job_status(
-                State(state.clone()),
-                Path(load_response.load_job_id.clone()),
-            )
-            .await
-            .expect("status")
-            .0;
-            if status_response.status == LoadJobStatus::Submitted {
-                ready_for_callback = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert!(ready_for_callback);
+        let coordinator = state
+            .unified_mapping_coordinator
+            .as_ref()
+            .expect("coordinator");
+        let load_job = coordinator
+            .create_load_job(&create_response.id, "db2")
+            .expect("create load job");
 
         let callback_response = external_load_job_callback(
             State(state.clone()),
-            Path(load_response.load_job_id.clone()),
+            Path(load_job.id.clone()),
             Json(ExternalLoadJobCallbackRequest {
                 status: ExternalLoadJobCallbackStatus::Completed,
                 external_run_id: Some("stmt_456".to_string()),
@@ -2465,13 +3148,10 @@ mod tests {
 
         assert_eq!(callback_response.status, LoadJobStatus::Completed);
 
-        let status_after = get_load_job_status(
-            State(state.clone()),
-            Path(load_response.load_job_id.clone()),
-        )
-        .await
-        .expect("status after callback")
-        .0;
+        let status_after = get_load_job_status(State(state.clone()), Path(load_job.id.clone()))
+            .await
+            .expect("status after callback")
+            .0;
         assert_eq!(status_after.status, LoadJobStatus::Completed);
         assert_eq!(status_after.external_run_id.as_deref(), Some("stmt_456"));
         assert_eq!(status_after.progress.rows_succeeded, 1000);
@@ -2487,7 +3167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_external_load_job_callback_rejects_postgresql_jobs() {
+    async fn test_external_load_job_callback_rejects_databricks_jobs() {
         let state = create_test_api_state();
 
         let create_response = create_unified_session(
@@ -2495,8 +3175,8 @@ mod tests {
             Json(CreateUnifiedSessionRequest {
                 source_session_ids: vec!["seed_session_001".to_string()],
                 target_database: TargetDatabaseConfig {
-                    datasource_id: "target-postgres".to_string(),
-                    schema: "public".to_string(),
+                    datasource_id: "target-databricks".to_string(),
+                    schema: "main".to_string(),
                     tables: HashMap::new(),
                 },
                 created_by: "tester".to_string(),
@@ -2511,7 +3191,7 @@ mod tests {
             .as_ref()
             .expect("coordinator");
         let job = coordinator
-            .create_load_job(&create_response.id, "postgresql")
+            .create_load_job(&create_response.id, "databricks")
             .expect("create load job");
 
         let result = external_load_job_callback(

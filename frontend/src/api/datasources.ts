@@ -99,6 +99,60 @@ interface BackendDatasourceListResponse {
   total: number;
 }
 
+interface BackendColumnDefinition {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  primaryKey?: boolean;
+}
+
+interface BackendTableDefinition {
+  name: string;
+  columns: BackendColumnDefinition[];
+  estimatedRows?: number;
+}
+
+interface BackendSchemaDefinition {
+  name: string;
+  tables: BackendTableDefinition[];
+  inferredAt: string;
+}
+
+interface BackendQueryResult {
+  rows: Array<Record<string, unknown>>;
+  rowCount: number;
+  executionTimeMs: number;
+  truncated: boolean;
+  columns?: BackendColumnDefinition[];
+}
+
+export interface WorkflowSchemaField {
+  name: string;
+  type: string;
+  nullable?: boolean;
+  primary_key?: boolean;
+}
+
+export interface WorkflowTableSchema {
+  name: string;
+  columns: WorkflowSchemaField[];
+  estimated_rows?: number;
+}
+
+export interface WorkflowDatasourceSchema {
+  name: string;
+  tables: WorkflowTableSchema[];
+  inferred_at: string;
+}
+
+export interface DatasourceQueryPreview {
+  rows: Array<Record<string, unknown>>;
+  row_count: number;
+  execution_time_ms: number;
+  truncated: boolean;
+  columns: WorkflowSchemaField[];
+}
+
 async function getConnectorMap(): Promise<Map<string, BackendConnector>> {
   try {
     const response = await api.get<{ connectors: BackendConnector[] }>('/connectors');
@@ -274,6 +328,65 @@ export async function getDatasourceHealth(
 export async function getDatasourceSchema(id: string): Promise<SchemaInfo> {
   const request = transformSchemaDiscoveryRequest(id);
   return api.post(`/datasources/${id}/schema/infer`, request);
+}
+
+function mapWorkflowSchemaField(column: BackendColumnDefinition): WorkflowSchemaField {
+  return {
+    name: column.name,
+    type: column.dataType,
+    nullable: column.nullable,
+    primary_key: column.primaryKey ?? false,
+  };
+}
+
+export async function inferDatasourceSchemaForWorkflow(
+  id: string,
+  options?: { tableName?: string; sampleSize?: number }
+): Promise<WorkflowDatasourceSchema> {
+  const response = await api.post<BackendSchemaDefinition>(
+    `/datasources/${id}/schema/infer`,
+    {
+      sourceId: id,
+      tableName: options?.tableName,
+      sampleSize: options?.sampleSize ?? 1000,
+    }
+  );
+
+  return {
+    name: response.name,
+    inferred_at: response.inferredAt,
+    tables: (response.tables || []).map((table) => ({
+      name: table.name,
+      estimated_rows: table.estimatedRows,
+      columns: (table.columns || []).map(mapWorkflowSchemaField),
+    })),
+  };
+}
+
+export async function previewDatasourceQuery(
+  id: string,
+  request: {
+    query: string;
+    parameters?: Record<string, unknown>;
+    limit?: number;
+    timeout?: number;
+  }
+): Promise<DatasourceQueryPreview> {
+  const response = await api.post<BackendQueryResult>(`/datasources/${id}/query`, {
+    sourceId: id,
+    query: request.query,
+    parameters: request.parameters || {},
+    limit: request.limit ?? 25,
+    timeout: request.timeout ?? 30,
+  });
+
+  return {
+    rows: response.rows || [],
+    row_count: response.rowCount,
+    execution_time_ms: response.executionTimeMs,
+    truncated: response.truncated,
+    columns: (response.columns || []).map(mapWorkflowSchemaField),
+  };
 }
 
 /**

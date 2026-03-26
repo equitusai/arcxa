@@ -645,6 +645,7 @@ fn infer_column_type(samples: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::catalog::types::ConnectionDetails;
+    use std::io::Write;
 
     fn create_test_source() -> DataSource {
         DataSource::new(
@@ -676,8 +677,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection() {
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(temp_file, "id,name").unwrap();
+        writeln!(temp_file, "1,Alice").unwrap();
+
         let connector = CsvConnector::new();
-        let source = create_test_source();
+        let source = DataSource::new(
+            "Test CSV".to_string(),
+            "CsvFile".to_string(),
+            ConnectionDetails {
+                secret_ref: "none".to_string(),
+                config: SourceConfig::CsvFile(CsvFileConfig {
+                    path: temp_file.path().to_string_lossy().to_string(),
+                    delimiter: ',',
+                    has_header: true,
+                }),
+                encryption_enabled: false,
+                credentials: Default::default(),
+            },
+        );
         let creds = Credentials::new("".to_string(), "".to_string());
 
         let result = connector.test_connection(&source, creds).await.unwrap();

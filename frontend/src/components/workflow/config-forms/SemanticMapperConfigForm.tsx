@@ -81,6 +81,7 @@ export interface SemanticMapperConfigFormProps {
   onUpdate: (updates: Partial<SemanticMapperConfig>) => void;
   nodeId?: string;
   datasourceId?: string; // Optional: for direct datasource analysis
+  sourceTable?: string;
   upstreamSchema?: Array<{
     name: string;
     type: string;
@@ -131,6 +132,7 @@ export function SemanticMapperConfigForm({
   onUpdate,
   nodeId,
   datasourceId,
+  sourceTable,
   upstreamSchema = []
 }: SemanticMapperConfigFormProps) {
   // ============================================================================
@@ -350,6 +352,7 @@ export function SemanticMapperConfigForm({
       if (datasourceId) {
         // Step 1: Start analysis
         const analysisResponse = await fieldMappingApi.analyzeForMapping(datasourceId, {
+          tables: sourceTable ? [sourceTable] : undefined,
           ontology_namespaces: selectedOntologies.map((ont) => ont.namespace),
           auto_approve_threshold: autoApproveThreshold,
           min_confidence: 0.5,
@@ -426,7 +429,7 @@ export function SemanticMapperConfigForm({
     } finally {
       setIsAnalyzing(false);
     }
-  }, [datasourceId, upstreamSchema, selectedOntologyIds, selectedOntologies, autoApproveThreshold, onUpdate]);
+  }, [datasourceId, sourceTable, upstreamSchema, selectedOntologyIds, selectedOntologies, autoApproveThreshold, onUpdate]);
 
   const handleApproveField = useCallback((field: FieldMapping) => {
     if (!field.candidates[0]) return;

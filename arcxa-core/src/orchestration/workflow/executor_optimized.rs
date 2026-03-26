@@ -3,16 +3,29 @@
 //! This module shows how to migrate executor steps to use the new
 //! row storage system, eliminating expensive clone operations.
 
-use super::definition::{CsvExporterConfig, DeduplicatorConfig, SemanticMapperConfig};
+#[cfg(feature = "workflow-storage")]
+use super::definition::{
+    AggregatorConfig, CsvExporterConfig, DataValidatorConfig, DeduplicatorConfig,
+    SemanticMapperConfig,
+};
+#[cfg(feature = "workflow-storage")]
 use super::error::{Result, WorkflowError};
+#[cfg(feature = "workflow-storage")]
 use super::execution_context_v2::ExecutionContextV2;
+#[cfg(feature = "workflow-storage")]
 use super::row_storage::RowAccessor;
 #[cfg(feature = "workflow-storage")]
 use super::row_storage::StorageManager;
 #[cfg(feature = "workflow-storage")]
+use super::runtime::operators::{
+    AggregatorBatchOperator, CsvExportBatchOperator, DataValidatorBatchOperator,
+    DeduplicatorBatchOperator, FieldTransformerBatchOperator, SemanticMapperBatchOperator,
+};
+#[cfg(feature = "workflow-storage")]
 use super::streaming_deduplicator::{StreamingDedupConfig, StreamingDeduplicator};
-use serde_json;
+#[cfg(feature = "workflow-storage")]
 use std::collections::HashSet;
+#[cfg(feature = "workflow-storage")]
 use std::sync::Arc;
 
 /// Example of optimized step execution
@@ -40,24 +53,37 @@ impl OptimizedStepExecutor {
 
         tracing::info!("DEDUP_OPTIMIZED: Processing {} rows", original_count);
 
-        // Choose strategy based on dataset size
-        let deduped_rows = if original_count > 100_000 {
-            // Large dataset: use streaming with disk-backed seen keys
-            self.streaming_deduplicate_large(&row_accessor, config)
-                .await?
+        let execution_path = if original_count > 100_000 {
+            "streaming_disk"
         } else if original_count > 10_000 {
-            // Medium dataset: streaming with in-memory seen keys
-            self.streaming_deduplicate_medium(&row_accessor, config)?
+            "streaming_memory"
         } else {
-            // Small dataset: in-memory processing
-            self.in_memory_deduplicate(&row_accessor, config)?
+            "batch_frame"
         };
 
-        let deduped_count = deduped_rows.len();
+        let deduped_count = if original_count > 100_000 {
+            // Large dataset: use streaming with disk-backed seen keys
+            let deduped_rows = self
+                .streaming_deduplicate_large(&row_accessor, config)
+                .await?;
+            let deduped_count = deduped_rows.len();
+            context.set_rows(deduped_rows)?;
+            deduped_count
+        } else if original_count > 10_000 {
+            // Medium dataset: streaming with in-memory seen keys
+            let deduped_rows = self.streaming_deduplicate_medium(&row_accessor, config)?;
+            let deduped_count = deduped_rows.len();
+            context.set_rows(deduped_rows)?;
+            deduped_count
+        } else {
+            let frame = context.get_batch_frame()?;
+            let operator = DeduplicatorBatchOperator;
+            let deduped_frame = operator.execute(frame, config)?;
+            let deduped_count = deduped_frame.row_count();
+            context.set_batch_frame(deduped_frame)?;
+            deduped_count
+        };
         let duplicates_removed = original_count - deduped_count;
-
-        // Store deduplicated rows with automatic tiering
-        context.set_rows(deduped_rows)?;
 
         // Track lineage if enabled
         if let Some(ref mut lineage) = context.row_lineage {
@@ -79,6 +105,7 @@ impl OptimizedStepExecutor {
                 "_row_count": deduped_count,
                 "_original_count": original_count,
                 "_duplicates_removed": duplicates_removed,
+                "_execution_path": execution_path,
                 "_storage_type": context.row_storage.as_ref()
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
@@ -128,6 +155,7 @@ impl OptimizedStepExecutor {
             input_data: serde_json::json!({}),
             working_data: serde_json::json!({}),
             row_storage: Some(row_storage),
+            batch_frame: None,
             step_outputs: Default::default(),
             step_row_storage: Default::default(),
             metadata: Default::default(),
@@ -251,7 +279,7 @@ impl OptimizedStepExecutor {
         config: &CsvExporterConfig,
         context: &mut ExecutionContextV2,
     ) -> Result<(bool, serde_json::Value)> {
-        tracing::info!("CSV_EXPORT_OPTIMIZED: Starting streaming export");
+        tracing::info!("CSV_EXPORT_OPTIMIZED: Starting export");
 
         let row_accessor = context.get_rows()?;
         let row_count = row_accessor.len();
@@ -267,65 +295,74 @@ impl OptimizedStepExecutor {
             ));
         }
 
-        // Open output file
-        let file = std::fs::File::create(&config.output_path)
-            .map_err(|e| WorkflowError::IoError(e.to_string()))?;
-        let mut writer = csv::Writer::from_writer(file);
+        let (rows_written, storage_type, batch_size) = if row_count > 100_000 {
+            let file = std::fs::File::create(&config.output_path)
+                .map_err(|e| WorkflowError::IoError(e.to_string()))?;
+            let mut writer = csv::WriterBuilder::new()
+                .delimiter(config.delimiter.unwrap_or(',') as u8)
+                .from_writer(file);
 
-        // Get headers from first row
-        let first_row = row_accessor
-            .get(0)?
-            .ok_or_else(|| WorkflowError::DataNotFound("No first row for headers".into()))?;
+            let first_row = row_accessor
+                .get(0)?
+                .ok_or_else(|| WorkflowError::DataNotFound("No first row for headers".into()))?;
 
-        let headers: Vec<String> = if let serde_json::Value::Object(obj) = &first_row {
-            obj.keys().cloned().collect()
-        } else {
-            return Err(WorkflowError::InvalidData("Row is not an object".into()));
-        };
+            let headers: Vec<String> = if let serde_json::Value::Object(obj) = &first_row {
+                obj.keys().cloned().collect()
+            } else {
+                return Err(WorkflowError::InvalidData("Row is not an object".into()));
+            };
 
-        // Write headers
-        writer
-            .write_record(&headers)
-            .map_err(|e| WorkflowError::IoError(e.to_string()))?;
+            if config.include_header {
+                writer
+                    .write_record(&headers)
+                    .map_err(|e| WorkflowError::IoError(e.to_string()))?;
+            }
 
-        // Stream rows to CSV
-        let mut rows_written = 0;
-        let batch_size = if row_count > 100_000 { 10_000 } else { 1_000 };
+            let mut rows_written = 0;
+            let batch_size = 10_000;
 
-        for batch_result in row_accessor.iter_batches(batch_size) {
-            let batch = batch_result?;
+            for batch_result in row_accessor.iter_batches(batch_size) {
+                let batch = batch_result?;
 
-            for row in batch {
-                if let serde_json::Value::Object(obj) = row {
-                    let record: Vec<String> = headers
-                        .iter()
-                        .map(|h| {
-                            obj.get(h)
-                                .map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    serde_json::Value::Null => String::new(),
-                                    _ => v.to_string(),
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect();
+                for row in batch {
+                    if let serde_json::Value::Object(obj) = row {
+                        let record: Vec<String> = headers
+                            .iter()
+                            .map(|h| {
+                                obj.get(h)
+                                    .map(|v| match v {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        serde_json::Value::Null => String::new(),
+                                        _ => v.to_string(),
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
 
-                    writer
-                        .write_record(&record)
-                        .map_err(|e| WorkflowError::IoError(e.to_string()))?;
+                        writer
+                            .write_record(&record)
+                            .map_err(|e| WorkflowError::IoError(e.to_string()))?;
 
-                    rows_written += 1;
+                        rows_written += 1;
+                    }
+                }
+
+                if rows_written % 100_000 == 0 {
+                    tracing::debug!("CSV_EXPORT_OPTIMIZED: Written {} rows", rows_written);
                 }
             }
 
-            if rows_written % 100_000 == 0 {
-                tracing::debug!("CSV_EXPORT_OPTIMIZED: Written {} rows", rows_written);
-            }
-        }
+            writer
+                .flush()
+                .map_err(|e| WorkflowError::IoError(e.to_string()))?;
 
-        writer
-            .flush()
-            .map_err(|e| WorkflowError::IoError(e.to_string()))?;
+            (rows_written, "streaming", batch_size)
+        } else {
+            let frame = context.get_batch_frame()?;
+            let operator = CsvExportBatchOperator;
+            let rows_written = operator.execute(&frame, config)?;
+            (rows_written, "batch_frame", row_count.max(1))
+        };
 
         tracing::info!(
             "CSV_EXPORT_OPTIMIZED: Successfully exported {} rows",
@@ -337,7 +374,7 @@ impl OptimizedStepExecutor {
             serde_json::json!({
                 "_output_path": config.output_path,
                 "_rows_written": rows_written,
-                "_storage_type": "streaming",
+                "_storage_type": storage_type,
                 "_batch_size": batch_size,
             }),
         ))
@@ -354,15 +391,19 @@ impl OptimizedStepExecutor {
         let row_accessor = context.get_rows()?;
         let row_count = row_accessor.len();
 
-        // Process based on size
-        let mapped_rows = if row_count > 50_000 {
-            self.streaming_map_large(&row_accessor, config)?
+        let mapped_count = if row_count > 50_000 {
+            let mapped_rows = self.streaming_map_large(&row_accessor, config)?;
+            let mapped_count = mapped_rows.len();
+            context.set_rows(mapped_rows)?;
+            mapped_count
         } else {
-            self.in_memory_map(&row_accessor, config)?
+            let frame = context.get_batch_frame()?;
+            let operator = SemanticMapperBatchOperator;
+            let mapped_frame = operator.execute(frame, config)?;
+            let mapped_count = mapped_frame.row_count();
+            context.set_batch_frame(mapped_frame)?;
+            mapped_count
         };
-
-        let mapped_count = mapped_rows.len();
-        context.set_rows(mapped_rows)?;
 
         Ok((
             true,
@@ -370,6 +411,140 @@ impl OptimizedStepExecutor {
                 "_row_count": mapped_count,
                 "_original_count": row_count,
                 "_target_ontology": config.target_ontology.clone(),
+                "_storage_type": context.row_storage.as_ref()
+                    .map(|s| s.storage_type().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }),
+        ))
+    }
+
+    /// Optimized data validator that keeps the small-dataset path batch-native.
+    pub async fn execute_data_validator(
+        &self,
+        config: &DataValidatorConfig,
+        context: &mut ExecutionContextV2,
+    ) -> Result<(bool, serde_json::Value)> {
+        tracing::info!("VALIDATOR_OPTIMIZED: Starting data validation");
+
+        let row_accessor = context.get_rows()?;
+        let row_count = row_accessor.len();
+
+        let (success, errors, warnings, execution_path) = if row_count > 50_000 {
+            let rows = row_accessor.to_vec()?;
+            let (success, errors, warnings) = self.validate_rows_large(&rows, config)?;
+            (success, errors, warnings, "row_json")
+        } else {
+            let frame = context.get_batch_frame()?;
+            let operator = DataValidatorBatchOperator;
+            let result = operator.execute(frame, config)?;
+            let success = result.success;
+            let errors = result.errors;
+            let warnings = result.warnings;
+            context.set_batch_frame(result.frame)?;
+            (success, errors, warnings, "batch_frame")
+        };
+
+        Ok((
+            success,
+            serde_json::json!({
+                "_row_count": row_count,
+                "_errors": errors,
+                "_warnings": warnings,
+                "_error_count": errors.len(),
+                "_warning_count": warnings.len(),
+                "_execution_path": execution_path,
+                "_storage_type": context.row_storage.as_ref()
+                    .map(|s| s.storage_type().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }),
+        ))
+    }
+
+    /// Optimized field transformer that keeps the small-dataset row path batch-native.
+    pub async fn execute_field_transformer(
+        &self,
+        config: &super::definition::FieldTransformerConfig,
+        context: &mut ExecutionContextV2,
+    ) -> Result<(bool, serde_json::Value)> {
+        tracing::info!("FIELD_TRANSFORMER_OPTIMIZED: Starting field transformation");
+
+        let row_accessor = context.get_rows()?;
+        let row_count = row_accessor.len();
+
+        let (stats, execution_path) = if row_count > 50_000 {
+            let rows = row_accessor.to_vec()?;
+            let object_rows = rows
+                .into_iter()
+                .map(|row| {
+                    row.as_object().cloned().ok_or_else(|| {
+                        WorkflowError::InvalidData("Field transformer requires object rows".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (transformed_rows, stats) =
+                super::field_transformer::transform_object_rows(&object_rows, config)?;
+            context.set_rows(
+                transformed_rows
+                    .into_iter()
+                    .map(serde_json::Value::Object)
+                    .collect(),
+            )?;
+            (stats, "row_json")
+        } else {
+            let frame = context.get_batch_frame()?;
+            let operator = FieldTransformerBatchOperator;
+            let result = operator.execute(frame, config)?;
+            let stats = result.stats;
+            context.set_batch_frame(result.frame)?;
+            (stats, "batch_frame")
+        };
+
+        Ok((
+            true,
+            serde_json::json!({
+                "_row_count": row_count,
+                "_rows_transformed": stats.rows_transformed,
+                "_fields_modified": stats.fields_modified,
+                "_execution_path": execution_path,
+                "_storage_type": context.row_storage.as_ref()
+                    .map(|s| s.storage_type().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }),
+        ))
+    }
+
+    /// Optimized aggregator that keeps the small-dataset path batch-native.
+    pub async fn execute_aggregator(
+        &self,
+        config: &AggregatorConfig,
+        context: &mut ExecutionContextV2,
+    ) -> Result<(bool, serde_json::Value)> {
+        tracing::info!("AGGREGATOR_OPTIMIZED: Starting aggregation");
+
+        let row_accessor = context.get_rows()?;
+        let original_count = row_accessor.len();
+
+        let (aggregated_count, execution_path) = if original_count > 50_000 {
+            let rows = row_accessor.to_vec()?;
+            let aggregated_rows = self.aggregate_rows_large(&rows, config)?;
+            let aggregated_count = aggregated_rows.len();
+            context.set_rows(aggregated_rows)?;
+            (aggregated_count, "row_json")
+        } else {
+            let frame = context.get_batch_frame()?;
+            let operator = AggregatorBatchOperator;
+            let aggregated_frame = operator.execute(frame, config)?;
+            let aggregated_count = aggregated_frame.row_count();
+            context.set_batch_frame(aggregated_frame)?;
+            (aggregated_count, "batch_frame")
+        };
+
+        Ok((
+            true,
+            serde_json::json!({
+                "_row_count": aggregated_count,
+                "_original_count": original_count,
+                "_execution_path": execution_path,
                 "_storage_type": context.row_storage.as_ref()
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
@@ -419,6 +594,141 @@ impl OptimizedStepExecutor {
         // For now, just pass through the rows
         Ok(rows)
     }
+
+    fn validate_rows_large(
+        &self,
+        rows: &[serde_json::Value],
+        config: &DataValidatorConfig,
+    ) -> Result<(bool, Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        use super::definition::{RuleType, Severity};
+
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            for rule in &config.rules {
+                let field_value = row.get(&rule.field);
+                let is_valid = match &rule.rule_type {
+                    RuleType::NotNull => matches!(field_value, Some(value) if !value.is_null()),
+                    RuleType::Regex { pattern } => {
+                        if let Some(serde_json::Value::String(string)) = field_value {
+                            regex::Regex::new(pattern)
+                                .map(|compiled| compiled.is_match(string))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    }
+                    RuleType::Range { min, max } => {
+                        if let Some(number) = field_value.and_then(|value| value.as_f64()) {
+                            number >= *min && number <= *max
+                        } else {
+                            false
+                        }
+                    }
+                    RuleType::InSet { values } => {
+                        if let Some(serde_json::Value::String(string)) = field_value {
+                            values.contains(string)
+                        } else {
+                            false
+                        }
+                    }
+                    RuleType::Length { min, max } => {
+                        if let Some(serde_json::Value::String(string)) = field_value {
+                            string.len() >= *min && string.len() <= *max
+                        } else {
+                            false
+                        }
+                    }
+                    _ => true,
+                };
+
+                if !is_valid {
+                    let violation = serde_json::json!({
+                        "row": row_idx,
+                        "field": rule.field,
+                        "rule_type": format!("{:?}", rule.rule_type),
+                        "value": field_value,
+                    });
+
+                    match rule.severity {
+                        Severity::Error => errors.push(violation),
+                        Severity::Warning => warnings.push(violation),
+                    }
+                }
+            }
+        }
+
+        let success = !config.fail_on_error || errors.is_empty();
+        Ok((success, errors, warnings))
+    }
+
+    fn aggregate_rows_large(
+        &self,
+        rows: &[serde_json::Value],
+        config: &AggregatorConfig,
+    ) -> Result<Vec<serde_json::Value>> {
+        use super::definition::AggFunction;
+        use std::collections::HashMap;
+
+        let mut groups: HashMap<String, Vec<&serde_json::Value>> = HashMap::new();
+        for row in rows {
+            let key = config
+                .group_by
+                .iter()
+                .map(|field| {
+                    row.get(field)
+                        .map(|value| value.to_string())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            groups.entry(key).or_default().push(row);
+        }
+
+        let mut result_rows = Vec::with_capacity(groups.len());
+        for (key_str, group_rows) in groups {
+            let mut result_row = serde_json::Map::new();
+
+            let keys: Vec<&str> = key_str.split('|').collect();
+            for (index, field) in config.group_by.iter().enumerate() {
+                if index < keys.len() {
+                    result_row.insert(field.clone(), serde_json::json!(keys[index]));
+                }
+            }
+
+            for aggregation in &config.aggregations {
+                let values: Vec<f64> = group_rows
+                    .iter()
+                    .filter_map(|row| row.get(&aggregation.field).and_then(|value| value.as_f64()))
+                    .collect();
+
+                let aggregate_value = match aggregation.function {
+                    AggFunction::Sum => values.iter().sum(),
+                    AggFunction::Avg => {
+                        if values.is_empty() {
+                            0.0
+                        } else {
+                            values.iter().sum::<f64>() / values.len() as f64
+                        }
+                    }
+                    AggFunction::Count => values.len() as f64,
+                    AggFunction::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
+                    AggFunction::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                    _ => 0.0,
+                };
+
+                let field_name = aggregation.alias.clone().unwrap_or_else(|| {
+                    format!("{}_{:?}", aggregation.field, aggregation.function).to_lowercase()
+                });
+                result_row.insert(field_name, serde_json::json!(aggregate_value));
+            }
+
+            result_rows.push(serde_json::Value::Object(result_row));
+        }
+
+        Ok(result_rows)
+    }
 }
 
 /// Extension trait for StorageManager to support deduplication
@@ -451,6 +761,7 @@ impl StorageManager {
 #[cfg(all(test, feature = "workflow-storage"))]
 mod tests {
     use super::*;
+    use crate::orchestration::workflow::runtime::frame::{BatchFrame, BatchFrameMetadata};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -477,7 +788,15 @@ mod tests {
             json!({"id": 2, "name": "Bob"}), // Duplicate
         ];
 
-        context.set_rows(rows).unwrap();
+        let frame =
+            BatchFrame::from_json_values(&rows)
+                .unwrap()
+                .with_metadata(BatchFrameMetadata {
+                    source_step_id: Some("extract_dedup".to_string()),
+                    source_kind: Some("db_extract".to_string()),
+                    source_id: None,
+                });
+        context.set_batch_frame(frame).unwrap();
 
         let config = DeduplicatorConfig {
             key_fields: vec!["id".to_string()],
@@ -494,6 +813,7 @@ mod tests {
         assert!(success);
         assert_eq!(output["_row_count"], 3);
         assert_eq!(output["_duplicates_removed"], 2);
+        assert_eq!(output["_execution_path"], "batch_frame");
 
         // Verify deduplicated data
         let result_rows = context.get_rows().unwrap().to_vec().unwrap();
@@ -501,10 +821,16 @@ mod tests {
         assert_eq!(result_rows[0]["id"], 1);
         assert_eq!(result_rows[1]["id"], 2);
         assert_eq!(result_rows[2]["id"], 3);
+
+        let result_frame = context.get_batch_frame().unwrap();
+        assert_eq!(
+            result_frame.metadata().source_step_id.as_deref(),
+            Some("extract_dedup")
+        );
     }
 
     #[tokio::test]
-    async fn test_streaming_csv_export() {
+    async fn test_batch_frame_csv_export_for_small_datasets() {
         let temp_dir = tempdir().unwrap();
         let storage_manager = Arc::new(
             StorageManager::new(
@@ -524,7 +850,15 @@ mod tests {
             json!({"id": 3, "name": "Charlie", "age": 35}),
         ];
 
-        context.set_rows(rows).unwrap();
+        let frame =
+            BatchFrame::from_json_values(&rows)
+                .unwrap()
+                .with_metadata(BatchFrameMetadata {
+                    source_step_id: Some("extract_csv".to_string()),
+                    source_kind: Some("db_extract".to_string()),
+                    source_id: None,
+                });
+        context.set_batch_frame(frame).unwrap();
 
         let output_path = temp_dir.path().join("output.csv");
         let config = CsvExporterConfig {
@@ -541,12 +875,283 @@ mod tests {
 
         assert!(success);
         assert_eq!(output["_rows_written"], 3);
+        assert_eq!(output["_storage_type"], "batch_frame");
 
         // Verify CSV file
         let csv_content = std::fs::read_to_string(&output_path).unwrap();
-        assert!(csv_content.contains("id,name,age") || csv_content.contains("age,id,name"));
-        assert!(csv_content.contains("Alice"));
-        assert!(csv_content.contains("Bob"));
-        assert!(csv_content.contains("Charlie"));
+        assert!(csv_content.contains("age,id,name"));
+        assert!(csv_content.contains("30,1,Alice"));
+        assert!(csv_content.contains("25,2,Bob"));
+        assert!(csv_content.contains("35,3,Charlie"));
+
+        let result_frame = context.get_batch_frame().unwrap();
+        assert_eq!(
+            result_frame.metadata().source_step_id.as_deref(),
+            Some("extract_csv")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_mapper_preserves_batch_frame_metadata() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = vec![
+            json!({"id": 1, "name": "Alice"}),
+            json!({"id": 2, "name": "Bob"}),
+        ];
+        let frame =
+            BatchFrame::from_json_values(&rows)
+                .unwrap()
+                .with_metadata(BatchFrameMetadata {
+                    source_step_id: Some("extract_small".to_string()),
+                    source_kind: Some("db_extract".to_string()),
+                    source_id: None,
+                });
+        context.set_batch_frame(frame).unwrap();
+
+        let config = SemanticMapperConfig {
+            target_ontology: vec!["gph:Customer".to_string()],
+            auto_approve_threshold: 0.95,
+            mapping_mode: super::super::definition::MappingMode::Hybrid,
+            mapping_session_id: None,
+            source_id: None,
+            table_name: None,
+            entity_uri: None,
+        };
+
+        let (success, output) = executor
+            .execute_semantic_mapper(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 2);
+
+        let result_frame = context.get_batch_frame().unwrap();
+        assert_eq!(
+            result_frame.metadata().source_step_id.as_deref(),
+            Some("extract_small")
+        );
+        assert_eq!(
+            result_frame.metadata().source_kind.as_deref(),
+            Some("db_extract")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_frame_data_validator_for_small_datasets() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = vec![
+            json!({"name": "Alice", "age": 30, "status": "active"}),
+            json!({"name": null, "age": 150, "status": "inactive"}),
+            json!({"name": "Bob", "age": 21, "status": "paused"}),
+        ];
+        let frame =
+            BatchFrame::from_json_values(&rows)
+                .unwrap()
+                .with_metadata(BatchFrameMetadata {
+                    source_step_id: Some("extract_validate".to_string()),
+                    source_kind: Some("db_extract".to_string()),
+                    source_id: None,
+                });
+        context.set_batch_frame(frame).unwrap();
+
+        let config = DataValidatorConfig {
+            rules: vec![
+                super::super::definition::ValidationRule {
+                    field: "name".to_string(),
+                    rule_type: super::super::definition::RuleType::NotNull,
+                    params: None,
+                    severity: super::super::definition::Severity::Error,
+                },
+                super::super::definition::ValidationRule {
+                    field: "age".to_string(),
+                    rule_type: super::super::definition::RuleType::Range {
+                        min: 0.0,
+                        max: 120.0,
+                    },
+                    params: None,
+                    severity: super::super::definition::Severity::Error,
+                },
+                super::super::definition::ValidationRule {
+                    field: "status".to_string(),
+                    rule_type: super::super::definition::RuleType::InSet {
+                        values: vec!["active".to_string(), "inactive".to_string()],
+                    },
+                    params: None,
+                    severity: super::super::definition::Severity::Warning,
+                },
+            ],
+            fail_on_error: true,
+        };
+
+        let (success, output) = executor
+            .execute_data_validator(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(!success);
+        assert_eq!(output["_row_count"], 3);
+        assert_eq!(output["_error_count"], 2);
+        assert_eq!(output["_warning_count"], 1);
+        assert_eq!(output["_execution_path"], "batch_frame");
+
+        let result_frame = context.get_batch_frame().unwrap();
+        assert_eq!(
+            result_frame.metadata().source_step_id.as_deref(),
+            Some("extract_validate")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_frame_aggregator_for_small_datasets() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = vec![
+            json!({"region": "east", "amount": 10.0, "orders": 1}),
+            json!({"region": "east", "amount": 15.0, "orders": 2}),
+            json!({"region": "west", "amount": 7.0, "orders": 3}),
+        ];
+        let frame =
+            BatchFrame::from_json_values(&rows)
+                .unwrap()
+                .with_metadata(BatchFrameMetadata {
+                    source_step_id: Some("extract_aggregate".to_string()),
+                    source_kind: Some("db_extract".to_string()),
+                    source_id: None,
+                });
+        context.set_batch_frame(frame).unwrap();
+
+        let config = AggregatorConfig {
+            group_by: vec!["region".to_string()],
+            aggregations: vec![
+                super::super::definition::Aggregation {
+                    field: "amount".to_string(),
+                    function: super::super::definition::AggFunction::Sum,
+                    alias: Some("total_amount".to_string()),
+                },
+                super::super::definition::Aggregation {
+                    field: "orders".to_string(),
+                    function: super::super::definition::AggFunction::Count,
+                    alias: Some("order_count".to_string()),
+                },
+            ],
+        };
+
+        let (success, output) = executor
+            .execute_aggregator(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 2);
+        assert_eq!(output["_original_count"], 3);
+        assert_eq!(output["_execution_path"], "batch_frame");
+
+        let result_frame = context.get_batch_frame().unwrap();
+        let result_rows = result_frame.to_json_values().unwrap();
+        assert_eq!(
+            result_frame.metadata().source_step_id.as_deref(),
+            Some("extract_aggregate")
+        );
+        assert!(result_rows.iter().any(|row| {
+            row["region"] == "\"east\"" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
+        }));
+        assert!(result_rows.iter().any(|row| {
+            row["region"] == "\"west\"" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_batch_frame_field_transformer_for_small_datasets() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = vec![
+            json!({"email": "  TEST@EXAMPLE.COM  ", "status": "ACTIVE"}),
+            json!({"email": "second@example.com", "status": "PENDING"}),
+        ];
+        let frame =
+            BatchFrame::from_json_values(&rows)
+                .unwrap()
+                .with_metadata(BatchFrameMetadata {
+                    source_step_id: Some("extract_transform".to_string()),
+                    source_kind: Some("db_extract".to_string()),
+                    source_id: None,
+                });
+        context.set_batch_frame(frame).unwrap();
+
+        let config = super::super::definition::FieldTransformerConfig {
+            transformations: vec![
+                super::super::definition::FieldTransformation {
+                    field: "email".to_string(),
+                    operations: vec![
+                        super::super::definition::TransformOperation::Trim,
+                        super::super::definition::TransformOperation::Lower,
+                    ],
+                },
+                super::super::definition::FieldTransformation {
+                    field: "status".to_string(),
+                    operations: vec![super::super::definition::TransformOperation::Lower],
+                },
+            ],
+        };
+
+        let (success, output) = executor
+            .execute_field_transformer(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 2);
+        assert_eq!(output["_rows_transformed"], 2);
+        assert_eq!(output["_fields_modified"], 3);
+        assert_eq!(output["_execution_path"], "batch_frame");
+
+        let result_frame = context.get_batch_frame().unwrap();
+        let result_rows = result_frame.to_json_values().unwrap();
+        assert_eq!(
+            result_frame.metadata().source_step_id.as_deref(),
+            Some("extract_transform")
+        );
+        assert_eq!(result_rows[0]["email"], json!("test@example.com"));
+        assert_eq!(result_rows[0]["status"], json!("active"));
+        assert_eq!(result_rows[1]["status"], json!("pending"));
     }
 }

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::common::databricks::build_loader_connection_string;
 use crate::etl::loaders::database::{DatabaseLoader, DatabaseLoaderFactory};
 use crate::etl::sources::csv::CsvSourceExecutor;
 use crate::etl::transformers::field::FieldTransformerExecutor;
@@ -448,6 +449,28 @@ impl LoadOrchestrator {
                 }
 
                 Ok(conn_str)
+            }
+
+            SourceConfig::Databricks(config) => {
+                let mut resolved_credentials = graphica_core::catalog::connector::Credentials::new(
+                    String::new(),
+                    String::new(),
+                );
+
+                if let Some((username, password)) = credentials {
+                    resolved_credentials.username = username;
+                    resolved_credentials.password = password.clone();
+                    resolved_credentials
+                        .additional
+                        .insert("token".to_string(), password);
+                } else {
+                    tracing::warn!("No Databricks credentials found, connection may fail");
+                }
+
+                Ok(build_loader_connection_string(
+                    config,
+                    &resolved_credentials,
+                ))
             }
 
             _ => {

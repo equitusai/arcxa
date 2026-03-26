@@ -141,20 +141,33 @@ export function InspectorPane({
     return [];
   };
 
-  const upstreamSchema = useMemo(() => {
-    if (!selectedNode) return [];
+  const upstreamNode = useMemo(() => {
+    if (!selectedNode) return undefined;
 
     // Find edges where the selected node is the target
     const incomingEdges = edges.filter((edge) => edge.target === selectedNode.id);
 
-    if (incomingEdges.length === 0) return [];
+    if (incomingEdges.length === 0) return undefined;
 
     // Get the first upstream node (we can enhance this to merge multiple sources later)
     const upstreamEdge = incomingEdges[0];
-    const upstreamNode = nodes.find((node) => node.id === upstreamEdge.source);
-
-    return extractSchemaFromNode(upstreamNode);
+    return nodes.find((node) => node.id === upstreamEdge.source);
   }, [selectedNode, nodes, edges]);
+
+  const upstreamSchema = useMemo(() => {
+    if (!upstreamNode) return [];
+    return extractSchemaFromNode(upstreamNode);
+  }, [upstreamNode]);
+
+  const upstreamDatasourceId =
+    upstreamNode?.data.step_type === 'db_extract'
+      ? upstreamNode.data.config?.datasource_id
+      : undefined;
+
+  const upstreamSourceTable =
+    upstreamNode?.data.step_type === 'db_extract'
+      ? upstreamNode.data.config?.schema_table || upstreamNode.data.config?.table_name
+      : undefined;
 
   // For Data Joiner: detect left and right upstream schemas
   const dualUpstreamSchemas = useMemo(() => {
@@ -710,6 +723,8 @@ export function InspectorPane({
             config={selectedNode.data.config}
             onUpdate={handleUpdateConfig}
             nodeId={selectedNode.id}
+            datasourceId={upstreamDatasourceId}
+            sourceTable={upstreamSourceTable}
             upstreamSchema={upstreamSchema}
           />
         );
@@ -743,6 +758,7 @@ export function InspectorPane({
             config={selectedNode.data.config}
             onUpdate={handleUpdateConfig}
             nodeId={selectedNode.id}
+            upstreamSchema={upstreamSchema}
           />
         );
 
@@ -782,6 +798,7 @@ export function InspectorPane({
             config={selectedNode.data.config}
             onUpdate={handleUpdateConfig}
             nodeId={selectedNode.id}
+            upstreamSchema={upstreamSchema}
           />
         );
 

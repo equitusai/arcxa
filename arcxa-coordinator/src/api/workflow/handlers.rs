@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use utoipa;
 
 use super::types::*;
@@ -17,7 +17,14 @@ use crate::api::workflow::materialization::{
 use crate::api::ApiState;
 use crate::governance::WorkflowResultPersistence;
 use crate::workflows::dataset_input::build_input_adapter;
-use graphica_core::orchestration::workflow::{InputAdapter, WorkflowDefinition};
+use graphica_core::{
+    catalog::{api_types::DataSourceCapabilities, DataSourceCatalog},
+    errors::GraphicaError,
+    orchestration::workflow::{
+        definition::{DbExtractConfig, DbLoaderConfig, LoadMode, StepConfig},
+        InputAdapter, WorkflowDefinition,
+    },
+};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ExecutionHistoryQuery {
@@ -40,6 +47,687 @@ fn map_workflow_engine_error(action: &str, error: anyhow::Error) -> (StatusCode,
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("{} failed: {}", action, message),
     )
+}
+
+const WORKFLOW_ISSUE_STEP_ID: &str = "$workflow";
+
+fn validation_issue(
+    level: WorkflowValidationIssueLevel,
+    step_id: impl Into<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    field: Option<&str>,
+) -> WorkflowValidationIssue {
+    WorkflowValidationIssue {
+        level,
+        step_id: step_id.into(),
+        code: code.into(),
+        message: message.into(),
+        field: field.map(str::to_string),
+    }
+}
+
+fn optional_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn datasource_capabilities(capabilities: Option<DataSourceCapabilities>) -> DataSourceCapabilities {
+    capabilities.unwrap_or(DataSourceCapabilities {
+        can_test: false,
+        can_infer_schema: false,
+        can_query: false,
+        can_read_workflow: false,
+        can_write_workflow: false,
+        supports_parameters: false,
+        supports_tls: false,
+        supports_incremental: false,
+        supports_cancellation: false,
+    })
+}
+
+fn normalize_identifier_variants(value: &str) -> Vec<String> {
+    let cleaned_segments = value
+        .split('.')
+        .map(|segment| {
+            segment
+                .trim()
+                .trim_matches('"')
+                .trim_matches('`')
+                .trim_matches('[')
+                .trim_matches(']')
+                .to_ascii_lowercase()
+        })
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if cleaned_segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::with_capacity(cleaned_segments.len());
+    for start in 0..cleaned_segments.len() {
+        variants.push(cleaned_segments[start..].join("."));
+    }
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+fn table_name_matches(actual: &str, expected: &str) -> bool {
+    let actual_variants = normalize_identifier_variants(actual);
+    let expected_variants = normalize_identifier_variants(expected);
+
+    actual_variants
+        .iter()
+        .any(|actual_variant| expected_variants.contains(actual_variant))
+}
+
+fn validate_definition_shape(definition: &WorkflowDefinition) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+
+    if definition.steps.is_empty() {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            WORKFLOW_ISSUE_STEP_ID,
+            "no_steps",
+            "Workflow must have at least one step",
+            None,
+        ));
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut known_ids = HashSet::new();
+
+    for step in &definition.steps {
+        let step_id = step.id.trim();
+
+        if step_id.is_empty() {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                WORKFLOW_ISSUE_STEP_ID,
+                "empty_step_id",
+                "Step ID cannot be empty",
+                Some("id"),
+            ));
+            continue;
+        }
+
+        if !seen_ids.insert(step_id.to_string()) {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "duplicate_step_id",
+                format!("Duplicate step ID: {}", step_id),
+                Some("id"),
+            ));
+        }
+
+        known_ids.insert(step_id.to_string());
+    }
+
+    for step in &definition.steps {
+        for dependency in &step.depends_on {
+            if !known_ids.contains(dependency) {
+                issues.push(validation_issue(
+                    WorkflowValidationIssueLevel::Error,
+                    step.id.clone(),
+                    "missing_dependency",
+                    format!(
+                        "Step '{}' depends on non-existent step '{}'",
+                        step.id, dependency
+                    ),
+                    Some("depends_on"),
+                ));
+            }
+        }
+
+        match &step.config {
+            StepConfig::DbExtract(config) => {
+                issues.extend(validate_db_extract_shape(step.id.as_str(), config));
+            }
+            StepConfig::DbLoader(config) => {
+                issues.extend(validate_db_loader_shape(step.id.as_str(), config));
+            }
+            _ => {}
+        }
+    }
+
+    issues
+}
+
+fn validate_db_extract_shape(
+    step_id: &str,
+    config: &DbExtractConfig,
+) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+    let table_name = optional_non_empty(config.table_name.as_deref());
+    let query = optional_non_empty(config.query.as_deref());
+
+    if config.datasource_id.trim().is_empty() {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_datasource_id",
+            "db_extract requires a datasource_id",
+            Some("datasource_id"),
+        ));
+    }
+
+    if table_name.is_none() && query.is_none() {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_source_selector",
+            "db_extract requires either table_name or query",
+            Some("table_name"),
+        ));
+    }
+
+    if query.is_some() && config.incremental.unwrap_or(false) {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "incremental_query_mode_unsupported",
+            "db_extract incremental extraction is only supported in table mode",
+            Some("incremental"),
+        ));
+    }
+
+    if config.incremental.unwrap_or(false)
+        && optional_non_empty(config.incremental_column.as_deref()).is_none()
+    {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_incremental_column",
+            "incremental_column is required when incremental extraction is enabled",
+            Some("incremental_column"),
+        ));
+    }
+
+    if config.incremental.unwrap_or(false) && config.last_value.is_none() {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_last_value",
+            "last_value is required when incremental extraction is enabled",
+            Some("last_value"),
+        ));
+    }
+
+    if config.include_schema.unwrap_or(false)
+        && optional_non_empty(config.schema_table.as_deref()).is_none()
+        && table_name.is_none()
+    {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_schema_table",
+            "schema_table or table_name is required when include_schema is enabled",
+            Some("schema_table"),
+        ));
+    }
+
+    issues
+}
+
+fn validate_db_loader_shape(
+    step_id: &str,
+    config: &DbLoaderConfig,
+) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+
+    if config.datasource_id.trim().is_empty() {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_datasource_id",
+            "db_loader requires a datasource_id",
+            Some("datasource_id"),
+        ));
+    }
+
+    if config.table_name.trim().is_empty() {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_target_table",
+            "db_loader requires a target table_name",
+            Some("table_name"),
+        ));
+    }
+
+    if matches!(config.mode, LoadMode::Upsert)
+        && config
+            .key_fields
+            .as_ref()
+            .map(|fields| fields.iter().any(|field| !field.trim().is_empty()))
+            != Some(true)
+    {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_key_fields",
+            "db_loader in upsert mode requires one or more key_fields",
+            Some("key_fields"),
+        ));
+    }
+
+    issues
+}
+
+async fn validate_datasource_backed_steps(
+    catalog: &dyn DataSourceCatalog,
+    definition: &WorkflowDefinition,
+) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+
+    for step in &definition.steps {
+        match &step.config {
+            StepConfig::DbExtract(config) => {
+                issues.extend(validate_db_extract_datasource(catalog, &step.id, config).await);
+            }
+            StepConfig::DbLoader(config) => {
+                issues.extend(validate_db_loader_datasource(catalog, &step.id, config).await);
+            }
+            _ => {}
+        }
+    }
+
+    issues
+}
+
+async fn validate_db_extract_datasource(
+    catalog: &dyn DataSourceCatalog,
+    step_id: &str,
+    config: &DbExtractConfig,
+) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+    let datasource_id = config.datasource_id.trim();
+
+    if datasource_id.is_empty() {
+        return issues;
+    }
+
+    let source = match catalog.get_source(datasource_id).await {
+        Ok(source) => source,
+        Err(GraphicaError::NotFound(_)) => {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "datasource_not_found",
+                format!("Datasource '{}' was not found", datasource_id),
+                Some("datasource_id"),
+            ));
+            return issues;
+        }
+        Err(error) => {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "datasource_lookup_failed",
+                format!("Failed to load datasource '{}': {}", datasource_id, error),
+                Some("datasource_id"),
+            ));
+            return issues;
+        }
+    };
+
+    let capabilities = datasource_capabilities(source.capabilities);
+    let query = optional_non_empty(config.query.as_deref());
+    let table_name = optional_non_empty(config.table_name.as_deref());
+    let schema_table = optional_non_empty(config.schema_table.as_deref());
+
+    if !capabilities.can_read_workflow {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "datasource_not_workflow_readable",
+            format!(
+                "Datasource '{}' is not eligible for workflow extraction",
+                datasource_id
+            ),
+            Some("datasource_id"),
+        ));
+    }
+
+    if query.is_some() && !capabilities.can_query {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "query_not_supported",
+            format!(
+                "Datasource '{}' does not support workflow query mode",
+                datasource_id
+            ),
+            Some("query"),
+        ));
+    }
+
+    if config.incremental.unwrap_or(false) && !capabilities.supports_incremental {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "incremental_not_supported",
+            format!(
+                "Datasource '{}' does not support incremental extraction",
+                datasource_id
+            ),
+            Some("incremental"),
+        ));
+    }
+
+    if !capabilities.can_infer_schema {
+        return issues;
+    }
+
+    let table_for_schema_check = if query.is_some() {
+        schema_table
+    } else {
+        schema_table.or(table_name)
+    };
+
+    let Some(table_for_schema_check) = table_for_schema_check else {
+        return issues;
+    };
+
+    let schema_field = if query.is_some() && schema_table.is_some() {
+        "schema_table"
+    } else if schema_table.is_some() {
+        "schema_table"
+    } else {
+        "table_name"
+    };
+
+    match catalog
+        .infer_schema(
+            datasource_id,
+            Some(table_for_schema_check),
+            config.schema_sample_size.unwrap_or(1000),
+        )
+        .await
+    {
+        Ok(schema) => {
+            if !schema
+                .tables
+                .iter()
+                .any(|table| table_name_matches(&table.name, table_for_schema_check))
+            {
+                issues.push(validation_issue(
+                    WorkflowValidationIssueLevel::Error,
+                    step_id,
+                    "source_table_not_found",
+                    format!(
+                        "Source table '{}' could not be found for datasource '{}'",
+                        table_for_schema_check, datasource_id
+                    ),
+                    Some(schema_field),
+                ));
+            }
+        }
+        Err(error) => {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "source_schema_inference_failed",
+                format!(
+                    "Failed to verify source table '{}' for datasource '{}': {}",
+                    table_for_schema_check, datasource_id, error
+                ),
+                Some(schema_field),
+            ));
+        }
+    }
+
+    issues
+}
+
+async fn validate_db_loader_datasource(
+    catalog: &dyn DataSourceCatalog,
+    step_id: &str,
+    config: &DbLoaderConfig,
+) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+    let datasource_id = config.datasource_id.trim();
+
+    if datasource_id.is_empty() {
+        return issues;
+    }
+
+    let source = match catalog.get_source(datasource_id).await {
+        Ok(source) => source,
+        Err(GraphicaError::NotFound(_)) => {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "datasource_not_found",
+                format!("Datasource '{}' was not found", datasource_id),
+                Some("datasource_id"),
+            ));
+            return issues;
+        }
+        Err(error) => {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "datasource_lookup_failed",
+                format!("Failed to load datasource '{}': {}", datasource_id, error),
+                Some("datasource_id"),
+            ));
+            return issues;
+        }
+    };
+
+    let capabilities = datasource_capabilities(source.capabilities);
+
+    if !capabilities.can_write_workflow {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "datasource_not_workflow_writable",
+            format!(
+                "Datasource '{}' is not eligible for workflow loading",
+                datasource_id
+            ),
+            Some("datasource_id"),
+        ));
+    }
+
+    if matches!(config.mode, LoadMode::Upsert)
+        && config
+            .key_fields
+            .as_ref()
+            .map(|fields| fields.iter().any(|field| !field.trim().is_empty()))
+            != Some(true)
+    {
+        issues.push(validation_issue(
+            WorkflowValidationIssueLevel::Error,
+            step_id,
+            "missing_key_fields",
+            "db_loader in upsert mode requires one or more key_fields",
+            Some("key_fields"),
+        ));
+    }
+
+    if !capabilities.can_infer_schema || config.table_name.trim().is_empty() {
+        return issues;
+    }
+
+    match catalog
+        .infer_schema(datasource_id, Some(config.table_name.as_str()), 1000)
+        .await
+    {
+        Ok(schema) => {
+            if let Some(table) = schema
+                .tables
+                .iter()
+                .find(|table| table_name_matches(&table.name, &config.table_name))
+            {
+                if matches!(config.mode, LoadMode::Upsert) {
+                    let target_columns = table
+                        .columns
+                        .iter()
+                        .map(|column| normalize_identifier_variants(&column.name))
+                        .collect::<Vec<_>>();
+
+                    let invalid_keys = config
+                        .key_fields
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|key_field| {
+                            let key_variants = normalize_identifier_variants(key_field);
+                            !target_columns.iter().any(|column_variants| {
+                                column_variants
+                                    .iter()
+                                    .any(|variant| key_variants.contains(variant))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    if !invalid_keys.is_empty() {
+                        issues.push(validation_issue(
+                            WorkflowValidationIssueLevel::Error,
+                            step_id,
+                            "invalid_key_fields",
+                            format!(
+                                "Key fields not found in target table '{}': {}",
+                                config.table_name,
+                                invalid_keys.join(", ")
+                            ),
+                            Some("key_fields"),
+                        ));
+                    }
+                }
+            } else {
+                issues.push(validation_issue(
+                    WorkflowValidationIssueLevel::Error,
+                    step_id,
+                    "target_table_not_found",
+                    format!(
+                        "Target table '{}' could not be found for datasource '{}'",
+                        config.table_name, datasource_id
+                    ),
+                    Some("table_name"),
+                ));
+            }
+        }
+        Err(error) => {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                step_id,
+                "target_schema_inference_failed",
+                format!(
+                    "Failed to verify target table '{}' for datasource '{}': {}",
+                    config.table_name, datasource_id, error
+                ),
+                Some("table_name"),
+            ));
+        }
+    }
+
+    issues
+}
+
+pub(crate) async fn build_workflow_validation_response(
+    state: &ApiState,
+    definition: &WorkflowDefinition,
+) -> Result<ValidateWorkflowResponse, (StatusCode, String)> {
+    let engine = state.workflow_engine.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Workflow engine not available".to_string(),
+        )
+    })?;
+
+    let mut issues = validate_definition_shape(definition);
+    let mut warnings = Vec::new();
+
+    if let Err(error) = engine.validate_workflow(definition) {
+        if issues.is_empty() {
+            issues.push(validation_issue(
+                WorkflowValidationIssueLevel::Error,
+                WORKFLOW_ISSUE_STEP_ID,
+                "workflow_validation_failed",
+                error.to_string(),
+                None,
+            ));
+        }
+    }
+
+    if let Some(catalog) = state.datasource_catalog.as_ref() {
+        issues.extend(validate_datasource_backed_steps(catalog.as_ref(), definition).await);
+    } else {
+        warnings.push(
+            "Datasource catalog unavailable; datasource-backed runtime validation was skipped"
+                .to_string(),
+        );
+    }
+
+    let valid = !issues
+        .iter()
+        .any(|issue| issue.level == WorkflowValidationIssueLevel::Error);
+
+    Ok(ValidateWorkflowResponse {
+        valid,
+        message: if valid {
+            "Workflow definition is valid".to_string()
+        } else {
+            "Workflow definition has validation issues".to_string()
+        },
+        warnings,
+        step_count: definition.steps.len(),
+        has_conditional_logic: false,
+        has_error_handling: false,
+        issues,
+    })
+}
+
+fn summarize_validation_failure(action: &str, response: &ValidateWorkflowResponse) -> String {
+    let mut messages = response
+        .issues
+        .iter()
+        .filter(|issue| issue.level == WorkflowValidationIssueLevel::Error)
+        .map(|issue| {
+            if issue.step_id == WORKFLOW_ISSUE_STEP_ID {
+                issue.message.clone()
+            } else {
+                format!("{}: {}", issue.step_id, issue.message)
+            }
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+
+    if messages.is_empty() && !response.message.trim().is_empty() {
+        messages.push(response.message.clone());
+    }
+
+    if messages.is_empty() {
+        format!("Workflow {} blocked by validation issues", action)
+    } else {
+        format!(
+            "Workflow {} blocked by validation issues: {}",
+            action,
+            messages.join("; ")
+        )
+    }
+}
+
+pub(crate) async fn ensure_workflow_ready_for_action(
+    state: &ApiState,
+    definition: &WorkflowDefinition,
+    action: &str,
+) -> Result<(), (StatusCode, String)> {
+    let response = build_workflow_validation_response(state, definition).await?;
+
+    if response.valid {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        summarize_validation_failure(action, &response),
+    ))
 }
 
 // ============================================================================
@@ -407,6 +1095,8 @@ pub async fn execute_workflow(
             )
         })?;
 
+    ensure_workflow_ready_for_action(state.as_ref(), &workflow.definition, "execution").await?;
+
     let execution_input =
         serde_json::to_value(&request.input).unwrap_or_else(|_| serde_json::Value::Null);
     let triggered_by = request.context.initiator.clone();
@@ -485,8 +1175,7 @@ pub async fn execute_workflow(
     path = "/api/v1/workflows/validate",
     request_body = WorkflowDefinition,
     responses(
-        (status = 200, description = "Workflow definition is valid. Returns validation result with detailed analysis including warnings for potential issues (empty workflows, orphaned steps, missing dependencies), step count, and feature flags for conditional logic and error handling. Use this endpoint to validate workflow definitions before registration or to check for common configuration errors.", body = serde_json::Value),
-        (status = 400, description = "Workflow definition is invalid. The validation failed due to structural errors, malformed steps, circular dependencies, invalid transformer references, or SHACL constraint violations.", body = String),
+        (status = 200, description = "Workflow definition validation completed. Returns shape validation plus datasource-aware issues for db_extract and db_loader steps when the datasource catalog is available. The response stays successful even when validation finds blocking issues; inspect valid=false and issues[].", body = ValidateWorkflowResponse),
         (status = 503, description = "Workflow engine not available. The validation service is not initialized.", body = String),
     ),
     tag = "Workflow Orchestration"
@@ -496,46 +1185,10 @@ pub async fn execute_workflow(
 pub async fn validate_workflow_definition(
     State(state): State<Arc<ApiState>>,
     Json(definition): Json<WorkflowDefinition>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let engine = state.workflow_engine.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Workflow engine not available".to_string(),
-        )
-    })?;
-
-    match engine.validate_workflow(&definition) {
-        Ok(_) => {
-            // Perform additional semantic checks
-            let mut warnings = Vec::new();
-
-            // Check for orphaned steps
-            if definition.steps.is_empty() {
-                warnings.push("Workflow has no steps defined".to_string());
-            }
-
-            // Check for missing dependencies
-            for step in &definition.steps {
-                for dep in &step.depends_on {
-                    if !definition.steps.iter().any(|s| &s.id == dep) {
-                        let warning =
-                            format!("Step '{}' depends on non-existent step '{}'", step.id, dep);
-                        warnings.push(warning);
-                    }
-                }
-            }
-
-            Ok(Json(serde_json::json!({
-                "valid": true,
-                "message": "Workflow definition is valid",
-                "warnings": warnings,
-                "step_count": definition.steps.len(),
-                "has_conditional_logic": false, // Not yet implemented in WorkflowStep
-                "has_error_handling": false      // Not yet implemented in WorkflowStep
-            })))
-        }
-        Err(e) => Err((StatusCode::BAD_REQUEST, format!("Validation failed: {}", e))),
-    }
+) -> Result<Json<ValidateWorkflowResponse>, (StatusCode, String)> {
+    Ok(Json(
+        build_workflow_validation_response(state.as_ref(), &definition).await?,
+    ))
 }
 
 #[utoipa::path(
@@ -629,6 +1282,8 @@ pub async fn dry_run_workflow(
             "Workflow engine not available".to_string(),
         )
     })?;
+
+    ensure_workflow_ready_for_action(state.as_ref(), &request.definition, "dry-run").await?;
 
     let total_start = std::time::Instant::now();
 
@@ -750,6 +1405,8 @@ pub async fn create_schedule(
                 format!("Workflow not found: {}", workflow_id),
             )
         })?;
+
+    ensure_workflow_ready_for_action(state.as_ref(), &workflow.definition, "scheduling").await?;
 
     // Generate schedule ID
     let schedule_id = request
@@ -1348,7 +2005,7 @@ pub async fn cancel_execution(
 mod tests {
     use super::{
         delete_workflow, get_workflow_details, list_workflow_executions, list_workflows,
-        register_workflow, update_workflow, ExecutionHistoryQuery,
+        register_workflow, update_workflow, validate_workflow_definition, ExecutionHistoryQuery,
     };
     use crate::api::auth::AuthConfig;
     use crate::api::import_jobs::ImportJobManager;
@@ -1358,20 +2015,48 @@ mod tests {
     use crate::storage::LineageStorage;
     use crate::workflows::domain::{ExecutionStatus, WorkflowExecution};
     use crate::workflows::storage::ExecutionStore;
+    use async_trait::async_trait;
     use axum::{
         extract::{Path, Query, State},
         http::StatusCode,
         Json,
     };
     use chrono::{TimeZone, Utc};
+    use graphica_core::catalog::{
+        api_types::{
+            ColumnDefinition, ConnectionTestResult, DataSourceCapabilities, DataSourceResponse,
+            DataSourceStatus, ListDataSourcesRequest, ListDataSourcesResponse, QueryResult,
+            SchemaDefinition, TableDefinition, UpdateDataSourcePatch,
+        },
+        types::{ConnectionDetails, DataSource, DatabricksConfig, PostgreSQLConfig, SourceConfig},
+        DataSourceCatalog,
+    };
+    use graphica_core::errors::GraphicaError;
     use graphica_core::orchestration::workflow::definition::{
-        ConfidenceGateConfig, FallbackStrategy, StepConfig, StepType,
+        ConfidenceGateConfig, DbExtractConfig, DbLoaderConfig, FallbackStrategy, LoadMode,
+        StepConfig, StepType,
     };
     use graphica_core::orchestration::workflow::{
         WorkflowDefinition, WorkflowEngine, WorkflowStep,
     };
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
+
+    #[test]
+    fn table_name_matches_catalog_and_schema_suffixes() {
+        assert!(super::table_name_matches(
+            "bronze.customers",
+            "main.bronze.customers"
+        ));
+        assert!(super::table_name_matches(
+            "`main`.`bronze`.`customers`",
+            "bronze.customers"
+        ));
+        assert!(!super::table_name_matches(
+            "main.bronze.orders",
+            "main.bronze.customers"
+        ));
+    }
 
     fn create_test_api_state() -> (Arc<ApiState>, Arc<WorkflowEngine>, Arc<ExecutionStore>) {
         let temp_dir = TempDir::new().unwrap();
@@ -1455,6 +2140,233 @@ mod tests {
         });
 
         (state, workflow_engine, execution_store)
+    }
+
+    fn create_test_api_state_with_catalog(
+        catalog: Arc<dyn DataSourceCatalog>,
+    ) -> (Arc<ApiState>, Arc<WorkflowEngine>, Arc<ExecutionStore>) {
+        let (state, workflow_engine, execution_store) = create_test_api_state();
+        let mut state_value = (*state).clone();
+        state_value.datasource_catalog = Some(catalog);
+        (Arc::new(state_value), workflow_engine, execution_store)
+    }
+
+    struct MockValidationCatalog {
+        sources: HashMap<String, DataSourceResponse>,
+        schemas: HashMap<(String, String), SchemaDefinition>,
+    }
+
+    impl MockValidationCatalog {
+        fn new() -> Self {
+            Self {
+                sources: HashMap::new(),
+                schemas: HashMap::new(),
+            }
+        }
+
+        fn with_source(mut self, source: DataSourceResponse) -> Self {
+            self.sources.insert(source.source.id.clone(), source);
+            self
+        }
+
+        fn with_table_schema(
+            mut self,
+            datasource_id: &str,
+            table_name: &str,
+            columns: &[&str],
+        ) -> Self {
+            self.schemas.insert(
+                (datasource_id.to_string(), table_name.to_string()),
+                SchemaDefinition {
+                    name: datasource_id.to_string(),
+                    tables: vec![TableDefinition {
+                        name: table_name.to_string(),
+                        columns: columns
+                            .iter()
+                            .map(|column| ColumnDefinition {
+                                name: (*column).to_string(),
+                                data_type: "text".to_string(),
+                                nullable: true,
+                                primary_key: false,
+                                default_value: None,
+                                semantic_type: None,
+                                statistics: None,
+                            })
+                            .collect(),
+                        estimated_rows: None,
+                    }],
+                    relationships: Vec::new(),
+                    indexes: Vec::new(),
+                    inferred_at: Utc::now(),
+                },
+            );
+            self
+        }
+    }
+
+    #[async_trait]
+    impl DataSourceCatalog for MockValidationCatalog {
+        async fn register_source(
+            &self,
+            _source: DataSource,
+        ) -> Result<DataSourceResponse, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn get_source(&self, id: &str) -> Result<DataSourceResponse, GraphicaError> {
+            self.sources
+                .get(id)
+                .cloned()
+                .ok_or_else(|| GraphicaError::NotFound(format!("Data source not found: {}", id)))
+        }
+
+        async fn update_source(
+            &self,
+            _id: &str,
+            _updates: UpdateDataSourcePatch,
+        ) -> Result<DataSourceResponse, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn delete_source(&self, _id: &str) -> Result<(), GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn list_sources(
+            &self,
+            _request: &ListDataSourcesRequest,
+        ) -> Result<ListDataSourcesResponse, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn test_connection(&self, _id: &str) -> Result<ConnectionTestResult, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn infer_schema(
+            &self,
+            id: &str,
+            table_name: Option<&str>,
+            _sample_size: usize,
+        ) -> Result<SchemaDefinition, GraphicaError> {
+            let table_name = table_name.unwrap_or_default().to_string();
+            Ok(self
+                .schemas
+                .get(&(id.to_string(), table_name))
+                .cloned()
+                .unwrap_or(SchemaDefinition {
+                    name: id.to_string(),
+                    tables: Vec::new(),
+                    relationships: Vec::new(),
+                    indexes: Vec::new(),
+                    inferred_at: Utc::now(),
+                }))
+        }
+
+        async fn execute_query(
+            &self,
+            _id: &str,
+            _query: &str,
+            _parameters: HashMap<String, serde_json::Value>,
+            _limit: Option<usize>,
+        ) -> Result<QueryResult, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn mark_synced(&self, _id: &str) -> Result<(), GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: DataSourceStatus,
+            _error_message: Option<String>,
+        ) -> Result<(), GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn search_sources(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<DataSourceResponse>, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn get_sources_by_tag(
+            &self,
+            _tag: &str,
+        ) -> Result<Vec<DataSourceResponse>, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn get_usage_stats(
+            &self,
+            _id: &str,
+        ) -> Result<graphica_core::catalog::client::UsageStatistics, GraphicaError> {
+            Err(GraphicaError::Internal("not implemented".to_string()))
+        }
+
+        async fn get_source_by_title(
+            &self,
+            title: &str,
+        ) -> Result<DataSourceResponse, GraphicaError> {
+            self.sources
+                .values()
+                .find(|source| source.source.title == title)
+                .cloned()
+                .ok_or_else(|| {
+                    GraphicaError::NotFound(format!("Data source not found with title: {}", title))
+                })
+        }
+    }
+
+    fn test_datasource_response(
+        id: &str,
+        capabilities: DataSourceCapabilities,
+    ) -> DataSourceResponse {
+        test_datasource_response_with_config(
+            id,
+            capabilities,
+            SourceConfig::PostgreSQL(PostgreSQLConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "test".to_string(),
+                schema: Some("public".to_string()),
+                ssl_mode: None,
+            }),
+        )
+    }
+
+    fn test_datasource_response_with_config(
+        id: &str,
+        capabilities: DataSourceCapabilities,
+        config: SourceConfig,
+    ) -> DataSourceResponse {
+        DataSourceResponse {
+            source: DataSource {
+                id: id.to_string(),
+                title: format!("Datasource {}", id),
+                description: None,
+                source_type: config.source_type().to_string(),
+                connection: ConnectionDetails {
+                    secret_ref: "vault://test".to_string(),
+                    config,
+                    encryption_enabled: false,
+                    credentials: HashMap::new(),
+                },
+                schema_ref: None,
+                tags: Vec::new(),
+                metadata: HashMap::new(),
+                created_at: None,
+                updated_at: None,
+                last_synced_at: None,
+            },
+            status: DataSourceStatus::Active,
+            last_test_result: None,
+            capabilities: Some(capabilities),
+        }
     }
 
     fn test_definition() -> WorkflowDefinition {
@@ -1571,6 +2483,390 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_flags_missing_extract_datasource() {
+        let catalog = Arc::new(MockValidationCatalog::new());
+        let (state, _, _) = create_test_api_state_with_catalog(catalog);
+
+        let definition = WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "extract_customers".to_string(),
+                step_type: StepType::DbExtract,
+                config: StepConfig::DbExtract(DbExtractConfig {
+                    datasource_id: "missing_source".to_string(),
+                    table_name: Some("customers".to_string()),
+                    schema_table: None,
+                    query: None,
+                    incremental: None,
+                    incremental_column: None,
+                    last_value: None,
+                    batch_size: 50_000,
+                    columns: None,
+                    include_schema: None,
+                    schema_sample_size: None,
+                }),
+                depends_on: Vec::new(),
+            }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!response.valid);
+        assert!(response
+            .issues
+            .iter()
+            .any(|issue| issue.code == "datasource_not_found"
+                && issue.step_id == "extract_customers"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_flags_unwritable_loader_datasource() {
+        let catalog = Arc::new(
+            MockValidationCatalog::new().with_source(test_datasource_response(
+                "readonly_target",
+                DataSourceCapabilities {
+                    can_test: true,
+                    can_infer_schema: true,
+                    can_query: true,
+                    can_read_workflow: true,
+                    can_write_workflow: false,
+                    supports_parameters: true,
+                    supports_tls: true,
+                    supports_incremental: true,
+                    supports_cancellation: true,
+                },
+            )),
+        );
+        let (state, _, _) = create_test_api_state_with_catalog(catalog);
+
+        let definition = WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "load_customers".to_string(),
+                step_type: StepType::DbLoader,
+                config: StepConfig::DbLoader(DbLoaderConfig {
+                    datasource_id: "readonly_target".to_string(),
+                    table_name: "customers".to_string(),
+                    mode: LoadMode::Insert,
+                    key_fields: None,
+                    batch_size: 1_000,
+                    create_table: false,
+                    entity_uri: None,
+                }),
+                depends_on: Vec::new(),
+            }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!response.valid);
+        assert!(response.issues.iter().any(|issue| {
+            issue.code == "datasource_not_workflow_writable" && issue.step_id == "load_customers"
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_flags_missing_upsert_key_fields() {
+        let (state, _, _) = create_test_api_state();
+
+        let definition = WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "upsert_customers".to_string(),
+                step_type: StepType::DbLoader,
+                config: StepConfig::DbLoader(DbLoaderConfig {
+                    datasource_id: "target_ds".to_string(),
+                    table_name: "customers".to_string(),
+                    mode: LoadMode::Upsert,
+                    key_fields: None,
+                    batch_size: 1_000,
+                    create_table: false,
+                    entity_uri: None,
+                }),
+                depends_on: Vec::new(),
+            }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!response.valid);
+        assert!(response
+            .issues
+            .iter()
+            .any(|issue| issue.code == "missing_key_fields"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_accepts_valid_datasource_workflow() {
+        let capabilities = DataSourceCapabilities {
+            can_test: true,
+            can_infer_schema: true,
+            can_query: true,
+            can_read_workflow: true,
+            can_write_workflow: true,
+            supports_parameters: true,
+            supports_tls: true,
+            supports_incremental: true,
+            supports_cancellation: true,
+        };
+        let catalog = Arc::new(
+            MockValidationCatalog::new()
+                .with_source(test_datasource_response("source_ds", capabilities.clone()))
+                .with_source(test_datasource_response("target_ds", capabilities))
+                .with_table_schema("source_ds", "customers", &["customer_id", "email"])
+                .with_table_schema("target_ds", "customers_curated", &["customer_id", "email"]),
+        );
+        let (state, _, _) = create_test_api_state_with_catalog(catalog);
+
+        let definition = WorkflowDefinition {
+            steps: vec![
+                WorkflowStep {
+                    id: "extract_customers".to_string(),
+                    step_type: StepType::DbExtract,
+                    config: StepConfig::DbExtract(DbExtractConfig {
+                        datasource_id: "source_ds".to_string(),
+                        table_name: Some("customers".to_string()),
+                        schema_table: None,
+                        query: None,
+                        incremental: Some(true),
+                        incremental_column: Some("customer_id".to_string()),
+                        last_value: None,
+                        batch_size: 50_000,
+                        columns: Some(vec!["customer_id".to_string(), "email".to_string()]),
+                        include_schema: Some(true),
+                        schema_sample_size: Some(250),
+                    }),
+                    depends_on: Vec::new(),
+                },
+                WorkflowStep {
+                    id: "load_customers".to_string(),
+                    step_type: StepType::DbLoader,
+                    config: StepConfig::DbLoader(DbLoaderConfig {
+                        datasource_id: "target_ds".to_string(),
+                        table_name: "customers_curated".to_string(),
+                        mode: LoadMode::Upsert,
+                        key_fields: Some(vec!["customer_id".to_string()]),
+                        batch_size: 1_000,
+                        create_table: false,
+                        entity_uri: None,
+                    }),
+                    depends_on: vec!["extract_customers".to_string()],
+                },
+            ],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(response.valid, "{:?}", response.issues);
+        assert!(response.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_accepts_valid_databricks_workflow() {
+        let capabilities = DataSourceCapabilities {
+            can_test: true,
+            can_infer_schema: true,
+            can_query: true,
+            can_read_workflow: true,
+            can_write_workflow: true,
+            supports_parameters: true,
+            supports_tls: true,
+            supports_incremental: true,
+            supports_cancellation: true,
+        };
+        let catalog = Arc::new(
+            MockValidationCatalog::new()
+                .with_source(test_datasource_response_with_config(
+                    "dbx_source",
+                    capabilities.clone(),
+                    SourceConfig::Databricks(DatabricksConfig {
+                        workspace_url: "https://adb-123.azuredatabricks.net".to_string(),
+                        http_path: "/sql/1.0/warehouses/abc123".to_string(),
+                        catalog: Some("main".to_string()),
+                        schema: Some("bronze".to_string()),
+                        warehouse_id: Some("abc123".to_string()),
+                    }),
+                ))
+                .with_source(test_datasource_response_with_config(
+                    "dbx_target",
+                    capabilities,
+                    SourceConfig::Databricks(DatabricksConfig {
+                        workspace_url: "https://adb-123.azuredatabricks.net".to_string(),
+                        http_path: "/sql/1.0/warehouses/abc123".to_string(),
+                        catalog: Some("main".to_string()),
+                        schema: Some("silver".to_string()),
+                        warehouse_id: Some("abc123".to_string()),
+                    }),
+                ))
+                .with_table_schema("dbx_source", "bronze.customers", &["customer_id", "email"])
+                .with_table_schema(
+                    "dbx_target",
+                    "silver.customers_curated",
+                    &["customer_id", "email"],
+                ),
+        );
+        let (state, _, _) = create_test_api_state_with_catalog(catalog);
+
+        let definition = WorkflowDefinition {
+            steps: vec![
+                WorkflowStep {
+                    id: "extract_customers".to_string(),
+                    step_type: StepType::DbExtract,
+                    config: StepConfig::DbExtract(DbExtractConfig {
+                        datasource_id: "dbx_source".to_string(),
+                        table_name: Some("bronze.customers".to_string()),
+                        schema_table: Some("bronze.customers".to_string()),
+                        query: None,
+                        incremental: Some(true),
+                        incremental_column: Some("customer_id".to_string()),
+                        last_value: None,
+                        batch_size: 50_000,
+                        columns: Some(vec!["customer_id".to_string(), "email".to_string()]),
+                        include_schema: Some(true),
+                        schema_sample_size: Some(250),
+                    }),
+                    depends_on: Vec::new(),
+                },
+                WorkflowStep {
+                    id: "load_customers".to_string(),
+                    step_type: StepType::DbLoader,
+                    config: StepConfig::DbLoader(DbLoaderConfig {
+                        datasource_id: "dbx_target".to_string(),
+                        table_name: "silver.customers_curated".to_string(),
+                        mode: LoadMode::Upsert,
+                        key_fields: Some(vec!["customer_id".to_string()]),
+                        batch_size: 1_000,
+                        create_table: false,
+                        entity_uri: None,
+                    }),
+                    depends_on: vec!["extract_customers".to_string()],
+                },
+            ],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(response.valid, "{:?}", response.issues);
+        assert!(response.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validate_workflow_definition_accepts_catalog_qualified_databricks_workflow() {
+        let capabilities = DataSourceCapabilities {
+            can_test: true,
+            can_infer_schema: true,
+            can_query: true,
+            can_read_workflow: true,
+            can_write_workflow: true,
+            supports_parameters: true,
+            supports_tls: true,
+            supports_incremental: true,
+            supports_cancellation: true,
+        };
+        let catalog = Arc::new(
+            MockValidationCatalog::new()
+                .with_source(test_datasource_response_with_config(
+                    "dbx_source",
+                    capabilities.clone(),
+                    SourceConfig::Databricks(DatabricksConfig {
+                        workspace_url: "https://adb-123.azuredatabricks.net".to_string(),
+                        http_path: "/sql/1.0/warehouses/abc123".to_string(),
+                        catalog: Some("main".to_string()),
+                        schema: Some("bronze".to_string()),
+                        warehouse_id: Some("abc123".to_string()),
+                    }),
+                ))
+                .with_source(test_datasource_response_with_config(
+                    "dbx_target",
+                    capabilities,
+                    SourceConfig::Databricks(DatabricksConfig {
+                        workspace_url: "https://adb-123.azuredatabricks.net".to_string(),
+                        http_path: "/sql/1.0/warehouses/abc123".to_string(),
+                        catalog: Some("main".to_string()),
+                        schema: Some("silver".to_string()),
+                        warehouse_id: Some("abc123".to_string()),
+                    }),
+                ))
+                .with_table_schema("dbx_source", "bronze.customers", &["customer_id", "email"])
+                .with_table_schema(
+                    "dbx_target",
+                    "silver.customers_curated",
+                    &["customer_id", "email"],
+                ),
+        );
+        let (state, _, _) = create_test_api_state_with_catalog(catalog);
+
+        let definition = WorkflowDefinition {
+            steps: vec![
+                WorkflowStep {
+                    id: "extract_customers".to_string(),
+                    step_type: StepType::DbExtract,
+                    config: StepConfig::DbExtract(DbExtractConfig {
+                        datasource_id: "dbx_source".to_string(),
+                        table_name: Some("main.bronze.customers".to_string()),
+                        schema_table: Some("main.bronze.customers".to_string()),
+                        query: None,
+                        incremental: Some(true),
+                        incremental_column: Some("customer_id".to_string()),
+                        last_value: None,
+                        batch_size: 50_000,
+                        columns: Some(vec!["customer_id".to_string(), "email".to_string()]),
+                        include_schema: Some(true),
+                        schema_sample_size: Some(250),
+                    }),
+                    depends_on: Vec::new(),
+                },
+                WorkflowStep {
+                    id: "load_customers".to_string(),
+                    step_type: StepType::DbLoader,
+                    config: StepConfig::DbLoader(DbLoaderConfig {
+                        datasource_id: "dbx_target".to_string(),
+                        table_name: "main.silver.customers_curated".to_string(),
+                        mode: LoadMode::Upsert,
+                        key_fields: Some(vec!["customer_id".to_string()]),
+                        batch_size: 1_000,
+                        create_table: false,
+                        entity_uri: None,
+                    }),
+                    depends_on: vec!["extract_customers".to_string()],
+                },
+            ],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        };
+
+        let response = validate_workflow_definition(State(state), Json(definition))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(response.valid, "{:?}", response.issues);
+        assert!(response.issues.is_empty());
     }
 
     #[tokio::test]

@@ -94,7 +94,7 @@
 //! - ✅ DB2Extractor
 //! - ✅ OracleExtractor
 //! - ✅ SAPHANAExtractor
-//! - ✅ DatabricksExtractor (connector-backed scaffold)
+//! - ✅ DatabricksExtractor (connector-backed extraction)
 //! - ✅ CSV extractor
 //!
 //! **Next**

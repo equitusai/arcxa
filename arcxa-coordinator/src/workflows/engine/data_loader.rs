@@ -9,9 +9,13 @@
 //!         ↓
 //!    DataLoader (this module)
 //!         ↓
-//! DatabaseLoader (Postgres, DB2, Oracle)
+//! DatabaseLoader (Postgres, Databricks, legacy DB2/Oracle adapters)
 //! ```
 
+use crate::common::databricks::{
+    build_loader_connection_string, workflow_connection_to_databricks,
+};
+use crate::common::oracle::build_workflow_connection_string as build_oracle_workflow_connection_string;
 use crate::etl::loaders::database::{DatabaseLoader, DatabaseLoaderFactory, LoadMode};
 use crate::workflows::domain::{
     DataRow, DataSource, DataSourceReader, DatabaseConnectionConfig, DatabaseType,
@@ -213,7 +217,9 @@ impl DataLoader {
 
         if loader_guard.is_none() {
             // Build connection string from config
-            let connection_string = self.build_connection_string();
+            let connection_string = self
+                .build_connection_string()
+                .context("Failed to build database connection string")?;
 
             // Create database loader
             let db_type = match self.database_type {
@@ -265,53 +271,47 @@ impl DataLoader {
     }
 
     /// Build database connection string from config
-    fn build_connection_string(&self) -> String {
+    fn build_connection_string(&self) -> Result<String> {
         match self.database_type {
-            DatabaseType::Postgres => {
-                format!(
+            DatabaseType::Postgres => Ok(format!(
                     "host={} port={} dbname={} user={} password={}",
                     self.connection_config.host,
                     self.connection_config.port,
                     self.connection_config.database,
                     self.connection_config.username,
                     self.connection_config.password
-                )
-            }
-            DatabaseType::DB2 => {
-                format!(
+                )),
+            DatabaseType::DB2 => Ok(format!(
                     "DRIVER={{IBM DB2 ODBC DRIVER}};DATABASE={};HOSTNAME={};PORT={};PROTOCOL=TCPIP;UID={};PWD={}",
                     self.connection_config.database,
                     self.connection_config.host,
                     self.connection_config.port,
                     self.connection_config.username,
                     self.connection_config.password
-                )
-            }
-            DatabaseType::MySQL => {
-                format!(
+                )),
+            DatabaseType::MySQL => Ok(format!(
                     "mysql://{}:{}@{}:{}/{}",
                     self.connection_config.username,
                     self.connection_config.password,
                     self.connection_config.host,
                     self.connection_config.port,
                     self.connection_config.database
-                )
+                )),
+            DatabaseType::Databricks => {
+                let (config, credentials) =
+                    workflow_connection_to_databricks(&self.connection_config)?;
+                Ok(build_loader_connection_string(&config, &credentials))
             }
-            DatabaseType::Oracle
-            | DatabaseType::SAPHANA
-            | DatabaseType::Snowflake
-            | DatabaseType::Databricks => {
-                // TODO: Implement Oracle, SAP HANA, Snowflake, and Databricks connection strings in Phase 3
-                format!(
-                    "{}://{}:{}@{}:{}/{}",
-                    self.database_type.to_string().to_lowercase(),
-                    self.connection_config.username,
-                    self.connection_config.password,
-                    self.connection_config.host,
-                    self.connection_config.port,
-                    self.connection_config.database
-                )
-            }
+            DatabaseType::Oracle => build_oracle_workflow_connection_string(&self.connection_config),
+            DatabaseType::SAPHANA | DatabaseType::Snowflake => Ok(format!(
+                "{}://{}:{}@{}:{}/{}",
+                self.database_type.to_string().to_lowercase(),
+                self.connection_config.username,
+                self.connection_config.password,
+                self.connection_config.host,
+                self.connection_config.port,
+                self.connection_config.database
+            )),
         }
     }
 }
@@ -361,7 +361,7 @@ mod tests {
         };
 
         let loader = DataLoader::new(DatabaseType::Postgres, config, load_config);
-        let conn_str = loader.build_connection_string();
+        let conn_str = loader.build_connection_string().unwrap();
 
         assert!(conn_str.contains("host=localhost"));
         assert!(conn_str.contains("port=5432"));
@@ -398,5 +398,67 @@ mod tests {
         let obj = value.as_object().unwrap();
         assert_eq!(obj.get("id").unwrap(), &json!("123"));
         assert_eq!(obj.get("name").unwrap(), &json!("Alice"));
+    }
+
+    #[test]
+    fn test_build_databricks_connection_string() {
+        let mut extra_params = HashMap::new();
+        extra_params.insert(
+            "http_path".to_string(),
+            "/sql/1.0/warehouses/abc123".to_string(),
+        );
+        extra_params.insert("schema".to_string(), "bronze".to_string());
+
+        let config = DatabaseConnectionConfig {
+            host: "https://adb-123.azuredatabricks.net".to_string(),
+            port: 443,
+            database: "main".to_string(),
+            username: "svc_arcxa".to_string(),
+            password: "token-value".to_string(),
+            ssl_mode: Some("require".to_string()),
+            extra_params,
+        };
+
+        let load_config = LoadConfig {
+            table_name: "events".to_string(),
+            ..Default::default()
+        };
+
+        let loader = DataLoader::new(DatabaseType::Databricks, config, load_config);
+        let conn_str = loader.build_connection_string().unwrap();
+
+        assert!(conn_str.contains("workspace_url=https://adb-123.azuredatabricks.net"));
+        assert!(conn_str.contains("http_path=/sql/1.0/warehouses/abc123"));
+        assert!(conn_str.contains("catalog=main"));
+        assert!(conn_str.contains("schema=bronze"));
+        assert!(conn_str.contains("token=token-value"));
+    }
+
+    #[test]
+    fn test_build_oracle_connection_string_accepts_camel_case_service_name() {
+        let mut extra_params = HashMap::new();
+        extra_params.insert("serviceName".to_string(), "ORCLPDB1".to_string());
+
+        let config = DatabaseConnectionConfig {
+            host: "oracle.example.com".to_string(),
+            port: 1521,
+            database: String::new(),
+            username: "etl_user".to_string(),
+            password: "secret".to_string(),
+            ssl_mode: None,
+            extra_params,
+        };
+
+        let load_config = LoadConfig {
+            table_name: "CUSTOMERS".to_string(),
+            ..Default::default()
+        };
+
+        let loader = DataLoader::new(DatabaseType::Oracle, config, load_config);
+        let conn_str = loader.build_connection_string().unwrap();
+
+        assert!(conn_str.contains("DBQ=//oracle.example.com:1521/ORCLPDB1"));
+        assert!(conn_str.contains("UID=etl_user"));
+        assert!(conn_str.contains("PWD=secret"));
     }
 }

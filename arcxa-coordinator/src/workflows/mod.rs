@@ -99,6 +99,7 @@ pub mod cicd;
 pub mod cli;
 pub mod dataset_input;
 pub mod db_extract_callback;
+pub mod db_loader;
 pub mod db_loader_callback;
 pub mod declarative;
 pub mod deployment;

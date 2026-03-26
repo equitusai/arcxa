@@ -133,6 +133,7 @@ pub enum DatabaseType {
     SAPHANA,
     MySQL,
     Snowflake,
+    Databricks,
 }
 
 impl fmt::Display for DatabaseType {
@@ -144,6 +145,7 @@ impl fmt::Display for DatabaseType {
             Self::SAPHANA => write!(f, "saphana"),
             Self::MySQL => write!(f, "mysql"),
             Self::Snowflake => write!(f, "snowflake"),
+            Self::Databricks => write!(f, "databricks"),
         }
     }
 }
@@ -470,6 +472,18 @@ mod tests {
         assert!(key.starts_with("db2:orders:"));
         assert!(key.contains("customer_id=C123"));
         assert!(key.contains("order_id=O456"));
+    }
+
+    #[test]
+    fn test_row_id_databricks() {
+        let mut pk = BTreeMap::new();
+        pk.insert("event_id".to_string(), "evt-123".to_string());
+
+        let row_id = RowId::database(DatabaseType::Databricks, "main.bronze.events", pk);
+        assert_eq!(
+            row_id.to_key(),
+            "databricks:main.bronze.events:event_id=evt-123"
+        );
     }
 
     #[test]

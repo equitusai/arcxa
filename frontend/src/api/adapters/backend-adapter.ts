@@ -21,6 +21,7 @@
 export interface BackendDatasourceImportRequest {
   source_id: string;
   table: string;
+  schema?: string;
   name?: string;
   where_clause?: string;
   columns?: string[];
@@ -33,6 +34,7 @@ export interface BackendDatasourceImportRequest {
 
 export interface BackendBatchTableImport {
   table: string;
+  schema?: string;
   name?: string;
   where_clause?: string;
   columns?: string[];
@@ -150,6 +152,7 @@ export function transformDatasourceImportRequest(
   return {
     source_id: frontendRequest.datasource_id,
     table: frontendRequest.table_name,
+    schema: frontendRequest.schema,
     name: frontendRequest.dataset_name,
     description: frontendRequest.description,
     tags: frontendRequest.tags,
@@ -178,6 +181,7 @@ export function transformBatchImportRequest(
     source_id: frontendRequest.datasource_id,
     tables: frontendRequest.tables.map(table => ({
       table: table.table_name,
+      schema: table.schema,
       name: table.dataset_name,
       // Note: Backend doesn't have description/tags per table in batch mode
     })),
@@ -203,13 +207,13 @@ export function transformSchemaDiscoveryRequest(
   }
 ): {
   sourceId: string;
-  table_name: string | null;
-  sample_size: number;
+  tableName: string | null;
+  sampleSize: number;
 } {
   return {
     sourceId: datasourceId,
-    table_name: options?.table_name ?? null,
-    sample_size: options?.sample_size ?? 100,
+    tableName: options?.table_name ?? null,
+    sampleSize: options?.sample_size ?? 100,
   };
 }
 

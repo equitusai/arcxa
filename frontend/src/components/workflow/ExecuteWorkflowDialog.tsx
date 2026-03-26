@@ -31,6 +31,7 @@ interface ExecuteWorkflowDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   workflowName: string;
+  supportsInputlessExecution?: boolean;
   isExecuting?: boolean;
   onExecute: (request: WorkflowExecutionRequest) => Promise<void>;
 }
@@ -67,10 +68,13 @@ export function ExecuteWorkflowDialog({
   open,
   onOpenChange,
   workflowName,
+  supportsInputlessExecution = false,
   isExecuting = false,
   onExecute,
 }: ExecuteWorkflowDialogProps) {
-  const [inputMode, setInputMode] = useState<'json' | 'dataset'>('json');
+  const [inputMode, setInputMode] = useState<'none' | 'json' | 'dataset'>(
+    supportsInputlessExecution ? 'none' : 'json'
+  );
   const [jsonInput, setJsonInput] = useState(DEFAULT_JSON_INPUT);
   const [selectedDatasetId, setSelectedDatasetId] = useState('');
   const [batchSize, setBatchSize] = useState('1000');
@@ -87,6 +91,20 @@ export function ExecuteWorkflowDialog({
     () => datasets.find((dataset) => dataset.id === selectedDatasetId),
     [datasets, selectedDatasetId]
   );
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    setInputMode((currentMode) => {
+      if (supportsInputlessExecution) {
+        return currentMode === 'json' || currentMode === 'dataset' ? currentMode : 'none';
+      }
+
+      return currentMode === 'none' ? 'json' : currentMode;
+    });
+  }, [open, supportsInputlessExecution]);
 
   useEffect(() => {
     if (!open || inputMode !== 'dataset' || selectedDatasetId || datasets.length === 0) {
@@ -110,6 +128,13 @@ export function ExecuteWorkflowDialog({
                 dataset_id: selectedDatasetId,
                 batch_size: parsePositiveInt(batchSize),
                 limit: parsePositiveInt(limit),
+              },
+            }
+          : inputMode === 'none'
+          ? {
+              input: {
+                type: 'json',
+                data: null,
               },
             }
           : {
@@ -138,8 +163,9 @@ export function ExecuteWorkflowDialog({
         <DialogHeader>
           <DialogTitle>Execute Workflow</DialogTitle>
           <DialogDescription>
-            Run {workflowName || 'this workflow'} from a JSON payload or a materialized dataset,
-            and optionally write the final rows back into the catalogue.
+            Run {workflowName || 'this workflow'} from source-driven execution, a JSON payload,
+            or a materialized dataset, and optionally write the final rows back into the
+            catalogue.
           </DialogDescription>
         </DialogHeader>
 
@@ -155,18 +181,35 @@ export function ExecuteWorkflowDialog({
             <CardContent className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="workflow-input-mode">Input mode</Label>
-                <Select value={inputMode} onValueChange={(value: 'json' | 'dataset') => setInputMode(value)}>
+                <Select
+                  value={inputMode}
+                  onValueChange={(value: 'none' | 'json' | 'dataset') => setInputMode(value)}
+                >
                   <SelectTrigger id="workflow-input-mode">
                     <SelectValue placeholder="Select execution input" />
                   </SelectTrigger>
                   <SelectContent>
+                    {supportsInputlessExecution && (
+                      <SelectItem value="none">No external input</SelectItem>
+                    )}
                     <SelectItem value="json">JSON payload</SelectItem>
                     <SelectItem value="dataset">Materialized dataset</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
-              {inputMode === 'json' ? (
+              {inputMode === 'none' ? (
+                <div className="rounded-sm border border-border bg-muted/30 p-4 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Database className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-sm font-medium">Source-driven execution</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    This workflow includes source steps that fetch their own data, so ARCXA will
+                    execute it without requiring an external JSON payload.
+                  </p>
+                </div>
+              ) : inputMode === 'json' ? (
                 <div className="space-y-2">
                   <Label htmlFor="workflow-json-input">Input JSON</Label>
                   <Textarea

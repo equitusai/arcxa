@@ -7,17 +7,26 @@ import React from 'react';
 import { Sigma, AlertCircle } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import type { AggregatorConfig } from '@/lib/workflow-etl-config';
+import type { AggregatorConfig, DetectedField } from '@/lib/workflow-etl-config';
 
 export interface AggregatorConfigFormProps {
   config?: AggregatorConfig;
   onUpdate: (updates: Partial<AggregatorConfig>) => void;
   nodeId?: string;
+  upstreamSchema?: DetectedField[];
 }
 
-export function AggregatorConfigForm({ config, onUpdate }: AggregatorConfigFormProps) {
+export function AggregatorConfigForm({
+  config,
+  onUpdate,
+  upstreamSchema = [],
+}: AggregatorConfigFormProps) {
   const groupBy = config?.group_by || [];
   const aggregations = config?.aggregations || [];
+  const upstreamFields = upstreamSchema.map((field) => field.name);
+  const invalidGroupByFields = groupBy.filter(
+    (field) => upstreamFields.length > 0 && !upstreamFields.includes(field)
+  );
 
   return (
     <div className="space-y-4">
@@ -48,6 +57,15 @@ export function AggregatorConfigForm({ config, onUpdate }: AggregatorConfigFormP
         </p>
       </div>
 
+      {upstreamFields.length > 0 && (
+        <div className="space-y-2">
+          <Label className="text-xs font-medium text-foreground">Available Fields</Label>
+          <div className="p-3 bg-background-secondary border border-border rounded text-xs text-muted-foreground">
+            {upstreamFields.join(', ')}
+          </div>
+        </div>
+      )}
+
       {/* Aggregation Functions */}
       <div className="space-y-2">
         <Label className="text-xs font-medium text-foreground">
@@ -74,6 +92,15 @@ export function AggregatorConfigForm({ config, onUpdate }: AggregatorConfigFormP
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800">
             At least one group-by field is required
+          </div>
+        </div>
+      )}
+
+      {invalidGroupByFields.length > 0 && (
+        <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
+          <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="text-amber-800">
+            Group-by fields not found in the upstream schema: {invalidGroupByFields.join(', ')}
           </div>
         </div>
       )}

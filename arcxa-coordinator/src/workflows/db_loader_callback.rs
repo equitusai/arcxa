@@ -13,10 +13,10 @@
 //! Current implementation uses batched multi-row INSERTs with configurable batch size.
 //! This provides significant performance improvement while maintaining transaction safety.
 
-use crate::etl::loaders::database::{DatabaseLoaderFactory, LoadMode as EtlLoadMode};
 use crate::governance::rdf_store::GraphicaRdfStore;
 use crate::mapping::loader::odbc_db2_connection::OdbcDB2Connection;
 use crate::mapping::loader::{DB2Connection, SqlParam, SqlParamType};
+use crate::workflows::db_loader;
 use anyhow::{anyhow, Context, Result};
 use graphica_core::catalog::{types::SourceConfig, Credentials, DataSourceCatalog};
 use graphica_core::secrets::providers::SecretStoreRegistry;
@@ -571,110 +571,141 @@ pub fn create_db_loader_callback(
     rdf_store: Option<Arc<GraphicaRdfStore>>,
     secret_store_registry: Option<Arc<graphica_core::secrets::providers::SecretStoreRegistry>>,
 ) -> Arc<graphica_core::orchestration::workflow::executor::DbLoaderCallback> {
-    Arc::new(Box::new(move |datasource_id, table_name, rows, mode| {
-        let catalog = catalog.clone();
-        let rdf_store = rdf_store.clone();
-        let secret_store_registry = secret_store_registry.clone();
-        let datasource_id = datasource_id.to_string();
-        let table_name = table_name.to_string();
-        let mode = mode.to_string();
+    Arc::new(Box::new(
+        move |datasource_id, table_name, rows, mode, key_fields| {
+            let catalog = catalog.clone();
+            let rdf_store = rdf_store.clone();
+            let secret_store_registry = secret_store_registry.clone();
+            let datasource_id = datasource_id.to_string();
+            let table_name = table_name.to_string();
+            let mode = mode.to_string();
+            let key_fields = key_fields.clone();
 
-        Box::pin(async move {
-            tracing::info!(
-                "DB Loader Callback: Loading {} rows to {}.{} (mode: {})",
-                rows.len(),
-                datasource_id,
-                table_name,
-                mode
-            );
+            Box::pin(async move {
+                tracing::info!(
+                    "DB Loader Callback: Loading {} rows to {}.{} (mode: {})",
+                    rows.len(),
+                    datasource_id,
+                    table_name,
+                    mode
+                );
 
-            // Resolve datasource from catalog (supports both URN and title lookup)
-            let datasource_response = resolve_datasource(&catalog, &datasource_id)
-                .await
-                .with_context(|| format!("Failed to resolve datasource: {}", datasource_id))?;
-
-            let credentials =
-                resolve_credentials(&datasource_response.source, secret_store_registry.clone())
+                // Resolve datasource from catalog (supports both URN and title lookup)
+                let datasource_response = resolve_datasource(&catalog, &datasource_id)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to resolve credentials for datasource {}",
-                            datasource_id
-                        )
-                    })?;
+                    .with_context(|| format!("Failed to resolve datasource: {}", datasource_id))?;
 
-            // Check for entity URI in row metadata (enables ontology-driven loading)
-            let entity_uri = detect_entity_uri(&rows);
+                let credentials =
+                    resolve_credentials(&datasource_response.source, secret_store_registry.clone())
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to resolve credentials for datasource {}",
+                                datasource_id
+                            )
+                        })?;
 
-            if let Some(uri) = entity_uri {
-                if let Some(store) = rdf_store {
-                    tracing::info!("Ontology-driven loading enabled for entity: {}", uri);
+                // Check for entity URI in row metadata (enables ontology-driven loading)
+                let entity_uri = detect_entity_uri(&rows);
 
-                    // Use ontology-driven loading path (DB2-only for now)
-                    let db2_config = match &datasource_response.source.connection.config {
-                        SourceConfig::DB2(config) => config,
-                        other => {
-                            return Err(anyhow!(
+                if let Some(uri) = entity_uri {
+                    if let Some(store) = rdf_store {
+                        tracing::info!("Ontology-driven loading enabled for entity: {}", uri);
+
+                        // Use ontology-driven loading path (DB2-only for now)
+                        let db2_config = match &datasource_response.source.connection.config {
+                            SourceConfig::DB2(config) => config,
+                            other => {
+                                return Err(anyhow!(
                                 "Ontology-driven loading currently only supports DB2, found: {:?}",
                                 other
                             ));
-                        }
-                    };
+                            }
+                        };
 
-                    return use_ontology_driven_loader(
-                        &uri,
-                        store,
-                        &datasource_id,
-                        &table_name,
-                        db2_config,
-                        &credentials,
-                        rows,
-                        &mode,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("Ontology-driven loading failed for entity: {}", uri)
-                    });
-                } else {
-                    tracing::warn!(
+                        return use_ontology_driven_loader(
+                            &uri,
+                            store,
+                            &datasource_id,
+                            &table_name,
+                            db2_config,
+                            &credentials,
+                            rows,
+                            &mode,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Ontology-driven loading failed for entity: {}", uri)
+                        });
+                    } else {
+                        tracing::warn!(
                         "Entity URI detected ({}) but no RDF store available, falling back to legacy loading",
                         uri
                     );
+                    }
                 }
-            }
 
-            // Fallback to legacy direct loading
-            tracing::debug!(
-                "Using legacy direct loading for {}.{}",
-                datasource_id,
-                table_name
-            );
+                // Fallback to legacy direct loading
+                tracing::debug!(
+                    "Using legacy direct loading for {}.{}",
+                    datasource_id,
+                    table_name
+                );
 
-            // Extract connection config
-            let connection_config = &datasource_response.source.connection.config;
+                let rows = db_loader::common::sanitize_rows_for_database_load(rows);
 
-            // Match on datasource type and load data
-            match connection_config {
-                SourceConfig::DB2(config) => {
-                    load_to_db2(config, &credentials, &table_name, rows, &mode).await
+                // Extract connection config
+                let connection_config = &datasource_response.source.connection.config;
+
+                // Match on datasource type and load data
+                match connection_config {
+                    SourceConfig::DB2(config) => {
+                        load_to_db2(config, &credentials, &table_name, rows, &mode).await
+                    }
+                    SourceConfig::PostgreSQL(config) => {
+                        db_loader::postgres::load(
+                            config,
+                            &credentials,
+                            &table_name,
+                            rows,
+                            &mode,
+                            key_fields.as_deref(),
+                        )
+                        .await
+                    }
+                    SourceConfig::Oracle(_) => {
+                        db_loader::oracle::load(
+                            &datasource_response.source,
+                            &table_name,
+                            rows,
+                            &mode,
+                            key_fields.as_deref(),
+                            &credentials,
+                        )
+                        .await
+                    }
+                    SourceConfig::SAPHANA(_config) => {
+                        Err(anyhow!("SAP HANA loading not yet implemented"))
+                    }
+                    SourceConfig::Databricks(config) => {
+                        db_loader::databricks::load(
+                            config,
+                            &credentials,
+                            &table_name,
+                            rows,
+                            &mode,
+                            key_fields.as_deref(),
+                        )
+                        .await
+                    }
+                    _ => Err(anyhow!(
+                        "Unsupported datasource type for DB loading: {:?}",
+                        datasource_response.source.source_type
+                    )),
                 }
-                SourceConfig::PostgreSQL(config) => {
-                    load_to_postgres(config, &credentials, &table_name, rows, &mode).await
-                }
-                SourceConfig::Oracle(_config) => {
-                    // TODO: Implement Oracle loading (requires loader implementation)
-                    Err(anyhow!("Oracle loading not yet implemented"))
-                }
-                SourceConfig::SAPHANA(_config) => {
-                    Err(anyhow!("SAP HANA loading not yet implemented"))
-                }
-                _ => Err(anyhow!(
-                    "Unsupported datasource type for DB loading: {:?}",
-                    datasource_response.source.source_type
-                )),
-            }
-        }) as Pin<Box<dyn Future<Output = Result<u64>> + Send>>
-    }))
+            }) as Pin<Box<dyn Future<Output = Result<u64>> + Send>>
+        },
+    ))
 }
 
 /// Convert catalog DB2Config to coordinator DB2Config using resolved credentials.
@@ -950,70 +981,6 @@ async fn load_to_db2(
 }
 
 /// Load data to PostgreSQL using the ETL PostgreSQLLoader
-async fn load_to_postgres(
-    config: &graphica_core::catalog::types::PostgreSQLConfig,
-    credentials: &graphica_core::catalog::Credentials,
-    table_name: &str,
-    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-    mode: &str,
-) -> Result<u64> {
-    if credentials.username.is_empty() || credentials.password.is_empty() {
-        return Err(anyhow!(
-            "PostgreSQL credentials missing (username/password required)"
-        ));
-    }
-
-    validate_table_name(table_name)?;
-
-    let mut connection_string = format!(
-        "host={} port={} dbname={} user={} password={}",
-        config.host, config.port, config.database, credentials.username, credentials.password
-    );
-
-    if let Some(ssl_mode) = &config.ssl_mode {
-        connection_string.push_str(&format!(" sslmode={}", ssl_mode));
-    }
-
-    let load_mode = map_load_mode(mode);
-    let effective_mode = match load_mode {
-        EtlLoadMode::Upsert | EtlLoadMode::Merge => {
-            tracing::warn!(
-                "PostgreSQL loader requires key_fields for UPSERT/MERGE; falling back to INSERT"
-            );
-            EtlLoadMode::Insert
-        }
-        other => other,
-    };
-
-    let batch_size = if rows.len() > 0 {
-        std::cmp::min(rows.len(), 10_000)
-    } else {
-        1000
-    };
-
-    let loader = DatabaseLoaderFactory::create("postgresql", &connection_string, batch_size)
-        .await
-        .context("Failed to create PostgreSQL loader")?;
-
-    let records: Vec<serde_json::Value> = rows.into_iter().map(serde_json::Value::Object).collect();
-
-    loader
-        .load(table_name, records, effective_mode, None)
-        .await
-        .context("PostgreSQL load failed")
-}
-
-fn map_load_mode(mode: &str) -> EtlLoadMode {
-    match mode.to_lowercase().as_str() {
-        "insert" => EtlLoadMode::Insert,
-        "upsert" => EtlLoadMode::Upsert,
-        "replace" => EtlLoadMode::Replace,
-        "append" => EtlLoadMode::Append,
-        "merge" => EtlLoadMode::Merge,
-        _ => EtlLoadMode::Insert,
-    }
-}
-
 /// Convert JSON value to SQL string representation
 ///
 /// SECURITY NOTE: This function is only used for parameter values, NOT for identifiers.
@@ -1579,5 +1546,64 @@ mod tests {
             "expected phase 2 credential failure, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_build_databricks_insert_statement_uses_named_parameters() {
+        use crate::common::databricks::build_insert_statement;
+
+        let rows = vec![
+            serde_json::Map::from_iter([
+                ("id".to_string(), serde_json::json!(1)),
+                ("name".to_string(), serde_json::json!("Alice")),
+            ]),
+            serde_json::Map::from_iter([
+                ("id".to_string(), serde_json::json!(2)),
+                ("name".to_string(), serde_json::json!("Bob")),
+            ]),
+        ];
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let quoted_columns = vec!["`id`".to_string(), "`name`".to_string()];
+
+        let (statement, parameters) = build_insert_statement(
+            "`main`.`bronze`.`customers`",
+            &columns,
+            &quoted_columns,
+            &rows,
+        )
+        .expect("insert statement");
+
+        assert!(
+            statement.starts_with("INSERT INTO `main`.`bronze`.`customers` (`id`, `name`) VALUES")
+        );
+        assert!(statement.contains(":r0_id"));
+        assert!(statement.contains(":r1_name"));
+        assert_eq!(parameters.get("r0_id"), Some(&serde_json::json!(1)));
+        assert_eq!(parameters.get("r1_name"), Some(&serde_json::json!("Bob")));
+    }
+
+    #[test]
+    fn test_build_databricks_merge_statement_requires_key_fields() {
+        use crate::common::databricks::build_merge_statement;
+
+        let rows = vec![serde_json::Map::from_iter([
+            ("id".to_string(), serde_json::json!(1)),
+            ("name".to_string(), serde_json::json!("Alice")),
+        ])];
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let quoted_columns = vec!["`id`".to_string(), "`name`".to_string()];
+
+        let error = build_merge_statement(
+            "`main`.`bronze`.`customers`",
+            &columns,
+            &quoted_columns,
+            &rows,
+            None,
+        )
+        .expect_err("missing key fields should fail");
+
+        assert!(error
+            .to_string()
+            .contains("requires one or more key fields"));
     }
 }

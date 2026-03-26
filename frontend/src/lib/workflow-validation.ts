@@ -151,9 +151,13 @@ export function validateConnection(
  */
 export function validateWorkflow(
   nodes: Node[],
-  edges: Edge[]
+  edges: Edge[],
+  options?: {
+    includeNodeValidationErrors?: boolean;
+  }
 ): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
+  const includeNodeValidationErrors = options?.includeNodeValidationErrors ?? true;
 
   // Check if workflow has at least one node
   if (nodes.length === 0) {
@@ -191,7 +195,7 @@ export function validateWorkflow(
     }
 
     // Add step-specific validation here
-    if (node.data?.validationError) {
+    if (includeNodeValidationErrors && node.data?.validationError) {
       errors.push(`Node ${node.data.label}: ${node.data.validationError}`);
     }
 

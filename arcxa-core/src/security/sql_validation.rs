@@ -291,8 +291,8 @@ mod tests {
 
     #[test]
     fn test_qualified_identifiers() {
-        assert!(validate_qualified_identifier("schema.table").is_ok());
-        assert!(validate_qualified_identifier("db.schema.table").is_ok());
+        assert!(validate_qualified_identifier("sales.customers").is_ok());
+        assert!(validate_qualified_identifier("warehouse.sales.customers").is_ok());
 
         // Too many parts
         assert!(validate_qualified_identifier("a.b.c.d").is_err());

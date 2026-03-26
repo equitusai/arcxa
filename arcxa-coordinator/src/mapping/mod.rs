@@ -40,7 +40,7 @@
 
 pub mod bindings; // Versioned ontology->physical bindings for goal SQL planning
 pub mod data_source; // Unified data source abstraction (CSV, DB, Parquet, Streaming)
-pub mod execution; // External execution ports (Databricks/Oracle/DB2 scaffolds)
+pub mod execution; // External execution ports for DB2/Oracle adapter workflows
 pub mod lineage; // Extended lineage tracking for CSV-to-DB pipeline
 pub mod loader; // Database loaders for bulk data loading
 pub mod manual; // Manual field mapping with persistence and auto-suggestion

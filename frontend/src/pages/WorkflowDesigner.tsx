@@ -45,7 +45,6 @@ import {
   useRegisterWorkflow,
   useUpdateWorkflow,
   useDeleteWorkflow,
-  useValidateWorkflowDefinition,
   useDryRunWorkflow,
   useScheduleWorkflow,
   useWorkflowSchedule,
@@ -74,7 +73,13 @@ import { useWorkflowExecution } from '@/hooks/useWorkflowExecution';
 import { validateConnection, showValidationError, validateWorkflow } from '@/lib/workflow-validation';
 import { getStepTypeConfig } from '@/lib/workflow-step-config';
 import { getETLStepTypeConfig, isETLStepType } from '@/lib/workflow-etl-config';
-import type { StepType, WorkflowDefinition, Workflow, WorkflowExecutionRequest } from '@/api/types';
+import type {
+  StepType,
+  WorkflowDefinition,
+  Workflow,
+  WorkflowExecutionRequest,
+  WorkflowValidationIssue,
+} from '@/api/types';
 
 // Node types configuration
 const nodeTypes: NodeTypes = {
@@ -84,6 +89,8 @@ const nodeTypes: NodeTypes = {
 
 const initialNodes: Node[] = [];
 const initialEdges: Edge[] = [];
+const DEFAULT_DRY_RUN_INPUT = '{\n  "data": "sample input"\n}';
+const SELF_SOURCING_STEP_TYPES = new Set(['csv_source', 'db_extract', 'multi_source_input']);
 
 function WorkflowDesignerInner() {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -100,10 +107,12 @@ function WorkflowDesignerInner() {
   const [isToolPaletteCollapsed, setIsToolPaletteCollapsed] = useState(false);
   const [showExecutionDetailsDialog, setShowExecutionDetailsDialog] = useState(false);
   const [selectedExecutionId, setSelectedExecutionId] = useState<string | null>(null);
-  const [dryRunInput, setDryRunInput] = useState('{\n  "data": "sample input"\n}');
+  const [dryRunInput, setDryRunInput] = useState(DEFAULT_DRY_RUN_INPUT);
   const [dryRunResult, setDryRunResult] = useState<any>(null);
   const [showScheduleDialog, setShowScheduleDialog] = useState(false);
   const [isWorkflowsPanelCollapsed, setIsWorkflowsPanelCollapsed] = useState(false);
+  const [backendValidationIssues, setBackendValidationIssues] = useState<WorkflowValidationIssue[]>([]);
+  const [isBackendValidating, setIsBackendValidating] = useState(false);
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const [reactFlowInstance, setReactFlowInstance] = useState<any>(null);
 
@@ -118,7 +127,6 @@ function WorkflowDesignerInner() {
   const registerWorkflow = useRegisterWorkflow();
   const updateWorkflow = useUpdateWorkflow();
   const deleteWorkflow = useDeleteWorkflow();
-  const validateDefinition = useValidateWorkflowDefinition();
   const dryRun = useDryRunWorkflow();
   const scheduleWorkflow = useScheduleWorkflow();
   const { data: workflowSchedules } = useWorkflowSchedule(selectedWorkflowId || undefined);
@@ -323,7 +331,7 @@ function WorkflowDesignerInner() {
   };
 
   // Convert React Flow nodes/edges to backend workflow definition
-  const convertToWorkflowDefinition = (): WorkflowDefinition => {
+  const convertToWorkflowDefinition = useCallback((): WorkflowDefinition => {
     // Map nodes to workflow steps
     const steps = nodes.map((node) => {
       // Get dependencies from edges
@@ -354,7 +362,7 @@ function WorkflowDesignerInner() {
       fusion_threshold: 0.85, // Default threshold
       fallback: 'manual_review' as const,
     };
-  };
+  }, [edges, nodes]);
 
   // Convert backend workflow definition to React Flow format
   const loadWorkflowFromDefinition = (definition: WorkflowDefinition) => {
@@ -399,6 +407,246 @@ function WorkflowDesignerInner() {
     setNodes(newNodes);
     setEdges(newEdges);
   };
+
+  const applyNodeValidationIssues = useCallback((issues: WorkflowValidationIssue[]) => {
+    const issueByStep = new Map<string, string>();
+
+    issues
+      .filter((issue) => issue.level === 'error' && issue.step_id && issue.step_id !== '$workflow')
+      .forEach((issue) => {
+        if (!issueByStep.has(issue.step_id)) {
+          issueByStep.set(issue.step_id, issue.message);
+        }
+      });
+
+    setNodes((currentNodes) => {
+      let changed = false;
+      const nextNodes = currentNodes.map((node) => {
+        const nextError = issueByStep.get(node.id);
+        const currentError = node.data?.validationError;
+
+        if ((currentError || undefined) === nextError) {
+          return node;
+        }
+
+        changed = true;
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            validationError: nextError,
+          },
+        };
+      });
+
+      return changed ? nextNodes : currentNodes;
+    });
+
+    setSelectedNode((currentSelectedNode) => {
+      if (!currentSelectedNode) {
+        return currentSelectedNode;
+      }
+
+      const nextError = issueByStep.get(currentSelectedNode.id);
+      const currentError = currentSelectedNode.data?.validationError;
+
+      if ((currentError || undefined) === nextError) {
+        return currentSelectedNode;
+      }
+
+      return {
+        ...currentSelectedNode,
+        data: {
+          ...currentSelectedNode.data,
+          validationError: nextError,
+        },
+      };
+    });
+  }, [setNodes]);
+
+  const localValidation = useMemo(
+    () => validateWorkflow(nodes, edges, { includeNodeValidationErrors: false }),
+    [edges, nodes]
+  );
+
+  const supportsInputlessExecution = useMemo(() => {
+    if (nodes.length === 0) {
+      return false;
+    }
+
+    const nodeIdsWithIncomingEdges = new Set(edges.map((edge) => edge.target));
+    return nodes.some(
+      (node) =>
+        !nodeIdsWithIncomingEdges.has(node.id) &&
+        SELF_SOURCING_STEP_TYPES.has(String(node.data?.step_type || ''))
+    );
+  }, [edges, nodes]);
+
+  useEffect(() => {
+    if (supportsInputlessExecution && dryRunInput === DEFAULT_DRY_RUN_INPUT) {
+      setDryRunInput('null');
+      return;
+    }
+
+    if (!supportsInputlessExecution && dryRunInput.trim() === 'null') {
+      setDryRunInput(DEFAULT_DRY_RUN_INPUT);
+    }
+  }, [dryRunInput, supportsInputlessExecution]);
+
+  const blockingBackendIssues = useMemo(
+    () => backendValidationIssues.filter((issue) => issue.level === 'error'),
+    [backendValidationIssues]
+  );
+
+  const validationErrors = useMemo(() => {
+    const errors = [...localValidation.errors];
+
+    if (nodes.length === 0) {
+      errors.push('Workflow is empty. Add at least one node to execute.');
+    }
+
+    if (!selectedWorkflowId) {
+      errors.push('Please save the workflow first.');
+    }
+
+    blockingBackendIssues.forEach((issue) => {
+      errors.push(
+        issue.step_id === '$workflow'
+          ? issue.message
+          : `${issue.step_id}: ${issue.message}`
+      );
+    });
+
+    if (isBackendValidating) {
+      errors.push('Validating datasource-backed workflow steps...');
+    }
+
+    return Array.from(new Set(errors));
+  }, [blockingBackendIssues, isBackendValidating, localValidation.errors, nodes.length, selectedWorkflowId]);
+
+  const canRunWorkflow = Boolean(
+    selectedWorkflowId &&
+      !execution.isExecuting &&
+      nodes.length > 0 &&
+      localValidation.valid &&
+      !isBackendValidating &&
+      blockingBackendIssues.length === 0
+  );
+
+  const runBackendValidation = useCallback(
+    async (options?: { showToast?: boolean }) => {
+      const definition = convertToWorkflowDefinition();
+
+      setIsBackendValidating(true);
+
+      try {
+        const response = await workflowApi.validateWorkflowDefinition(definition);
+        const issues = response.issues || [];
+
+        setBackendValidationIssues(issues);
+        applyNodeValidationIssues(issues);
+
+        if (options?.showToast) {
+          if (response.valid) {
+            toast.success('Workflow validation passed', {
+              description: response.warnings?.length
+                ? `${response.warnings.length} warning${response.warnings.length === 1 ? '' : 's'}`
+                : `${response.step_count || definition.steps.length} steps validated`,
+            });
+          } else {
+            toast.error('Workflow validation failed', {
+              description:
+                issues[0]?.message ||
+                response.message ||
+                'Datasource-backed validation reported blocking issues.',
+            });
+          }
+        }
+
+        return response;
+      } catch (error: any) {
+        const message = error?.message || 'Validation request failed';
+        const fallbackIssues: WorkflowValidationIssue[] = [
+          {
+            level: 'error',
+            step_id: '$workflow',
+            code: 'validation_request_failed',
+            message,
+          },
+        ];
+
+        setBackendValidationIssues(fallbackIssues);
+        applyNodeValidationIssues([]);
+
+        if (options?.showToast) {
+          toast.error('Validation request failed', {
+            description: message,
+          });
+        }
+
+        return {
+          valid: false,
+          message,
+          warnings: [],
+          step_count: definition.steps.length,
+          has_conditional_logic: false,
+          has_error_handling: false,
+          issues: fallbackIssues,
+        };
+      } finally {
+        setIsBackendValidating(false);
+      }
+    },
+    [applyNodeValidationIssues, convertToWorkflowDefinition]
+  );
+
+  useEffect(() => {
+    if (nodes.length === 0 || !localValidation.valid) {
+      setBackendValidationIssues([]);
+      applyNodeValidationIssues([]);
+      setIsBackendValidating(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timeoutId = window.setTimeout(async () => {
+      setIsBackendValidating(true);
+
+      try {
+        const response = await workflowApi.validateWorkflowDefinition(convertToWorkflowDefinition());
+        if (cancelled) {
+          return;
+        }
+
+        const issues = response.issues || [];
+        setBackendValidationIssues(issues);
+        applyNodeValidationIssues(issues);
+      } catch (error: any) {
+        if (cancelled) {
+          return;
+        }
+
+        setBackendValidationIssues([
+          {
+            level: 'error',
+            step_id: '$workflow',
+            code: 'validation_request_failed',
+            message: error?.message || 'Validation request failed',
+          },
+        ]);
+        applyNodeValidationIssues([]);
+      } finally {
+        if (!cancelled) {
+          setIsBackendValidating(false);
+        }
+      }
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [applyNodeValidationIssues, convertToWorkflowDefinition, localValidation.valid, nodes.length]);
 
   const saveWorkflow = () => {
     if (!workflowName.trim()) {
@@ -446,6 +694,8 @@ function WorkflowDesignerInner() {
       setWorkflowName(fullWorkflow.name);
       setWorkflowId(fullWorkflow.id);
       setSelectedWorkflowId(fullWorkflow.id);
+      setBackendValidationIssues([]);
+      applyNodeValidationIssues([]);
       loadWorkflowFromDefinition(fullWorkflow.definition);
       setIsWorkflowListOpen(false);
 
@@ -459,45 +709,41 @@ function WorkflowDesignerInner() {
     }
   };
 
-  const validateCurrentWorkflow = () => {
-    // First do client-side validation
-    const clientValidation = validateWorkflow(nodes, edges);
-
-    if (!clientValidation.valid) {
-      toast.error('❌ Client-side validation failed', {
-        description: clientValidation.errors.join('\n'),
+  const validateCurrentWorkflow = async () => {
+    if (!localValidation.valid) {
+      toast.error('Workflow validation failed', {
+        description: localValidation.errors.join('\n'),
       });
       return;
     }
 
-    // Convert nodes to workflow steps
-    const steps = nodes.map(node => ({
-      id: node.id,
-      step_type: node.data.step_type, // ✅ Fixed: use step_type (snake_case)
-      config: node.data.config || {},
-      depends_on: edges
-        .filter(edge => edge.target === node.id)
-        .map(edge => edge.source),
-    }));
+    const response = await runBackendValidation({ showToast: true });
 
-    // Call backend validation
-    validateDefinition.mutate({
-      steps,
-      timeout_seconds: 300,
-      max_retries: 3,
-    });
+    if (response.valid && response.warnings && response.warnings.length > 0) {
+      toast.warning('Workflow validation warnings', {
+        description: response.warnings.join('\n'),
+      });
+    }
   };
 
-  function openExecuteDialog() {
+  async function openExecuteDialog() {
     if (!selectedWorkflowId) {
       toast.error('Please save the workflow first');
       return;
     }
 
-    // Validate workflow before execution
-    const validation = validateWorkflow(nodes, edges);
+    if (!localValidation.valid) {
+      toast.error(`Cannot execute: ${localValidation.errors.join(', ')}`);
+      return;
+    }
+
+    const validation = await runBackendValidation();
     if (!validation.valid) {
-      toast.error(`Cannot execute: ${validation.errors.join(', ')}`);
+      toast.error('Cannot execute workflow', {
+        description:
+          validation.issues?.find((issue) => issue.level === 'error')?.message ||
+          validation.message,
+      });
       return;
     }
 
@@ -552,8 +798,26 @@ function WorkflowDesignerInner() {
       return;
     }
 
+    if (!localValidation.valid) {
+      toast.error(`Cannot dry-run: ${localValidation.errors.join(', ')}`);
+      return;
+    }
+
+    const validation = await runBackendValidation();
+    if (!validation.valid) {
+      toast.error('Dry-run blocked by validation issues', {
+        description:
+          validation.issues?.find((issue) => issue.level === 'error')?.message ||
+          validation.message,
+      });
+      return;
+    }
+
     try {
-      const input = JSON.parse(dryRunInput);
+      const input =
+        supportsInputlessExecution && !dryRunInput.trim()
+          ? null
+          : JSON.parse(dryRunInput);
 
       const result = await dryRun.mutateAsync({
         workflowId: selectedWorkflowId,
@@ -574,6 +838,21 @@ function WorkflowDesignerInner() {
       return;
     }
 
+    if (!localValidation.valid) {
+      toast.error(`Cannot schedule: ${localValidation.errors.join(', ')}`);
+      return;
+    }
+
+    const validation = await runBackendValidation();
+    if (!validation.valid) {
+      toast.error('Scheduling blocked by validation issues', {
+        description:
+          validation.issues?.find((issue) => issue.level === 'error')?.message ||
+          validation.message,
+      });
+      return;
+    }
+
     await scheduleWorkflow.mutateAsync({
       workflowId: selectedWorkflowId,
       request,
@@ -584,12 +863,16 @@ function WorkflowDesignerInner() {
     setWorkflowName('New Workflow');
     setWorkflowId('');
     setSelectedWorkflowId(null);
+    setBackendValidationIssues([]);
+    applyNodeValidationIssues([]);
     setNodes(initialNodes);
     setEdges(initialEdges);
     setSelectedNode(null);
   };
 
   const clearWorkflow = () => {
+    setBackendValidationIssues([]);
+    applyNodeValidationIssues([]);
     setNodes([]);
     setEdges([]);
     setSelectedNode(null);
@@ -728,10 +1011,10 @@ function WorkflowDesignerInner() {
             size="sm"
             className="gap-2"
             onClick={validateCurrentWorkflow}
-            disabled={nodes.length === 0}
+            disabled={nodes.length === 0 || isBackendValidating}
           >
             <CheckCircle className="h-4 w-4" />
-            Validate
+            {isBackendValidating ? 'Validating...' : 'Validate'}
           </Button>
 
           <Button
@@ -742,7 +1025,7 @@ function WorkflowDesignerInner() {
               setDryRunResult(null);
               setShowDryRunDialog(true);
             }}
-            disabled={!selectedWorkflowId}
+            disabled={!canRunWorkflow}
           >
             <FlaskConical className="h-4 w-4" />
             Dry-Run
@@ -764,7 +1047,7 @@ function WorkflowDesignerInner() {
             scheduleCount={workflowSchedules?.length}
             isLoading={false}
             onClick={() => setShowScheduleDialog(true)}
-            disabled={!selectedWorkflowId}
+            disabled={!canRunWorkflow}
             compact={true}
           />
 
@@ -817,7 +1100,7 @@ function WorkflowDesignerInner() {
               }
             : undefined
         }
-        canExecute={!!selectedWorkflowId && !execution.isExecuting && nodes.length > 0}
+        canExecute={canRunWorkflow}
         canStop={execution.isExecuting}
         canPause={false} // TODO: Enable when backend API is available
         canResume={false} // TODO: Enable when backend API is available
@@ -825,15 +1108,7 @@ function WorkflowDesignerInner() {
         onStop={stopCurrentWorkflow}
         onPause={pauseCurrentWorkflow}
         onResume={resumeCurrentWorkflow}
-        validationErrors={
-          nodes.length === 0
-            ? ['Workflow is empty. Add at least one node to execute.']
-            : !selectedWorkflowId
-            ? ['Please save the workflow first.']
-            : validateWorkflow(nodes, edges).valid
-            ? []
-            : validateWorkflow(nodes, edges).errors
-        }
+        validationErrors={validationErrors}
       />
 
       {/* Main Workflow Area */}
@@ -989,6 +1264,7 @@ function WorkflowDesignerInner() {
         open={showExecuteDialog}
         onOpenChange={setShowExecuteDialog}
         workflowName={workflowName}
+        supportsInputlessExecution={supportsInputlessExecution}
         isExecuting={execution.isExecuting}
         onExecute={executeCurrentWorkflow}
       />
@@ -1005,15 +1281,19 @@ function WorkflowDesignerInner() {
 
           <div className="space-y-4 mt-4">
             <div>
-              <Label>Input Data (JSON)</Label>
+              <Label>
+                {supportsInputlessExecution ? 'Optional Input Override (JSON)' : 'Input Data (JSON)'}
+              </Label>
               <Textarea
                 value={dryRunInput}
                 onChange={(e) => setDryRunInput(e.target.value)}
                 className="font-mono text-sm h-32 mt-2"
-                placeholder='{"data": "sample input"}'
+                placeholder={supportsInputlessExecution ? 'null' : DEFAULT_DRY_RUN_INPUT}
               />
               <p className="text-xs text-muted-foreground mt-1">
-                Input data that will be passed to the workflow
+                {supportsInputlessExecution
+                  ? 'This workflow can execute from configured source steps. Leave this as null unless you need to inject additional JSON input during dry-run.'
+                  : 'Input data that will be passed to the workflow'}
               </p>
             </div>
 
@@ -1131,6 +1411,7 @@ function WorkflowDesignerInner() {
           onOpenChange={setShowScheduleDialog}
           workflowId={selectedWorkflowId}
           workflowName={workflowName}
+          supportsInputlessExecution={supportsInputlessExecution}
           onSchedule={handleSchedule}
           isScheduling={scheduleWorkflow.isPending}
         />

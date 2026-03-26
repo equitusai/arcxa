@@ -5,7 +5,9 @@
 //! without creating a dependency from core to coordinator.
 
 use anyhow::{anyhow, Context, Result};
-use graphica_core::catalog::{api_types::SchemaDefinition, DataSourceCatalog};
+use graphica_core::catalog::{
+    api_types::SchemaDefinition, connectors::databricks::DatabricksSqlClient, DataSourceCatalog,
+};
 use graphica_core::core::lineage::row_level::{DatabaseType, RowId};
 use graphica_core::orchestration::workflow::definition::DbExtractConfig;
 use graphica_core::orchestration::workflow::executor::{
@@ -17,6 +19,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use crate::common::postgres::{
+    quote_postgres_identifier_segment, quote_postgres_qualified_identifier,
+};
 
 /// Create a DB extract callback wired to the datasource catalog.
 pub fn create_db_extract_callback(catalog: Arc<dyn DataSourceCatalog>) -> Arc<DbExtractCallback> {
@@ -124,7 +130,9 @@ fn build_query(
 ) -> Result<(String, HashMap<String, JsonValue>)> {
     if let Some(query) = &config.query {
         if config.incremental.unwrap_or(false) {
-            tracing::warn!("db_extract incremental filter ignored because query is provided");
+            return Err(anyhow!(
+                "incremental extraction is only supported in table mode, not custom query mode"
+            ));
         }
         return Ok((query.clone(), HashMap::new()));
     }
@@ -138,7 +146,7 @@ fn build_query(
     let select_columns = if let Some(columns) = &config.columns {
         let mut validated = Vec::with_capacity(columns.len());
         for col in columns {
-            validated.push(validate_identifier_for_source(col, source_type)?.to_string());
+            validated.push(validate_identifier_for_source(col, source_type)?);
         }
         validated.join(", ")
     } else {
@@ -151,14 +159,14 @@ fn build_query(
     if config.incremental.unwrap_or(false) {
         if let Some(incremental_column) = &config.incremental_column {
             let incremental_column =
-                validate_identifier_for_source(incremental_column, source_type)?.to_string();
+                validate_identifier_for_source(incremental_column, source_type)?;
             if let Some(last_value) = &config.last_value {
                 query.push_str(&format!(" WHERE {} > :last_value", incremental_column));
                 parameters.insert("last_value".to_string(), last_value.clone());
             } else {
-                tracing::warn!(
-                    "db_extract incremental_column provided without last_value; skipping filter"
-                );
+                return Err(anyhow!(
+                    "last_value is required when incremental extraction is enabled"
+                ));
             }
         }
     }
@@ -167,6 +175,14 @@ fn build_query(
 }
 
 fn validate_table_identifier(identifier: &str, source_type: &str) -> Result<String> {
+    if source_type.eq_ignore_ascii_case("Databricks") {
+        return DatabricksSqlClient::quote_identifier(identifier).map_err(|error| anyhow!(error));
+    }
+
+    if source_type.eq_ignore_ascii_case("PostgreSQL") {
+        return quote_postgres_qualified_identifier(identifier);
+    }
+
     let parts: Vec<&str> = identifier.split('.').collect();
     if parts.is_empty() {
         return Err(anyhow!("Table identifier cannot be empty"));
@@ -177,7 +193,21 @@ fn validate_table_identifier(identifier: &str, source_type: &str) -> Result<Stri
     Ok(identifier.to_string())
 }
 
-fn validate_identifier_for_source<'a>(identifier: &'a str, source_type: &str) -> Result<&'a str> {
+fn validate_identifier_for_source(identifier: &str, source_type: &str) -> Result<String> {
+    if source_type.eq_ignore_ascii_case("Databricks") {
+        let segment = DatabricksSqlClient::sanitize_identifier_segment(identifier)
+            .map_err(|error| anyhow!(error))?;
+        return Ok(format!("`{segment}`"));
+    }
+
+    if source_type.eq_ignore_ascii_case("PostgreSQL") {
+        return if identifier.contains('.') {
+            quote_postgres_qualified_identifier(identifier)
+        } else {
+            quote_postgres_identifier_segment(identifier)
+        };
+    }
+
     if source_type.eq_ignore_ascii_case("Oracle") {
         if identifier.is_empty() {
             return Err(anyhow!("SQL identifier cannot be empty"));
@@ -194,20 +224,17 @@ fn validate_identifier_for_source<'a>(identifier: &'a str, source_type: &str) ->
             ));
         }
 
-        return Ok(identifier);
+        return Ok(identifier.to_string());
     }
 
-    validate_identifier(identifier)
+    Ok(validate_identifier(identifier)?.to_string())
 }
 
 fn schema_definition_to_json(schema: &SchemaDefinition, table_name: &str) -> JsonValue {
-    let normalized_table = table_name.split('.').last().unwrap_or(table_name);
     let table = schema
         .tables
         .iter()
-        .find(|t| {
-            t.name.eq_ignore_ascii_case(table_name) || t.name.eq_ignore_ascii_case(normalized_table)
-        })
+        .find(|t| table_identifiers_match(&t.name, table_name))
         .or_else(|| schema.tables.first());
 
     let fields = table
@@ -230,6 +257,44 @@ fn schema_definition_to_json(schema: &SchemaDefinition, table_name: &str) -> Jso
     serde_json::json!({
         "fields": fields,
     })
+}
+
+fn normalize_identifier_variants(value: &str) -> Vec<String> {
+    let segments = value
+        .split('.')
+        .map(|segment| {
+            segment
+                .trim()
+                .trim_matches('"')
+                .trim_matches('`')
+                .trim_matches('[')
+                .trim_matches(']')
+                .to_ascii_lowercase()
+        })
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::with_capacity(segments.len());
+    for start in 0..segments.len() {
+        variants.push(segments[start..].join("."));
+    }
+
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+fn table_identifiers_match(left: &str, right: &str) -> bool {
+    let left_variants = normalize_identifier_variants(left);
+    let right_variants = normalize_identifier_variants(right);
+
+    left_variants
+        .iter()
+        .any(|left_variant| right_variants.contains(left_variant))
 }
 
 fn add_row_ids(
@@ -308,7 +373,140 @@ fn map_database_type(source_type: &str) -> Option<DatabaseType> {
         Some(DatabaseType::MySQL)
     } else if lower.contains("snowflake") {
         Some(DatabaseType::Snowflake)
+    } else if lower.contains("databricks") {
+        Some(DatabaseType::Databricks)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graphica_core::catalog::api_types::{ColumnDefinition, TableDefinition};
+
+    #[test]
+    fn databricks_build_query_quotes_identifiers() {
+        let config = DbExtractConfig {
+            datasource_id: "dbx_source".to_string(),
+            table_name: Some("main.bronze.customers".to_string()),
+            schema_table: Some("main.bronze.customers".to_string()),
+            query: None,
+            incremental: Some(true),
+            incremental_column: Some("updated_at".to_string()),
+            last_value: Some(serde_json::json!("2026-01-01T00:00:00Z")),
+            batch_size: 1_000,
+            columns: Some(vec!["customer_id".to_string(), "email".to_string()]),
+            include_schema: Some(true),
+            schema_sample_size: Some(100),
+        };
+
+        let (query, parameters) = build_query(&config, "Databricks").unwrap();
+        assert_eq!(
+            query,
+            "SELECT `customer_id`, `email` FROM `main`.`bronze`.`customers` WHERE `updated_at` > :last_value"
+        );
+        assert_eq!(
+            parameters.get("last_value"),
+            Some(&serde_json::json!("2026-01-01T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn databricks_build_query_rejects_invalid_column_identifier() {
+        let config = DbExtractConfig {
+            datasource_id: "dbx_source".to_string(),
+            table_name: Some("bronze.customers".to_string()),
+            schema_table: None,
+            query: None,
+            incremental: Some(false),
+            incremental_column: None,
+            last_value: None,
+            batch_size: 1_000,
+            columns: Some(vec!["bad-column".to_string()]),
+            include_schema: Some(false),
+            schema_sample_size: Some(100),
+        };
+
+        let error = build_query(&config, "Databricks").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Invalid Databricks identifier segment"));
+    }
+
+    #[test]
+    fn postgres_build_query_quotes_identifiers() {
+        let config = DbExtractConfig {
+            datasource_id: "pg_source".to_string(),
+            table_name: Some("public.User".to_string()),
+            schema_table: Some("public.User".to_string()),
+            query: None,
+            incremental: Some(true),
+            incremental_column: Some("updatedAt".to_string()),
+            last_value: Some(serde_json::json!("2026-01-01T00:00:00Z")),
+            batch_size: 1_000,
+            columns: Some(vec!["order".to_string(), "createdAt".to_string()]),
+            include_schema: Some(false),
+            schema_sample_size: Some(100),
+        };
+
+        let (query, parameters) = build_query(&config, "PostgreSQL").unwrap();
+        assert_eq!(
+            query,
+            "SELECT \"order\", \"createdAt\" FROM \"public\".\"User\" WHERE \"updatedAt\" > :last_value"
+        );
+        assert_eq!(
+            parameters.get("last_value"),
+            Some(&serde_json::json!("2026-01-01T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn build_query_rejects_incremental_custom_query_mode() {
+        let config = DbExtractConfig {
+            datasource_id: "pg_source".to_string(),
+            table_name: None,
+            schema_table: Some("public.users".to_string()),
+            query: Some("SELECT * FROM users".to_string()),
+            incremental: Some(true),
+            incremental_column: Some("updated_at".to_string()),
+            last_value: Some(serde_json::json!("2026-01-01T00:00:00Z")),
+            batch_size: 1_000,
+            columns: None,
+            include_schema: Some(false),
+            schema_sample_size: Some(100),
+        };
+
+        let error = build_query(&config, "PostgreSQL").unwrap_err().to_string();
+        assert!(error.contains("table mode"));
+    }
+
+    #[test]
+    fn schema_definition_to_json_matches_catalog_qualified_table_names() {
+        let schema = SchemaDefinition {
+            name: "main.bronze".to_string(),
+            tables: vec![TableDefinition {
+                name: "bronze.customers".to_string(),
+                columns: vec![ColumnDefinition {
+                    name: "customer_id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    nullable: false,
+                    primary_key: true,
+                    default_value: None,
+                    semantic_type: None,
+                    statistics: None,
+                }],
+                estimated_rows: None,
+            }],
+            relationships: Vec::new(),
+            indexes: Vec::new(),
+            inferred_at: chrono::Utc::now(),
+        };
+
+        let payload = schema_definition_to_json(&schema, "main.bronze.customers");
+        let fields = payload["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["name"], "customer_id");
+        assert_eq!(fields[0]["primary_key"], true);
     }
 }

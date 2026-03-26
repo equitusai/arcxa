@@ -140,17 +140,30 @@ export function StepConfigDialog({
     return [];
   };
 
-  const upstreamSchema = useMemo(() => {
-    if (!selectedNode) return [];
+  const upstreamNode = useMemo(() => {
+    if (!selectedNode) return undefined;
 
     const incomingEdges = edges.filter((edge) => edge.target === selectedNode.id);
-    if (incomingEdges.length === 0) return [];
+    if (incomingEdges.length === 0) return undefined;
 
     const upstreamEdge = incomingEdges[0];
-    const upstreamNode = nodes.find((node) => node.id === upstreamEdge.source);
-
-    return extractSchemaFromNode(upstreamNode);
+    return nodes.find((node) => node.id === upstreamEdge.source);
   }, [selectedNode, nodes, edges]);
+
+  const upstreamSchema = useMemo(() => {
+    if (!upstreamNode) return [];
+    return extractSchemaFromNode(upstreamNode);
+  }, [upstreamNode]);
+
+  const upstreamDatasourceId =
+    upstreamNode?.data.step_type === 'db_extract'
+      ? upstreamNode.data.config?.datasource_id
+      : undefined;
+
+  const upstreamSourceTable =
+    upstreamNode?.data.step_type === 'db_extract'
+      ? upstreamNode.data.config?.schema_table || upstreamNode.data.config?.table_name
+      : undefined;
 
   const dualUpstreamSchemas = useMemo(() => {
     if (!selectedNode || selectedNode.data.step_type !== 'data_joiner') {
@@ -309,6 +322,8 @@ export function StepConfigDialog({
             config={selectedNode.data.config}
             onUpdate={handleUpdateConfig}
             nodeId={selectedNode.id}
+            datasourceId={upstreamDatasourceId}
+            sourceTable={upstreamSourceTable}
             upstreamSchema={upstreamSchema}
           />
         );
@@ -342,6 +357,7 @@ export function StepConfigDialog({
             config={selectedNode.data.config}
             onUpdate={handleUpdateConfig}
             nodeId={selectedNode.id}
+            upstreamSchema={upstreamSchema}
           />
         );
 
@@ -379,6 +395,7 @@ export function StepConfigDialog({
             config={selectedNode.data.config}
             onUpdate={handleUpdateConfig}
             nodeId={selectedNode.id}
+            upstreamSchema={upstreamSchema}
           />
         );
 

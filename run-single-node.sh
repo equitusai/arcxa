@@ -9,6 +9,25 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
+RUST_TOOLCHAIN="stable"
+
+run_cargo() {
+    local cargo_args=("$@")
+    if [ "${cargo_args[0]}" = "cargo" ]; then
+        cargo_args=("${cargo_args[@]:1}")
+    fi
+
+    env -u CC \
+        -u CFLAGS \
+        -u CPPFLAGS \
+        -u LDFLAGS \
+        -u C_INCLUDE_PATH \
+        -u CPLUS_INCLUDE_PATH \
+        -u LIBRARY_PATH \
+        PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
+        RUSTFLAGS="" \
+        cargo +${RUST_TOOLCHAIN} "${cargo_args[@]}"
+}
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Running ARCXA (Single-Node Mode)${NC}"
@@ -66,7 +85,7 @@ echo ""
 
 # Build coordinator
 echo -e "${YELLOW}Building arcxa-coordinator...${NC}"
-(cd arcxa-coordinator && cargo build --release 2>&1 | tail -3)
+(cd arcxa-coordinator && run_cargo cargo build --release 2>&1 | tail -3)
 
 echo -e "${GREEN}✓ Coordinator built successfully${NC}"
 echo ""

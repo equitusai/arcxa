@@ -16,6 +16,14 @@ export interface ApiError {
   details?: Record<string, any>;
 }
 
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 export interface PaginationParams {
   page?: number;
   page_size?: number;
@@ -1210,11 +1218,14 @@ export interface WorkflowExecutionSummary {
 // Workflow Testing & Validation Types (New API v0.2.0)
 // ============================================================================
 
-export interface ValidateWorkflowRequest {
-  steps: WorkflowStep[];
-  timeout_seconds?: number;
-  max_retries?: number;
-  description?: string;
+export type ValidateWorkflowRequest = WorkflowDefinition;
+
+export interface WorkflowValidationIssue {
+  level: 'warning' | 'error';
+  step_id: string;
+  code: string;
+  message: string;
+  field?: string;
 }
 
 export interface ValidateWorkflowResponse {
@@ -1224,6 +1235,7 @@ export interface ValidateWorkflowResponse {
   step_count?: number;
   has_conditional_logic?: boolean;
   has_error_handling?: boolean;
+  issues?: WorkflowValidationIssue[];
 }
 
 export interface TestStepRequest {
@@ -1241,7 +1253,7 @@ export interface TestStepResponse {
 }
 
 export interface DryRunRequest {
-  input: Record<string, any>;
+  input: JsonValue;
   context?: Record<string, any>;
 }
 
@@ -1281,7 +1293,7 @@ export interface ScheduleWorkflowRequest {
   interval_seconds?: number;
   scheduled_at?: string; // ISO 8601 timestamp
   timezone?: string; // IANA timezone (e.g., "America/New_York", "UTC") - requires backend v0.3.0+
-  input: Record<string, any>;
+  input: JsonValue;
   context?: Record<string, any>;
   enabled: boolean;
 }
@@ -1294,7 +1306,7 @@ export interface UpdateScheduleRequest {
   interval_seconds?: number;
   scheduled_at?: string;
   timezone?: string;
-  input?: Record<string, any>;
+  input?: JsonValue;
   context?: Record<string, any>;
   enabled?: boolean;
 }

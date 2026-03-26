@@ -34,6 +34,7 @@ interface ScheduleWorkflowDialogProps {
   onOpenChange: (open: boolean) => void;
   workflowId: string;
   workflowName: string;
+  supportsInputlessExecution?: boolean;
   onSchedule: (request: ScheduleWorkflowRequest) => Promise<void>;
   isScheduling: boolean;
 }
@@ -234,6 +235,7 @@ export function ScheduleWorkflowDialog({
   onOpenChange,
   workflowId,
   workflowName,
+  supportsInputlessExecution = false,
   onSchedule,
   isScheduling,
 }: ScheduleWorkflowDialogProps) {
@@ -244,8 +246,28 @@ export function ScheduleWorkflowDialog({
   const [scheduledAt, setScheduledAt] = useState('');
   const [inputData, setInputData] = useState('{\n  "data": "sample input"\n}');
   const [contextData, setContextData] = useState('{\n  "tenant_id": "default"\n}');
+  const [useExternalInput, setUseExternalInput] = useState(!supportsInputlessExecution);
   const [enabled, setEnabled] = useState(true);
   const [nextRuns, setNextRuns] = useState<Date[]>([]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    setUseExternalInput(!supportsInputlessExecution);
+    setInputData((current) => {
+      if (supportsInputlessExecution && current === '{\n  "data": "sample input"\n}') {
+        return 'null';
+      }
+
+      if (!supportsInputlessExecution && current.trim() === 'null') {
+        return '{\n  "data": "sample input"\n}';
+      }
+
+      return current;
+    });
+  }, [open, supportsInputlessExecution]);
 
   // Calculate next runs whenever cron expression or timezone changes
   useEffect(() => {
@@ -263,7 +285,7 @@ export function ScheduleWorkflowDialog({
 
   const handleSchedule = async () => {
     try {
-      const input = JSON.parse(inputData);
+      const input = useExternalInput ? JSON.parse(inputData) : null;
       const context = contextData.trim() ? JSON.parse(contextData) : undefined;
 
       const request: ScheduleWorkflowRequest = {
@@ -295,7 +317,7 @@ export function ScheduleWorkflowDialog({
         <DialogHeader>
           <DialogTitle>Schedule Workflow: {workflowName}</DialogTitle>
           <DialogDescription>
-            Configure automatic execution schedule with timezone support
+            Configure automatic execution with timezone support.
           </DialogDescription>
         </DialogHeader>
 
@@ -490,19 +512,48 @@ export function ScheduleWorkflowDialog({
             </TabsContent>
           </Tabs>
 
-          {/* Input Data */}
-          <div className="space-y-2">
-            <Label>Input Data (JSON)</Label>
-            <Textarea
-              value={inputData}
-              onChange={(e) => setInputData(e.target.value)}
-              className="font-mono text-sm h-32"
-              placeholder='{"data": "sample input"}'
-            />
-            <p className="text-xs text-muted-foreground">
-              Input data that will be passed to the workflow on each execution
-            </p>
-          </div>
+          {supportsInputlessExecution ? (
+            <div className="space-y-3 rounded-sm border border-border p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <Label className="text-sm font-medium">External input payload</Label>
+                  <p className="text-xs text-muted-foreground">
+                    This workflow can run directly from its configured source steps. Keep this
+                    off unless you want scheduled runs to inject an additional JSON payload.
+                  </p>
+                </div>
+                <Switch checked={useExternalInput} onCheckedChange={setUseExternalInput} />
+              </div>
+
+              {useExternalInput && (
+                <div className="space-y-2">
+                  <Label>Input Data (JSON)</Label>
+                  <Textarea
+                    value={inputData}
+                    onChange={(e) => setInputData(e.target.value)}
+                    className="font-mono text-sm h-32"
+                    placeholder='{"data": "sample input"}'
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Input data that will be passed to the workflow on each execution.
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <Label>Input Data (JSON)</Label>
+              <Textarea
+                value={inputData}
+                onChange={(e) => setInputData(e.target.value)}
+                className="font-mono text-sm h-32"
+                placeholder='{"data": "sample input"}'
+              />
+              <p className="text-xs text-muted-foreground">
+                Input data that will be passed to the workflow on each execution
+              </p>
+            </div>
+          )}
 
           {/* Context Data (Optional) */}
           <div className="space-y-2">

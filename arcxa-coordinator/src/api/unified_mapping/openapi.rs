@@ -112,7 +112,7 @@ use utoipa::OpenApi;
         )
     ),
     tags(
-        (name = "Unified Mapping", description = "Multi-source CSV consolidation with AI/ML field similarity, conflict resolution, and batch loading to PostgreSQL/DB2/Oracle/Databricks"),
+        (name = "Unified Mapping", description = "Multi-source CSV consolidation with AI/ML field similarity, conflict resolution, and batch loading to PostgreSQL/DB2/Oracle/Databricks. External executor callbacks apply only to DB2; PostgreSQL, Oracle, and Databricks run through internal catalog-backed loader paths."),
     ),
     info(
         title = "ARCXA Unified Mapping API",

@@ -336,13 +336,27 @@ export interface MultiSourceInputConfig {
   }>;
 }
 
+export interface DetectedField {
+  name: string;
+  type: string;
+  sample_values?: string[];
+  nullable?: boolean;
+  primary_key?: boolean;
+}
+
 export interface DBExtractConfig {
   datasource_id: string;
   table_name?: string;
+  schema_table?: string;
   query?: string;
   incremental?: boolean;
   incremental_column?: string;
   last_value?: any;
+  batch_size?: number;
+  columns?: string[];
+  include_schema?: boolean;
+  schema_sample_size?: number;
+  detected_fields?: DetectedField[];
 }
 
 export interface SemanticMapperConfig {

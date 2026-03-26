@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use rocksdb::{IteratorMode, WriteBatch, DB};
 
 use super::error::{Result, WorkflowError};
+use super::runtime::spill::{StorageTieringPlan, StorageTieringPolicy};
 use arrow2::datatypes::Schema;
 
 /// Row storage abstraction with automatic tiering
@@ -111,31 +112,22 @@ pub struct FieldSchema {
 }
 
 impl RowStorage {
-    /// Create storage from rows with automatic tiering
-    pub fn from_rows(rows: Vec<serde_json::Value>) -> Result<Self> {
-        let row_count = rows.len();
-        let estimated_size = estimate_memory_size(&rows);
-
-        Ok(match (row_count, estimated_size) {
-            (n, _) if n < 10_000 => {
-                tracing::debug!("Using InMemory storage for {} rows", n);
+    fn inline_storage_from_plan(
+        rows: Vec<serde_json::Value>,
+        plan: StorageTieringPlan,
+        row_count: usize,
+        estimated_size: usize,
+    ) -> Self {
+        match plan {
+            StorageTieringPlan::InMemory => {
+                tracing::debug!("Using InMemory storage for {} rows", row_count);
                 RowStorage::InMemory {
                     rows: Arc::new(rows),
                 }
             }
-            (n, size) if n < 100_000 && size < 500_000_000 => {
-                tracing::debug!("Using Shared storage for {} rows ({} bytes)", n, size);
-                RowStorage::Shared {
-                    rows: Arc::new(RwLock::new(rows)),
-                    version: 0,
-                }
-            }
-            _ => {
-                // For now, fallback to Shared for larger datasets
-                // RocksDB and Parquet require StorageManager
-                tracing::warn!(
-                    "Large dataset ({} rows, {} bytes) using Shared storage. \
-                    Consider using StorageManager for optimal performance.",
+            StorageTieringPlan::Shared => {
+                tracing::debug!(
+                    "Using Shared storage for {} rows ({} bytes)",
                     row_count,
                     estimated_size
                 );
@@ -144,7 +136,33 @@ impl RowStorage {
                     version: 0,
                 }
             }
-        })
+            StorageTieringPlan::RocksDb | StorageTieringPlan::Parquet => {
+                tracing::warn!(
+                    "Dataset planned for {:?} storage ({} rows, {} bytes) is using Shared storage because StorageManager is not available.",
+                    plan,
+                    row_count,
+                    estimated_size
+                );
+                RowStorage::Shared {
+                    rows: Arc::new(RwLock::new(rows)),
+                    version: 0,
+                }
+            }
+        }
+    }
+
+    /// Create storage from rows with automatic tiering
+    pub fn from_rows(rows: Vec<serde_json::Value>) -> Result<Self> {
+        let row_count = rows.len();
+        let estimated_size = estimate_memory_size(&rows);
+        let plan = StorageTieringPolicy::default().plan(row_count, estimated_size);
+
+        Ok(Self::inline_storage_from_plan(
+            rows,
+            plan,
+            row_count,
+            estimated_size,
+        ))
     }
 
     /// Get the number of rows
@@ -502,13 +520,20 @@ impl StorageManager {
     ) -> Result<RowStorage> {
         let row_count = rows.len();
         let estimated_size = estimate_memory_size(&rows);
+        let plan = StorageTieringPolicy::default().plan(row_count, estimated_size);
 
-        match (row_count, estimated_size) {
-            (n, _) if n < 10_000 => Ok(RowStorage::from_rows(rows)?),
-            (n, size) if n < 100_000 && size < 500_000_000 => Ok(RowStorage::from_rows(rows)?),
-            (n, _) if n < 1_000_000 => self.create_rocks_storage(execution_id, step_id, rows),
-            _ => {
+        match plan {
+            StorageTieringPlan::InMemory | StorageTieringPlan::Shared => Ok(
+                RowStorage::inline_storage_from_plan(rows, plan, row_count, estimated_size),
+            ),
+            StorageTieringPlan::RocksDb => self.create_rocks_storage(execution_id, step_id, rows),
+            StorageTieringPlan::Parquet => {
                 // TODO: Implement Parquet storage
+                tracing::warn!(
+                    "Dataset planned for Parquet storage ({} rows, {} bytes) is falling back to RocksDB until Parquet spill is implemented.",
+                    row_count,
+                    estimated_size
+                );
                 self.create_rocks_storage(execution_id, step_id, rows)
             }
         }

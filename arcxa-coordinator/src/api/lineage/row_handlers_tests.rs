@@ -238,6 +238,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parse_row_key_databricks_database() {
+        let row_id =
+            row_handlers::parse_row_key("databricks:main.bronze.events:event_id=evt-123").unwrap();
+        assert_eq!(
+            row_id.to_key(),
+            "databricks:main.bronze.events:event_id=evt-123"
+        );
+    }
+
+    #[tokio::test]
     async fn test_parse_row_key_kafka() {
         let row_id = row_handlers::parse_row_key("kafka:orders:p5:o987654").unwrap();
         assert_eq!(row_id.to_key(), "kafka:orders:p5:o987654");

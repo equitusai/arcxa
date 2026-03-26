@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 
 // Graph-native execution imports (for legacy WorkflowEngine-based execution)
 use crate::api::auth::Claims;
+use crate::api::workflow::handlers::ensure_workflow_ready_for_action;
 use crate::api::workflow::materialization::{
     finalize_execution_result, persist_execution_record_if_possible,
 };
@@ -1321,6 +1322,8 @@ pub async fn execute_workflow_legacy(
             )
         })?;
 
+    ensure_workflow_ready_for_action(state.as_ref(), &workflow.definition, "execution").await?;
+
     let execution_input =
         serde_json::to_value(&request.input).unwrap_or_else(|_| serde_json::Value::Null);
     let triggered_by = request.context.initiator.clone();
@@ -1412,7 +1415,7 @@ pub async fn dry_run_workflow(
 
     // Validate workflow exists before attempting dry-run execution
     // Note: workflow is fetched here for early validation, but execute_workflow_with_input will fetch it again internally
-    let _workflow = engine
+    let workflow = engine
         .get_workflow(&workflow_id)
         .await
         .map_err(|e| {
@@ -1427,6 +1430,8 @@ pub async fn dry_run_workflow(
                 format!("Workflow not found: {}", workflow_id),
             )
         })?;
+
+    ensure_workflow_ready_for_action(state.as_ref(), &workflow.definition, "dry-run").await?;
 
     // Convert context to HashMap and add dry-run flag
     let mut context_map = request.context.to_hashmap();
@@ -1714,6 +1719,7 @@ mod tests {
         http::{Request, StatusCode},
         Router,
     };
+    use chrono::TimeZone;
     use tower::ServiceExt;
 
     fn create_test_state() -> Arc<WorkflowApiState> {

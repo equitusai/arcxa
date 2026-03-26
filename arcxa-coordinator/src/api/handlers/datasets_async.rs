@@ -18,9 +18,11 @@ use crate::api::ApiState;
 use anyhow::Context;
 use graphica_core::catalog::api_types::QueryResult;
 use graphica_core::profiling::IncrementalProfiler;
-use graphica_core::security::validate_identifier;
 
-use super::datasets::{create_error, store_datasource_lineage, write_query_result_to_parquet};
+use super::datasets::{
+    build_import_table_reference, store_datasource_lineage, validate_import_columns,
+    write_query_result_to_parquet,
+};
 
 /// Execute datasource import in background
 pub async fn execute_async_import(
@@ -70,39 +72,45 @@ pub async fn execute_async_import(
     };
 
     job_manager.update_progress(&import_id, 10, 0);
+    let source_type = datasource.source.connection.config.source_type();
 
-    // Validate table name to prevent SQL injection
-    let validated_table = match validate_identifier(&request.table) {
+    let validated_table = match build_import_table_reference(
+        &request.table,
+        request.schema.as_deref(),
+        source_type,
+    ) {
         Ok(table) => table,
         Err(e) => {
-            error!("❌ Invalid table name '{}': {}", request.table, e);
-            job_manager.fail_job(&import_id, ImportError {
-                row: None,
-                column: None,
-                message: format!("Invalid table name '{}': {}. Table names must be alphanumeric with underscores only.", request.table, e),
-                code: "INVALID_TABLE_NAME".to_string(),
-            });
+            error!(
+                "❌ Invalid table reference '{}' for {}: {}",
+                request.table, source_type, e
+            );
+            job_manager.fail_job(
+                &import_id,
+                ImportError {
+                    row: None,
+                    column: None,
+                    message: format!("Invalid table reference '{}': {}.", request.table, e),
+                    code: "INVALID_TABLE_NAME".to_string(),
+                },
+            );
             return;
         }
     };
 
-    // Validate column names to prevent SQL injection
-    let validated_columns: Result<Vec<&str>, _> = request
-        .columns
-        .iter()
-        .map(|col| validate_identifier(col))
-        .collect();
-
-    let validated_columns = match validated_columns {
+    let validated_columns = match validate_import_columns(&request.columns, source_type) {
         Ok(cols) => cols,
         Err(e) => {
             error!("❌ Invalid column name: {}", e);
-            job_manager.fail_job(&import_id, ImportError {
-                row: None,
-                column: None,
-                message: format!("Invalid column name: {}. Column names must be alphanumeric with underscores only.", e),
-                code: "INVALID_COLUMN_NAME".to_string(),
-            });
+            job_manager.fail_job(
+                &import_id,
+                ImportError {
+                    row: None,
+                    column: None,
+                    message: format!("Invalid column name: {}.", e),
+                    code: "INVALID_COLUMN_NAME".to_string(),
+                },
+            );
             return;
         }
     };
@@ -127,11 +135,7 @@ pub async fn execute_async_import(
         return;
     }
 
-    let mut query = format!("SELECT {} FROM {}", columns_clause, validated_table);
-
-    if let Some(limit) = request.limit {
-        query.push_str(&format!(" LIMIT {}", limit));
-    }
+    let query = format!("SELECT {} FROM {}", columns_clause, validated_table);
 
     info!("🔍 Executing query: {}", query);
     job_manager.update_progress(&import_id, 20, 0);
@@ -225,7 +229,7 @@ pub async fn execute_async_import(
 
     let lineage = ImportLineage {
         import_method: "datasource_query".to_string(),
-        source_file: format!("{}:{}", request.source_id, request.table),
+        source_file: format!("{}:{}", request.source_id, validated_table),
         imported_by: user_id.clone(),
         imported_at: Utc::now().to_rfc3339(),
         import_id: import_id.clone(),
@@ -257,7 +261,7 @@ pub async fn execute_async_import(
         &lineage,
         &schema,
         &request.source_id,
-        &request.table,
+        &validated_table,
         request.where_clause.as_deref(),
         "parquet",
         &parquet_path,

@@ -2,6 +2,8 @@
 //!
 //! Professional database loading infrastructure with support for:
 //! - PostgreSQL (native via tokio-postgres)
+//! - Databricks (SQL Statement API)
+//! - Oracle (ODBC with parameter binding)
 //! - DB2 (deprecated - use workflows/engine/transformers/db2_load.rs instead)
 //!
 //! ## Architecture
@@ -10,6 +12,8 @@
 //! DatabaseLoader (trait)
 //!       ↑
 //!       └── PostgreSQLLoader (COPY, INSERT, UPSERT)
+//!       └── DatabricksLoader (Statement API INSERT/MERGE)
+//!       └── OracleLoader (ODBC INSERT ALL/MERGE)
 //! ```
 //!
 //! ## Features
@@ -26,11 +30,15 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub mod common;
+pub mod databricks;
+pub mod oracle;
 pub mod postgres_pool;
 pub mod postgresql;
 // db2 module removed - use workflows/engine/transformers/db2_load.rs instead
 
 pub use common::*;
+pub use databricks::DatabricksLoader;
+pub use oracle::OracleLoader;
 pub use postgres_pool::{
     create_postgres_pool, get_pool_stats, PoolStats, PoolTimeouts, PostgresConfig, PostgresPool,
     PostgresPoolConfig,
@@ -113,6 +121,14 @@ impl DatabaseLoaderFactory {
         match datasource_type.to_lowercase().as_str() {
             "postgresql" | "postgres" => {
                 let loader = PostgreSQLLoader::new(connection_string, batch_size).await?;
+                Ok(Box::new(loader))
+            }
+            "databricks" => {
+                let loader = DatabricksLoader::new(connection_string, batch_size).await?;
+                Ok(Box::new(loader))
+            }
+            "oracle" => {
+                let loader = OracleLoader::new(connection_string, batch_size).await?;
                 Ok(Box::new(loader))
             }
             "db2" => {

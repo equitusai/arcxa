@@ -15,6 +15,7 @@
 //!
 //! This handler is kept for backward compatibility but logs deprecation warnings.
 
+use anyhow::{anyhow, Result as AnyResult};
 use axum::{
     extract::{Extension, Multipart, Path, Query, State},
     http::StatusCode,
@@ -31,6 +32,9 @@ use crate::api::dto::datasets::*;
 use crate::api::ApiState;
 use crate::common::csv_utils::{
     detect_delimiter_advanced, parse_csv_line_advanced, CsvDetectionConfig,
+};
+use crate::common::postgres::{
+    quote_postgres_identifier_segment, quote_postgres_qualified_identifier,
 };
 
 // Security imports for SQL injection prevention
@@ -398,36 +402,31 @@ async fn handle_sync_datasource_import(
     })?;
 
     info!("📊 Found datasource: {}", datasource.source.title);
+    let source_type = datasource.source.connection.config.source_type();
 
-    // Validate table name to prevent SQL injection
-    let validated_table = validate_identifier(&request.table)
-        .map_err(|e| {
-            error!("❌ Invalid table name '{}': {}", request.table, e);
+    let validated_table =
+        build_import_table_reference(&request.table, request.schema.as_deref(), source_type)
+            .map_err(|e| {
+                error!(
+                    "❌ Invalid table reference '{}' for {}: {}",
+                    request.table, source_type, e
+                );
+                create_error(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_TABLE_NAME",
+                    &format!("Invalid table reference '{}': {}.", request.table, e),
+                )
+            })?;
+
+    let validated_columns =
+        validate_import_columns(&request.columns, source_type).map_err(|e| {
+            error!("❌ Invalid column name for {} import: {}", source_type, e);
             create_error(
                 StatusCode::BAD_REQUEST,
-                "INVALID_TABLE_NAME",
-                &format!("Invalid table name '{}': {}. Table names must be alphanumeric with underscores only.", request.table, e),
+                "INVALID_COLUMN_NAME",
+                &format!("Invalid column name: {}.", e),
             )
         })?;
-
-    // Validate column names to prevent SQL injection
-    let validated_columns: Result<Vec<&str>, _> = request
-        .columns
-        .iter()
-        .map(|col| validate_identifier(col))
-        .collect();
-
-    let validated_columns = validated_columns.map_err(|e| {
-        error!("❌ Invalid column name: {}", e);
-        create_error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_COLUMN_NAME",
-            &format!(
-                "Invalid column name: {}. Column names must be alphanumeric with underscores only.",
-                e
-            ),
-        )
-    })?;
 
     // WHERE clause is temporarily disabled due to SQL injection risk
     // TODO: Implement parameterized queries or SQL parser before re-enabling
@@ -447,12 +446,7 @@ async fn handle_sync_datasource_import(
         validated_columns.join(", ")
     };
 
-    let mut query = format!("SELECT {} FROM {}", columns_clause, validated_table);
-
-    // Add LIMIT if provided
-    if let Some(limit) = request.limit {
-        query.push_str(&format!(" LIMIT {}", limit));
-    }
+    let query = format!("SELECT {} FROM {}", columns_clause, validated_table);
 
     info!("🔍 Executing query: {}", query);
 
@@ -542,7 +536,7 @@ async fn handle_sync_datasource_import(
     let timestamp = Utc::now();
     let lineage = ImportLineage {
         import_method: "datasource_query".to_string(),
-        source_file: format!("{}:{}", request.source_id, request.table),
+        source_file: format!("{}:{}", request.source_id, validated_table),
         imported_by: user_id.clone(),
         imported_at: timestamp.to_rfc3339(),
         import_id: import_id.clone(),
@@ -558,7 +552,7 @@ async fn handle_sync_datasource_import(
         &lineage,
         &schema,
         &request.source_id,
-        &request.table,
+        &validated_table,
         request.where_clause.as_deref(),
         "parquet",
         &parquet_path,
@@ -626,6 +620,7 @@ pub async fn batch_import_datasources(
             name: table_import.name.clone(),
             source_id: request.source_id.clone(),
             table: table_import.table.clone(),
+            schema: table_import.schema,
             where_clause: table_import.where_clause,
             columns: table_import.columns,
             limit: table_import.limit,
@@ -666,6 +661,78 @@ pub async fn batch_import_datasources(
         status: "processing".to_string(),
         started_at: Utc::now().to_rfc3339(),
     }))
+}
+
+pub(super) fn build_import_table_reference(
+    table: &str,
+    schema: Option<&str>,
+    source_type: &str,
+) -> AnyResult<String> {
+    let table = table.trim();
+    if table.is_empty() {
+        return Err(anyhow!("table reference cannot be empty"));
+    }
+
+    let qualified = if table.contains('.') {
+        table.to_string()
+    } else if let Some(schema) = schema.map(str::trim).filter(|schema| !schema.is_empty()) {
+        format!("{schema}.{table}")
+    } else {
+        table.to_string()
+    };
+
+    let parts: Vec<&str> = qualified.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(anyhow!(
+            "qualified table reference must have between 1 and 3 identifier parts"
+        ));
+    }
+
+    for part in &parts {
+        validate_import_identifier_for_source(part, source_type)?;
+    }
+
+    Ok(qualified)
+}
+
+pub(super) fn validate_import_columns(
+    columns: &[String],
+    source_type: &str,
+) -> AnyResult<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| validate_import_identifier_for_source(column.trim(), source_type))
+        .collect()
+}
+
+fn validate_import_identifier_for_source(identifier: &str, source_type: &str) -> AnyResult<String> {
+    if identifier.is_empty() {
+        return Err(anyhow!("identifier cannot be empty"));
+    }
+
+    if source_type.eq_ignore_ascii_case("PostgreSQL") {
+        return if identifier.contains('.') {
+            quote_postgres_qualified_identifier(identifier)
+        } else {
+            quote_postgres_identifier_segment(identifier)
+        };
+    }
+
+    if source_type.eq_ignore_ascii_case("Oracle") {
+        let valid = identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '#'));
+
+        if !valid {
+            return Err(anyhow!(
+                "Oracle identifiers must contain only alphanumeric characters, underscore, $, or #"
+            ));
+        }
+
+        return Ok(identifier.to_string());
+    }
+
+    Ok(validate_identifier(identifier)?.to_string())
 }
 
 // ============================================================================
@@ -1753,6 +1820,33 @@ mod tests {
         let id2 = generate_id();
         assert_ne!(id1, id2);
         assert!(!id1.is_empty());
+    }
+
+    #[test]
+    fn test_build_import_table_reference_supports_oracle_schema_and_symbols() {
+        let qualified =
+            build_import_table_reference("ORDERS$ARCHIVE", Some("ERP#DATA"), "Oracle").unwrap();
+        assert_eq!(qualified, "ERP#DATA.ORDERS$ARCHIVE");
+    }
+
+    #[test]
+    fn test_build_import_table_reference_quotes_postgres_identifiers() {
+        let qualified = build_import_table_reference("User", Some("public"), "PostgreSQL").unwrap();
+        assert_eq!(qualified, "\"public\".\"User\"");
+    }
+
+    #[test]
+    fn test_validate_import_columns_quotes_postgres_reserved_words() {
+        let columns = validate_import_columns(&["order".to_string()], "PostgreSQL").unwrap();
+        assert_eq!(columns, vec!["\"order\"".to_string()]);
+    }
+
+    #[test]
+    fn test_build_import_table_reference_rejects_invalid_oracle_identifier() {
+        let error = build_import_table_reference("orders-archive", Some("ERP"), "Oracle")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Oracle identifiers"));
     }
 
     #[test]

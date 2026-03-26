@@ -11,6 +11,7 @@ NC='\033[0m' # No Color
 
 VERSION="1.0.0"
 MIN_RUST_VERSION="1.91.1"
+RUST_TOOLCHAIN="stable"
 
 version_ge() {
     [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
@@ -23,7 +24,7 @@ check_rust_version() {
     fi
 
     local current_version
-    current_version="$(rustc --version | awk '{print $2}')"
+    current_version="$(rustc +${RUST_TOOLCHAIN} --version | awk '{print $2}')"
 
     if ! version_ge "$current_version" "$MIN_RUST_VERSION"; then
         echo -e "${RED}Rust ${MIN_RUST_VERSION}+ is required (found ${current_version}).${NC}"
@@ -88,6 +89,11 @@ show_status() {
 }
 
 run_cargo() {
+    local cargo_args=("$@")
+    if [ "${cargo_args[0]}" = "cargo" ]; then
+        cargo_args=("${cargo_args[@]:1}")
+    fi
+
     env -u CC \
         -u CFLAGS \
         -u CPPFLAGS \
@@ -97,7 +103,7 @@ run_cargo() {
         -u LIBRARY_PATH \
         PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
         RUSTFLAGS="" \
-        "$@"
+        cargo +${RUST_TOOLCHAIN} "${cargo_args[@]}"
 }
 
 # Defaults

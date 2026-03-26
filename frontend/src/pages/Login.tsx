@@ -199,10 +199,11 @@ export function Login() {
               </Button>
             </form>
 
-            <div className="mt-6 text-center text-sm text-muted-foreground">
+            <div className="mt-6 text-center text-sm text-muted-foreground space-y-1">
+              <p>No self-service sign-up is available in this build.</p>
               <p>
-                Default local credentials:{' '}
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">admin / admin</code>
+                Ask an ARCXA administrator to create your account, or complete the
+                one-time admin setup on a brand-new instance.
               </p>
             </div>
           </CardContent>

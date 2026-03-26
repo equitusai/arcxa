@@ -68,8 +68,14 @@ pub struct LoadToDatabaseRequest {
     /// Target database type (PostgreSQL, DB2, Oracle, Databricks)
     pub database_type: DatabaseType,
 
-    /// Connection string or configuration
-    pub connection_config: DatabaseConnectionConfig,
+    /// Connection string or configuration for external load adapters.
+    ///
+    /// Required for DB2 external execution.
+    /// Internal PostgreSQL, Oracle, and Databricks loads resolve connection
+    /// details from the registered target datasource in
+    /// `target_database.datasource_id`.
+    #[serde(default)]
+    pub connection_config: Option<DatabaseConnectionConfig>,
 
     /// Batch size for bulk loading
     #[serde(default = "default_batch_size")]
@@ -84,7 +90,7 @@ pub struct LoadToDatabaseRequest {
     pub validate_data: bool,
 }
 
-/// Callback request from external executors (DB2/Oracle/Databricks)
+/// Callback request from external executors (DB2 only)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExternalLoadJobCallbackRequest {
     /// New status being reported by the external executor

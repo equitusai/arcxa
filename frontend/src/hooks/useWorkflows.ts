@@ -9,6 +9,8 @@ import { toast } from 'sonner';
 import * as workflowApi from '@/api/workflows';
 import {
   RegisterWorkflowRequest,
+  ValidateWorkflowResponse,
+  WorkflowDefinition,
   WorkflowExecutionRequest,
   PaginationParams,
 } from '@/api/types';
@@ -189,10 +191,19 @@ export function useValidateWorkflow() {
       definition,
     }: {
       workflowId: string;
-      definition: any;
+      definition: WorkflowDefinition;
     }) => workflowApi.validateWorkflow(workflowId, definition),
-    onSuccess: () => {
-      toast.success('Workflow validation successful');
+    onSuccess: (response: ValidateWorkflowResponse) => {
+      if (response.valid) {
+        toast.success('Workflow validation successful');
+        return;
+      }
+
+      toast.error('Workflow validation failed', {
+        description:
+          response.issues?.find((issue) => issue.level === 'error')?.message ||
+          response.message,
+      });
     },
     onError: (error: any) => {
       console.error('Workflow validation failed:', error);
@@ -315,11 +326,11 @@ export function useExecutionDetails(executionId: string | undefined) {
  *
  * @example
  * const validateDef = useValidateWorkflowDefinition();
- * validateDef.mutate({ steps: [...], timeout_seconds: 300 });
+ * validateDef.mutate({ steps: [...], fusion_threshold: 0.85, fallback: 'manual_review' });
  */
 export function useValidateWorkflowDefinition() {
   return useMutation({
-    mutationFn: (definition: import('@/api/types').ValidateWorkflowRequest) =>
+    mutationFn: (definition: import('@/api/types').WorkflowDefinition) =>
       workflowApi.validateWorkflowDefinition(definition),
     onSuccess: (data) => {
       if (data.valid) {

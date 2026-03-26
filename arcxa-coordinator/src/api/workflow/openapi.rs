@@ -53,6 +53,9 @@ use utoipa::OpenApi;
             // Testing/Validation types
             crate::api::workflow::types::TestWorkflowStepRequest,
             crate::api::workflow::types::TestWorkflowStepResponse,
+            crate::api::workflow::types::ValidateWorkflowResponse,
+            crate::api::workflow::types::WorkflowValidationIssue,
+            crate::api::workflow::types::WorkflowValidationIssueLevel,
             crate::api::workflow::types::DryRunWorkflowRequest,
             crate::api::workflow::types::DryRunWorkflowResponse,
             crate::api::workflow::types::StepExecutionResult,

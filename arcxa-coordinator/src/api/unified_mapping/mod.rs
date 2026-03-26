@@ -27,7 +27,7 @@
 //! ### Database Loading
 //! - `POST /api/v1/mapping/unified-sessions/:id/load` - Load data to target database
 //! - `GET /api/v1/mapping/load-jobs/:job_id` - Get load job status
-//! - `POST /api/v1/mapping/load-jobs/:job_id/callback` - Report external executor status
+//! - `POST /api/v1/mapping/load-jobs/:job_id/callback` - Report external executor status (DB2 only)
 //!
 //! ### Statistics
 //! - `GET /api/v1/mapping/unified-sessions/statistics` - Get global statistics
@@ -37,7 +37,7 @@
 //! 1. Create multiple source mapping sessions (CSV → Ontology)
 //! 2. Create unified session from source sessions
 //! 3. Review and resolve any detected conflicts
-//! 4. Load data to target database (PostgreSQL, DB2, or Oracle)
+//! 4. Load data to target database (PostgreSQL, Databricks, DB2, or Oracle)
 //! 5. Monitor load job progress
 //!
 //! ## Conflict Resolution Strategies
@@ -50,6 +50,7 @@
 
 pub mod field_similarity;
 pub mod handlers;
+mod internal_load;
 pub mod openapi;
 pub mod types;
 

@@ -3,15 +3,32 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-pub fn ssl_mode_uses_tls(ssl_mode: Option<&str>) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresSslBehavior {
+    Disable,
+    Prefer,
+    Require,
+}
+
+pub fn postgres_ssl_behavior(ssl_mode: Option<&str>) -> PostgresSslBehavior {
     match ssl_mode
         .map(str::trim)
         .filter(|mode| !mode.is_empty())
         .map(|mode| mode.to_ascii_lowercase())
+        .as_deref()
     {
-        None => true,
-        Some(mode) => mode != "disable",
+        Some("disable") => PostgresSslBehavior::Disable,
+        Some("prefer") | None => PostgresSslBehavior::Prefer,
+        Some("require") | Some("verify-ca") | Some("verify-full") => PostgresSslBehavior::Require,
+        Some(_) => PostgresSslBehavior::Require,
     }
+}
+
+pub fn ssl_mode_uses_tls(ssl_mode: Option<&str>) -> bool {
+    !matches!(
+        postgres_ssl_behavior(ssl_mode),
+        PostgresSslBehavior::Disable
+    )
 }
 
 pub fn parse_connection_string_ssl_mode(connection_string: &str) -> Option<String> {
@@ -55,41 +72,89 @@ pub fn make_rustls_connector() -> Result<MakeRustlsConnect> {
     Ok(MakeRustlsConnect::new(tls_config))
 }
 
+fn strip_ssl_mode(connection_string: &str) -> String {
+    connection_string
+        .split_whitespace()
+        .filter(|part| {
+            part.split_once('=')
+                .map(|(key, _)| !key.eq_ignore_ascii_case("sslmode"))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn connect_with_tls(connection_string: &str) -> Result<Client> {
+    let tls = make_rustls_connector()?;
+    let (client, connection) = tokio_postgres::connect(connection_string, tls)
+        .await
+        .context("Failed to connect to PostgreSQL over TLS")?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!("PostgreSQL TLS connection error: {}", e);
+        }
+    });
+
+    Ok(client)
+}
+
+async fn connect_without_tls(connection_string: &str) -> Result<Client> {
+    let no_tls_connection_string = strip_ssl_mode(connection_string);
+    let (client, connection) = tokio_postgres::connect(&no_tls_connection_string, NoTls)
+        .await
+        .context("Failed to connect to PostgreSQL without TLS")?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!("PostgreSQL connection error: {}", e);
+        }
+    });
+
+    Ok(client)
+}
+
+pub async fn connect_postgres_client_with_transport(
+    connection_string: &str,
+    ssl_mode: Option<&str>,
+) -> Result<(Client, bool)> {
+    match postgres_ssl_behavior(ssl_mode) {
+        PostgresSslBehavior::Disable => connect_without_tls(connection_string)
+            .await
+            .map(|client| (client, false)),
+        PostgresSslBehavior::Prefer => match connect_with_tls(connection_string).await {
+            Ok(client) => Ok((client, true)),
+            Err(error) => {
+                tracing::warn!(
+                    "PostgreSQL TLS connection failed with sslmode=prefer, falling back to non-TLS: {}",
+                    error
+                );
+                connect_without_tls(connection_string)
+                    .await
+                    .map(|client| (client, false))
+            }
+        },
+        PostgresSslBehavior::Require => connect_with_tls(connection_string)
+            .await
+            .map(|client| (client, true)),
+    }
+}
+
 pub async fn connect_postgres_client(
     connection_string: &str,
     ssl_mode: Option<&str>,
 ) -> Result<Client> {
-    if ssl_mode_uses_tls(ssl_mode) {
-        let tls = make_rustls_connector()?;
-        let (client, connection) = tokio_postgres::connect(connection_string, tls)
-            .await
-            .context("Failed to connect to PostgreSQL over TLS")?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("PostgreSQL TLS connection error: {}", e);
-            }
-        });
-
-        Ok(client)
-    } else {
-        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-            .await
-            .context("Failed to connect to PostgreSQL without TLS")?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("PostgreSQL connection error: {}", e);
-            }
-        });
-
-        Ok(client)
-    }
+    connect_postgres_client_with_transport(connection_string, ssl_mode)
+        .await
+        .map(|(client, _)| client)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_connection_string_ssl_mode, ssl_mode_uses_tls};
+    use super::{
+        parse_connection_string_ssl_mode, postgres_ssl_behavior, ssl_mode_uses_tls,
+        PostgresSslBehavior,
+    };
 
     #[test]
     fn parses_sslmode_from_connection_string() {
@@ -106,5 +171,26 @@ mod tests {
         assert!(ssl_mode_uses_tls(Some("prefer")));
         assert!(ssl_mode_uses_tls(Some("require")));
         assert!(!ssl_mode_uses_tls(Some("disable")));
+    }
+
+    #[test]
+    fn models_sslmode_prefer_separately() {
+        assert_eq!(postgres_ssl_behavior(None), PostgresSslBehavior::Prefer);
+        assert_eq!(
+            postgres_ssl_behavior(Some("prefer")),
+            PostgresSslBehavior::Prefer
+        );
+        assert_eq!(
+            postgres_ssl_behavior(Some("require")),
+            PostgresSslBehavior::Require
+        );
+        assert_eq!(
+            postgres_ssl_behavior(Some("verify-full")),
+            PostgresSslBehavior::Require
+        );
+        assert_eq!(
+            postgres_ssl_behavior(Some("disable")),
+            PostgresSslBehavior::Disable
+        );
     }
 }

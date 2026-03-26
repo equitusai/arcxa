@@ -154,6 +154,7 @@ pub struct OracleConfig {
     /// Service name or SID
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "serviceName")]
+    #[serde(alias = "service_name")]
     pub service_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
@@ -216,9 +217,11 @@ pub struct SnowflakeConfig {
 pub struct DatabricksConfig {
     /// Workspace URL (e.g., "https://adb-1234567890123456.7.azuredatabricks.net")
     #[serde(rename = "workspaceUrl")]
+    #[serde(alias = "workspace_url")]
     pub workspace_url: String,
     /// SQL endpoint HTTP path
     #[serde(rename = "httpPath")]
+    #[serde(alias = "http_path")]
     pub http_path: String,
     /// Optional catalog name
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,6 +232,7 @@ pub struct DatabricksConfig {
     /// Optional warehouse ID for governance/executor references
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "warehouseId")]
+    #[serde(alias = "warehouse_id")]
     pub warehouse_id: Option<String>,
 }
 
@@ -548,6 +552,18 @@ mod tests {
     }
 
     #[test]
+    fn test_oracle_config_accepts_legacy_service_name_alias() {
+        let config: OracleConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "port": 1521,
+            "service_name": "ORCL"
+        }))
+        .unwrap();
+
+        assert_eq!(config.service_name.as_deref(), Some("ORCL"));
+    }
+
+    #[test]
     fn test_snowflake_config_validation() {
         let config = SourceConfig::Snowflake(SnowflakeConfig {
             account: "xy12345.us-east-1".to_string(),
@@ -581,6 +597,25 @@ mod tests {
         });
 
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn test_databricks_config_accepts_legacy_snake_case_aliases() {
+        let payload = serde_json::json!({
+            "workspace_url": "https://adb-12345.6.azuredatabricks.net",
+            "http_path": "/sql/1.0/warehouses/abc123",
+            "catalog": "main",
+            "schema": "default",
+            "warehouse_id": "abc123"
+        });
+
+        let config: DatabricksConfig = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            config.workspace_url,
+            "https://adb-12345.6.azuredatabricks.net"
+        );
+        assert_eq!(config.http_path, "/sql/1.0/warehouses/abc123");
+        assert_eq!(config.warehouse_id.as_deref(), Some("abc123"));
     }
 
     #[test]

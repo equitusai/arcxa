@@ -3,7 +3,7 @@
  * Multi-step dialog to import datasets from connected datasources or file library
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -46,7 +46,7 @@ interface DatasetImportWizardProps {
 
 interface DiscoveredTable {
   name: string;
-  schema: string;
+  schema?: string;
   rowCount?: number;
   columnCount?: number;
   sizeBytes?: number;
@@ -88,14 +88,23 @@ export function DatasetImportWizard({
     limit: 50,
   });
   const queryClient = useQueryClient();
+  const importableDatasources = useMemo(
+    () =>
+      (datasources || []).filter(
+        (datasource) =>
+          (datasource.instance_capabilities?.canQuery ?? false) &&
+          (datasource.instance_capabilities?.canInferSchema ?? false)
+      ),
+    [datasources]
+  );
 
   // Filter files to show only registered datasources
   const registeredFiles = filesData?.files.filter(f => f.registration_status === 'registered') || [];
 
   // Handle pre-selection when dialog opens with initial values
   useEffect(() => {
-    if (open && initialDatasourceId && datasources) {
-      const datasource = datasources.find((ds) => ds.id === initialDatasourceId);
+    if (open && initialDatasourceId && importableDatasources.length > 0) {
+      const datasource = importableDatasources.find((ds) => ds.id === initialDatasourceId);
       if (datasource && !selectedDatasource) {
         // Auto-select the datasource and discover tables
         setSelectedDatasource(datasource);
@@ -104,7 +113,7 @@ export function DatasetImportWizard({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, initialDatasourceId, datasources]);
+  }, [open, initialDatasourceId, importableDatasources]);
 
   const handleSelectDatasource = (datasource: Datasource) => {
     setSelectedDatasource(datasource);
@@ -136,7 +145,7 @@ export function DatasetImportWizard({
 
       const tables: DiscoveredTable[] = response.tables.map((table) => ({
         name: table.name,
-        schema: response.name,
+        schema: response.name || undefined,
         rowCount: table.estimatedRows,
         columnCount: table.columns.length,
         // Estimate size based on row count (rough estimate)
@@ -248,7 +257,7 @@ export function DatasetImportWizard({
           const response = await importDatasourceTable({
             datasource_id: selectedDatasource.id,
             table_name: tableName,
-            schema: table.schema || 'public',
+            schema: table.schema || undefined,
             dataset_name: currentDatasetName,
             description: datasetDescription,
             profile: enableProfiling,
@@ -415,9 +424,9 @@ export function DatasetImportWizard({
                   <TabsTrigger value="datasource" className="text-xs">
                     <Database className="h-3.5 w-3.5 mr-1.5" />
                     Connected Data Sources
-                    {datasources && datasources.length > 0 && (
+                    {importableDatasources.length > 0 && (
                       <Badge variant="secondary" className="ml-1.5 text-xs">
-                        {datasources.length}
+                        {importableDatasources.length}
                       </Badge>
                     )}
                   </TabsTrigger>
@@ -438,9 +447,9 @@ export function DatasetImportWizard({
                     <div className="flex items-center justify-center py-8">
                       <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
                     </div>
-                  ) : datasources && datasources.length > 0 ? (
+                  ) : importableDatasources.length > 0 ? (
                     <div className="space-y-2">
-                      {datasources.map((datasource) => (
+                      {importableDatasources.map((datasource) => (
                         <button
                           key={datasource.id}
                           onClick={() => handleSelectDatasource(datasource)}
@@ -460,7 +469,19 @@ export function DatasetImportWizard({
                           </div>
                         </button>
                       ))}
+                      <p className="text-xs text-muted-foreground pt-1">
+                        Only datasources that support schema discovery and query execution are
+                        available for dataset import.
+                      </p>
                     </div>
+                  ) : datasources && datasources.length > 0 ? (
+                    <Alert>
+                      <AlertCircle className="h-4 w-4" />
+                      <AlertDescription>
+                        No connected data sources currently support end-to-end dataset import.
+                        Choose a datasource with schema discovery and query execution enabled.
+                      </AlertDescription>
+                    </Alert>
                   ) : (
                     <Alert>
                       <AlertCircle className="h-4 w-4" />

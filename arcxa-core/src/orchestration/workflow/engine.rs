@@ -353,7 +353,7 @@ impl WorkflowEngine {
         }
 
         // Create execution context
-        let mut exec_context = ExecutionContext::new(input);
+        let mut exec_context = ExecutionContext::from_input_value(input)?;
         exec_context.metadata = context.clone();
         exec_context.workflow_id = Some(workflow_id.to_string());
 
@@ -524,7 +524,7 @@ impl WorkflowEngine {
         let executor = WorkflowExecutor::new(workflow, model_invoker, rule_executor)?;
 
         // Create execution context
-        let mut exec_context = ExecutionContext::new(input);
+        let mut exec_context = ExecutionContext::from_input_value(input)?;
         exec_context.metadata = context.clone();
 
         // Execute workflow (single step)
@@ -594,8 +594,14 @@ pub struct WorkflowSummary {
 mod tests {
     use super::*;
     use crate::orchestration::workflow::definition::{
-        ConfidenceGateConfig, FallbackStrategy, StepConfig, StepType, WorkflowStep,
+        ConfidenceGateConfig, DataValidatorConfig, FallbackStrategy, FieldTransformation,
+        FieldTransformerConfig, RuleType, Severity, StepConfig, StepType, TransformOperation,
+        ValidationRule, WorkflowStep,
     };
+    use crate::orchestration::workflow::input::{
+        DatasetInputAdapter, DatasetResolver, WorkflowInput,
+    };
+    use serde_json::Value as JsonValue;
 
     fn create_test_definition() -> WorkflowDefinition {
         WorkflowDefinition {
@@ -608,6 +614,78 @@ mod tests {
                 }),
                 depends_on: vec![],
             }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        }
+    }
+
+    struct EngineDatasetResolver {
+        rows: Vec<JsonValue>,
+    }
+
+    #[async_trait::async_trait]
+    impl DatasetResolver for EngineDatasetResolver {
+        async fn load_rows(
+            &self,
+            _dataset_id: &str,
+            limit: Option<usize>,
+        ) -> Result<Vec<JsonValue>> {
+            Ok(match limit {
+                Some(limit) => self.rows.iter().take(limit).cloned().collect(),
+                None => self.rows.clone(),
+            })
+        }
+    }
+
+    fn create_batch_transform_definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "transform1".to_string(),
+                step_type: StepType::FieldTransformer,
+                config: StepConfig::FieldTransformer(FieldTransformerConfig {
+                    transformations: vec![FieldTransformation {
+                        field: "status".to_string(),
+                        operations: vec![TransformOperation::Lower],
+                    }],
+                }),
+                depends_on: vec![],
+            }],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        }
+    }
+
+    fn create_batch_transform_and_validate_definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            steps: vec![
+                WorkflowStep {
+                    id: "transform1".to_string(),
+                    step_type: StepType::FieldTransformer,
+                    config: StepConfig::FieldTransformer(FieldTransformerConfig {
+                        transformations: vec![FieldTransformation {
+                            field: "status".to_string(),
+                            operations: vec![TransformOperation::Lower],
+                        }],
+                    }),
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    id: "validate1".to_string(),
+                    step_type: StepType::DataValidator,
+                    config: StepConfig::DataValidator(DataValidatorConfig {
+                        rules: vec![ValidationRule {
+                            field: "status".to_string(),
+                            rule_type: RuleType::InSet {
+                                values: vec!["active".to_string(), "pending".to_string()],
+                            },
+                            params: None,
+                            severity: Severity::Error,
+                        }],
+                        fail_on_error: false,
+                    }),
+                    depends_on: vec!["transform1".to_string()],
+                },
+            ],
             fusion_threshold: 0.8,
             fallback: FallbackStrategy::ManualReview,
         }
@@ -882,6 +960,154 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Workflow not found"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_workflow_with_input_preserves_dataset_batch_metadata_in_step_results() {
+        use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+        use crate::orchestration::rules::RuleExecutor;
+
+        let registry = Arc::new(ModelRegistry::new());
+        let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+        let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+        let rule_executor = Arc::new(RuleExecutor::new());
+        let engine = WorkflowEngine::new_with_execution(invoker, rule_executor);
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "batch_transform_workflow".to_string(),
+                create_batch_transform_definition(),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let adapter = Arc::new(DatasetInputAdapter::new(Arc::new(EngineDatasetResolver {
+            rows: vec![
+                serde_json::json!({"id": 1, "status": "ACTIVE"}),
+                serde_json::json!({"id": 2, "status": "PENDING"}),
+            ],
+        })));
+
+        let results = engine
+            .execute_workflow_with_input(
+                &workflow_id,
+                WorkflowInput::Dataset {
+                    dataset_id: "ds_input_123".to_string(),
+                    batch_size: Some(1000),
+                    limit: None,
+                },
+                adapter,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let step_result = results[0]
+            .step_results
+            .get("transform1")
+            .expect("transform step result to be stored");
+
+        assert_eq!(step_result.output["_rows"][0]["status"], "active");
+        assert!(step_result.batch_frame.is_none());
+
+        let batch_metadata = step_result
+            .batch_metadata
+            .as_ref()
+            .expect("stored step result should preserve lightweight batch metadata");
+        assert_eq!(batch_metadata.source_step_id, None);
+        assert_eq!(batch_metadata.source_kind.as_deref(), Some("dataset_input"));
+        assert_eq!(batch_metadata.source_id.as_deref(), Some("ds_input_123"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_workflow_with_input_preserves_ingress_metadata_across_second_batch_step()
+    {
+        use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+        use crate::orchestration::rules::RuleExecutor;
+
+        let registry = Arc::new(ModelRegistry::new());
+        let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+        let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+        let rule_executor = Arc::new(RuleExecutor::new());
+        let engine = WorkflowEngine::new_with_execution(invoker, rule_executor);
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "batch_transform_validate_workflow".to_string(),
+                create_batch_transform_and_validate_definition(),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let adapter = Arc::new(DatasetInputAdapter::new(Arc::new(EngineDatasetResolver {
+            rows: vec![
+                serde_json::json!({"id": 1, "status": "ACTIVE"}),
+                serde_json::json!({"id": 2, "status": "PENDING"}),
+            ],
+        })));
+
+        let results = engine
+            .execute_workflow_with_input(
+                &workflow_id,
+                WorkflowInput::Dataset {
+                    dataset_id: "ds_input_chain_456".to_string(),
+                    batch_size: Some(1000),
+                    limit: None,
+                },
+                adapter,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+
+        let transform_result = results[0]
+            .step_results
+            .get("transform1")
+            .expect("transform step result to be stored");
+        let validate_result = results[0]
+            .step_results
+            .get("validate1")
+            .expect("validate step result to be stored");
+
+        assert_eq!(transform_result.output["_rows"][0]["status"], "active");
+        assert_eq!(validate_result.output["_error_count"], 0);
+
+        let transform_metadata = transform_result
+            .batch_metadata
+            .as_ref()
+            .expect("transform step should preserve lightweight ingress metadata");
+        let validate_metadata = validate_result
+            .batch_metadata
+            .as_ref()
+            .expect("validate step should preserve lightweight ingress metadata");
+
+        assert_eq!(transform_metadata.source_step_id, None);
+        assert_eq!(validate_metadata.source_step_id, None);
+        assert_eq!(
+            transform_metadata.source_kind.as_deref(),
+            Some("dataset_input")
+        );
+        assert_eq!(
+            validate_metadata.source_kind.as_deref(),
+            Some("dataset_input")
+        );
+        assert_eq!(
+            transform_metadata.source_id.as_deref(),
+            Some("ds_input_chain_456")
+        );
+        assert_eq!(
+            validate_metadata.source_id.as_deref(),
+            Some("ds_input_chain_456")
+        );
     }
 
     #[tokio::test]

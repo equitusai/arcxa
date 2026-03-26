@@ -796,9 +796,16 @@ mod tests {
                 base: DeduplicatorConfig {
                     method: DedupMethod::Exact,
                     key_fields: vec!["id".to_string()],
+                    threshold: None,
                     keep: KeepStrategy::HighestQuality,
                 },
-                ..Default::default()
+                batch_size: 10_000,
+                max_memory_bytes: 100_000_000,
+                cache_size: 100_000,
+                bloom_expected_items: 1_000_000,
+                bloom_false_positive_rate: 0.01,
+                parallel_processing: true,
+                num_workers: 4,
             },
         )
         .unwrap();

@@ -176,6 +176,94 @@ pub async fn execute_odbc_query_with_metadata(
     .map_err(|e| anyhow!("ODBC task failed: {:?}", e))?
 }
 
+/// Execute ODBC query with named parameter binding and full column metadata.
+#[cfg(feature = "odbc")]
+pub async fn execute_odbc_query_with_metadata_and_params(
+    connection_string: &str,
+    query: &str,
+    parameters: HashMap<String, serde_json::Value>,
+) -> Result<OdbcQueryResult> {
+    let connection_string = connection_string.to_string();
+    let query = query.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let env = Environment::new()
+            .map_err(|e| anyhow!("Failed to create ODBC environment: {:?}", e))?;
+
+        let conn = env
+            .connect_with_connection_string(&connection_string, ConnectionOptions::default())
+            .map_err(|e| anyhow!("Failed to connect via ODBC: {:?}", e))?;
+
+        let (rewritten_query, ordered_names) =
+            crate::common::odbc::rewrite_named_parameters(&query);
+        if ordered_names.is_empty() {
+            return Err(anyhow!(
+                "Query parameters were provided but no named placeholders were found"
+            ));
+        }
+
+        let bound_parameters =
+            crate::common::odbc::build_named_parameters(&parameters, &ordered_names)?;
+
+        let mut cursor = conn
+            .execute(&rewritten_query, bound_parameters.as_slice(), None)
+            .map_err(|e| anyhow!("ODBC parameterized query failed: {:?}", e))?
+            .ok_or_else(|| anyhow!("ODBC query returned no results"))?;
+
+        let num_cols = cursor
+            .num_result_cols()
+            .map_err(|e| anyhow!("Failed to get column count: {:?}", e))?
+            as usize;
+
+        let mut columns = Vec::with_capacity(num_cols);
+        let mut description = ColumnDescription::default();
+        for i in 1..=num_cols {
+            cursor
+                .describe_col(i as u16, &mut description)
+                .map_err(|e| anyhow!("Failed to describe column {}: {:?}", i, e))?;
+
+            let name = description
+                .name_to_string()
+                .unwrap_or_else(|_| format!("col{}", i));
+
+            let data_type = map_odbc_type_to_sql(&description.data_type);
+            let nullable = description.nullability != odbc_api::Nullability::NoNulls;
+
+            columns.push(OdbcColumnInfo {
+                name,
+                data_type,
+                nullable,
+            });
+        }
+
+        let mut rows = Vec::new();
+        while let Some(mut row) = cursor
+            .next_row()
+            .map_err(|e| anyhow!("Failed to fetch row: {:?}", e))?
+        {
+            let mut row_map = HashMap::with_capacity(num_cols);
+            for (idx, col_info) in columns.iter().enumerate() {
+                let mut buffer = Vec::new();
+                let not_null = row
+                    .get_text((idx + 1) as u16, &mut buffer)
+                    .map_err(|e| anyhow!("Failed to get column {}: {:?}", idx + 1, e))?;
+
+                let value = if not_null {
+                    String::from_utf8_lossy(&buffer).to_string()
+                } else {
+                    String::new()
+                };
+                row_map.insert(col_info.name.clone(), value);
+            }
+            rows.push(row_map);
+        }
+
+        Ok(OdbcQueryResult { columns, rows })
+    })
+    .await
+    .map_err(|e| anyhow!("ODBC task failed: {:?}", e))?
+}
+
 /// Map ODBC DataType to SQL type string
 #[cfg(feature = "odbc")]
 fn map_odbc_type_to_sql(data_type: &DataType) -> String {

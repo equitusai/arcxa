@@ -828,6 +828,17 @@ mod tests {
     use super::*;
     use crate::catalog::types::ConnectionDetails;
 
+    macro_rules! require_live_db2 {
+        () => {
+            if std::env::var_os("ARCXA_RUN_LIVE_DB2_TESTS").is_none() {
+                eprintln!(
+                    "Skipping live DB2 connector test; set ARCXA_RUN_LIVE_DB2_TESTS=1 to enable"
+                );
+                return;
+            }
+        };
+    }
+
     fn create_test_source() -> DataSource {
         DataSource::new(
             "Test DB2".to_string(),
@@ -875,6 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -886,6 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_infer_schema() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -902,6 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_query() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -946,6 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_unified_schema() {
+        require_live_db2!();
         use crate::schema::SourceType;
 
         let connector = DB2Connector::new();
@@ -972,6 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_data() {
+        require_live_db2!();
         use futures::StreamExt;
 
         let connector = DB2Connector::new();
@@ -994,6 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_to_csv() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -1016,6 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_to_json_lines() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -1043,6 +1061,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_to_json_array() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -1065,6 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_estimate_row_count() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());
@@ -1080,6 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_sample_rows() {
+        require_live_db2!();
         let connector = DB2Connector::new();
         let source = create_test_source();
         let creds = Credentials::new("db2admin".to_string(), "password".to_string());

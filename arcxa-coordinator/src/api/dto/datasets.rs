@@ -41,6 +41,10 @@ pub struct DatasourceImportRequest {
     /// Table/collection name to import
     pub table: String,
 
+    /// Optional schema/catalog name to qualify the source table
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+
     /// Optional name for the materialized dataset
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -101,6 +105,10 @@ pub struct BatchDatasourceImportRequest {
 pub struct BatchTableImport {
     /// Table name
     pub table: String,
+
+    /// Optional schema/catalog name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 
     /// Optional dataset name (defaults to table name)
     #[serde(skip_serializing_if = "Option::is_none")]

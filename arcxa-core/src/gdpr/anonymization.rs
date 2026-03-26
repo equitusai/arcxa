@@ -338,10 +338,7 @@ mod tests {
         let anonymizer = Anonymizer::with_mask('*', 4);
 
         // Mask all but last 4 characters
-        assert_eq!(
-            anonymizer.anonymize("user@example.com"),
-            "************m.com"
-        );
+        assert_eq!(anonymizer.anonymize("user@example.com"), "************.com");
 
         // If shorter than preserve_last, mask all
         assert_eq!(anonymizer.anonymize("abc"), "***");

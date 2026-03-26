@@ -580,7 +580,12 @@ impl InMemoryDataSourceCatalog {
         let (can_query, base_can_infer_schema, can_read_workflow, can_write_workflow) =
             match source_type {
                 "PostgreSQL" => (true, true, true, true),
-                "Oracle" => (uses_odbc_routing, true, uses_odbc_routing, false),
+                "Oracle" => (
+                    uses_odbc_routing,
+                    true,
+                    uses_odbc_routing,
+                    uses_odbc_routing,
+                ),
                 "DB2" => (uses_odbc_routing, true, uses_odbc_routing, true),
                 "SAPHANA" => (
                     uses_odbc_routing,
@@ -589,11 +594,15 @@ impl InMemoryDataSourceCatalog {
                     false,
                 ),
                 "Snowflake" => (true, true, true, false),
+                "Databricks" => (true, true, true, true),
                 "CsvFile" => (true, true, true, false),
                 _ => (false, false, false, false),
             };
 
-        let supports_parameters = connector_capabilities.parameterized_queries;
+        let supports_parameters = match source_type {
+            "Oracle" => uses_odbc_routing,
+            _ => connector_capabilities.parameterized_queries,
+        };
         let can_infer_schema = if source_type == "SAPHANA" {
             base_can_infer_schema
         } else {
@@ -616,11 +625,12 @@ impl InMemoryDataSourceCatalog {
             ),
             supports_incremental: matches!(
                 source.connection.config,
-                SourceConfig::PostgreSQL(_)
-                    | SourceConfig::Oracle(_)
+                SourceConfig::Oracle(_)
+                    | SourceConfig::PostgreSQL(_)
                     | SourceConfig::DB2(_)
                     | SourceConfig::SAPHANA(_)
                     | SourceConfig::Snowflake(_)
+                    | SourceConfig::Databricks(_)
             ),
             supports_cancellation: !uses_odbc_routing && connector_capabilities.query_timeout,
         }
@@ -1025,6 +1035,7 @@ impl InMemoryDataSourceCatalog {
         source: &DataSource,
         credentials: &Credentials,
         query: &str,
+        parameters: HashMap<String, serde_json::Value>,
         limit: Option<usize>,
     ) -> CatalogResult<QueryResult> {
         #[cfg(feature = "odbc")]
@@ -1071,44 +1082,97 @@ impl InMemoryDataSourceCatalog {
             &final_query[..final_query.len().min(100)]
         );
 
-        // Execute via pooled connection or fallback to non-pooled for DB2
+        // Execute via pooled connection or fallback to non-pooled when parameters require native
+        // ODBC binding support.
         #[cfg(feature = "odbc")]
         let result = match &source.connection.config {
             SourceConfig::Oracle(_) => {
-                let pool = self
-                    .get_or_create_oracle_pool(&source.id, &connection_string)
-                    .await?;
-                let mut conn = pool.get().await.map_err(|e| {
-                    GraphicaError::Internal(format!(
-                        "Failed to acquire Oracle connection from pool: {}",
-                        e
-                    ))
-                })?;
-                conn.execute_query_with_metadata(&final_query)
-                    .map_err(|e| GraphicaError::Internal(format!("Oracle query failed: {}", e)))?
-            }
-            SourceConfig::SAPHANA(_) => {
-                let pool = self
-                    .get_or_create_saphana_pool(&source.id, &connection_string)
-                    .await?;
-                let mut conn = pool.get().await.map_err(|e| {
-                    GraphicaError::Internal(format!(
-                        "Failed to acquire SAP HANA connection from pool: {}",
-                        e
-                    ))
-                })?;
-                conn.execute_query_with_metadata(&final_query)
-                    .map_err(|e| GraphicaError::Internal(format!("SAP HANA query failed: {}", e)))?
-            }
-            SourceConfig::DB2(_) => {
-                // DB2 uses its own dedicated pool via workflow system
-                // Fallback to non-pooled execution for catalog queries
-                use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata;
-                execute_odbc_query_with_metadata(&connection_string, &final_query)
+                if !parameters.is_empty() {
+                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
+                    execute_odbc_query_with_metadata_and_params(
+                        &connection_string,
+                        &final_query,
+                        parameters.clone(),
+                    )
                     .await
                     .map_err(|e| {
-                        GraphicaError::Internal(format!("DB2 query execution failed: {}", e))
+                        GraphicaError::Internal(format!(
+                            "Oracle parameterized query execution failed: {}",
+                            e
+                        ))
                     })?
+                } else {
+                    let pool = self
+                        .get_or_create_oracle_pool(&source.id, &connection_string)
+                        .await?;
+                    let mut conn = pool.get().await.map_err(|e| {
+                        GraphicaError::Internal(format!(
+                            "Failed to acquire Oracle connection from pool: {}",
+                            e
+                        ))
+                    })?;
+                    conn.execute_query_with_metadata(&final_query)
+                        .map_err(|e| {
+                            GraphicaError::Internal(format!("Oracle query failed: {}", e))
+                        })?
+                }
+            }
+            SourceConfig::SAPHANA(_) => {
+                if !parameters.is_empty() {
+                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
+                    execute_odbc_query_with_metadata_and_params(
+                        &connection_string,
+                        &final_query,
+                        parameters.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        GraphicaError::Internal(format!(
+                            "SAP HANA parameterized query execution failed: {}",
+                            e
+                        ))
+                    })?
+                } else {
+                    let pool = self
+                        .get_or_create_saphana_pool(&source.id, &connection_string)
+                        .await?;
+                    let mut conn = pool.get().await.map_err(|e| {
+                        GraphicaError::Internal(format!(
+                            "Failed to acquire SAP HANA connection from pool: {}",
+                            e
+                        ))
+                    })?;
+                    conn.execute_query_with_metadata(&final_query)
+                        .map_err(|e| {
+                            GraphicaError::Internal(format!("SAP HANA query failed: {}", e))
+                        })?
+                }
+            }
+            SourceConfig::DB2(_) => {
+                if !parameters.is_empty() {
+                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
+                    execute_odbc_query_with_metadata_and_params(
+                        &connection_string,
+                        &final_query,
+                        parameters.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        GraphicaError::Internal(format!(
+                            "DB2 parameterized query execution failed: {}",
+                            e
+                        ))
+                    })?
+                } else {
+                    // DB2 uses its own dedicated pool via workflow system
+                    // Fallback to non-pooled execution for catalog queries
+                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata;
+                    execute_odbc_query_with_metadata(&connection_string, &final_query)
+                        .await
+                        .map_err(|e| {
+                            GraphicaError::Internal(format!("DB2 query execution failed: {}", e))
+                        })?
+                }
             }
             _ => unreachable!(),
         };
@@ -1624,15 +1688,8 @@ impl DataSourceCatalog for InMemoryDataSourceCatalog {
         if Self::should_use_odbc(source_type) {
             tracing::debug!("Routing {} query to ODBC execution path", source_type);
 
-            if !parameters.is_empty() {
-                return Err(GraphicaError::Configuration(format!(
-                    "Parameterized queries are not supported for {} datasources until native ODBC bind support is implemented",
-                    source_type
-                )));
-            }
-
             return self
-                .execute_query_via_odbc(&source, &credentials, query, limit)
+                .execute_query_via_odbc(&source, &credentials, query, parameters, limit)
                 .await;
         }
 
@@ -1864,7 +1921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_query_rejects_parameters_for_odbc_sources() {
+    async fn test_oracle_capabilities_advertise_parameter_and_incremental_support() {
         let registry = Arc::new(RwLock::new(ConnectorRegistry::new()));
         let catalog = InMemoryDataSourceCatalog::new(registry);
 
@@ -1891,24 +1948,13 @@ mod tests {
         let source_id = source.id.clone();
         catalog.register_source(source).await.unwrap();
 
-        let result = catalog
-            .execute_query(
-                &source_id,
-                "SELECT * FROM DUAL WHERE :id = 1",
-                HashMap::from([("id".to_string(), serde_json::json!(1))]),
-                Some(10),
-            )
-            .await;
-
-        assert!(
-            matches!(
-                &result,
-                Err(GraphicaError::Configuration(message))
-                    if message.contains("Parameterized queries are not supported")
-            ),
-            "expected parameter rejection, got {:?}",
-            result
-        );
+        let response = catalog.get_source(&source_id).await.unwrap();
+        let capabilities = response
+            .capabilities
+            .expect("capabilities should be populated");
+        assert_eq!(capabilities.supports_parameters, cfg!(feature = "odbc"));
+        assert_eq!(capabilities.supports_incremental, cfg!(feature = "odbc"));
+        assert_eq!(capabilities.can_write_workflow, cfg!(feature = "odbc"));
     }
 
     #[tokio::test]

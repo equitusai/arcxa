@@ -563,8 +563,14 @@ impl DbExtractConfig {
         if self.table_name.is_none() && self.query.is_none() {
             anyhow::bail!("Either table_name or query must be provided");
         }
+        if self.query.is_some() && self.incremental.unwrap_or(false) {
+            anyhow::bail!("incremental extraction is only supported in table mode");
+        }
         if self.incremental.unwrap_or(false) && self.incremental_column.is_none() {
             anyhow::bail!("incremental_column required when incremental is true");
+        }
+        if self.incremental.unwrap_or(false) && self.last_value.is_none() {
+            anyhow::bail!("last_value required when incremental is true");
         }
         if self.include_schema.unwrap_or(false)
             && self.schema_table.is_none()

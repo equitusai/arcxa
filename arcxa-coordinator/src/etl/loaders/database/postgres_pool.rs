@@ -5,7 +5,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime, SslMode};
-use graphica_core::catalog::postgres_tls::{make_rustls_connector, ssl_mode_uses_tls};
+use graphica_core::catalog::postgres_tls::{
+    connect_postgres_client_with_transport, make_rustls_connector, postgres_ssl_behavior,
+    ssl_mode_uses_tls, PostgresSslBehavior,
+};
 use std::time::Duration;
 use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
@@ -212,8 +215,48 @@ pub async fn create_postgres_pool(config: PostgresPoolConfig) -> Result<Postgres
         },
     });
 
+    let connection_string = format!(
+        "host={} port={} dbname={} user={} password={}",
+        config.postgres_config.host,
+        config.postgres_config.port,
+        config.postgres_config.database,
+        config.postgres_config.username,
+        config.postgres_config.password
+    );
+    let ssl_behavior = postgres_ssl_behavior(config.postgres_config.ssl_mode.as_deref());
+    let use_tls = match ssl_behavior {
+        PostgresSslBehavior::Disable => false,
+        PostgresSslBehavior::Require => true,
+        PostgresSslBehavior::Prefer => {
+            let (client, used_tls) = connect_postgres_client_with_transport(
+                &connection_string,
+                config.postgres_config.ssl_mode.as_deref(),
+            )
+            .await
+            .context("Failed to probe PostgreSQL transport mode for pool initialization")?;
+
+            client
+                .simple_query("SELECT 1")
+                .await
+                .context("Failed PostgreSQL pool transport probe query")?;
+
+            used_tls
+        }
+    };
+
+    pg_config.ssl_mode = if use_tls {
+        config
+            .postgres_config
+            .ssl_mode
+            .as_deref()
+            .map(parse_postgres_ssl_mode)
+            .transpose()?
+    } else {
+        Some(SslMode::Disable)
+    };
+
     // Create pool
-    let pool = if ssl_mode_uses_tls(config.postgres_config.ssl_mode.as_deref()) {
+    let pool = if use_tls && ssl_mode_uses_tls(config.postgres_config.ssl_mode.as_deref()) {
         let tls = make_rustls_connector().context("Failed to configure PostgreSQL TLS")?;
         pg_config
             .create_pool(Some(Runtime::Tokio1), tls)

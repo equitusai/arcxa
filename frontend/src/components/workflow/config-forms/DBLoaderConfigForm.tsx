@@ -1,30 +1,66 @@
 /**
  * Database Loader Configuration Form
- * Configure database data loading (INSERT/UPSERT/REPLACE)
+ * Schema-aware target configuration for INSERT/UPSERT/REPLACE.
  */
 
-import React from 'react';
-import { Upload, AlertCircle } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { AlertCircle, Loader2, Search, Upload } from 'lucide-react';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  inferDatasourceSchemaForWorkflow,
+  type WorkflowDatasourceSchema,
+} from '@/api/datasources';
 import { useDatasources } from '@/hooks/useDatasources';
-import type { DBLoaderConfig } from '@/lib/workflow-etl-config';
+import type { DBLoaderConfig, DetectedField } from '@/lib/workflow-etl-config';
 
 export interface DBLoaderConfigFormProps {
   config?: DBLoaderConfig;
   onUpdate: (updates: Partial<DBLoaderConfig>) => void;
   nodeId?: string;
+  upstreamSchema?: DetectedField[];
 }
 
-export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps) {
+function qualifiedIdentifierVariants(value: string): string[] {
+  const segments = value
+    .split('.')
+    .map((segment) => segment.trim().replace(/^[`"]+|[`"]+$/g, '').toLowerCase())
+    .filter(Boolean);
+
+  const variants: string[] = [];
+  for (let start = 0; start < segments.length; start += 1) {
+    variants.push(segments.slice(start).join('.'));
+  }
+
+  return Array.from(new Set(variants));
+}
+
+function tableNameMatches(left: string, right: string): boolean {
+  const leftVariants = qualifiedIdentifierVariants(left);
+  const rightVariants = qualifiedIdentifierVariants(right);
+  return leftVariants.some((variant) => rightVariants.includes(variant));
+}
+
+export function DBLoaderConfigForm({
+  config,
+  onUpdate,
+  upstreamSchema = [],
+}: DBLoaderConfigFormProps) {
   const { data: datasources, isLoading } = useDatasources();
+  const [schema, setSchema] = useState<WorkflowDatasourceSchema | null>(null);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [columnSearch, setColumnSearch] = useState('');
 
   const datasourceId = config?.datasource_id || '';
   const tableName = config?.table_name || '';
   const mode = config?.mode || 'insert';
   const keyFields = config?.key_fields || [];
   const batchSize = config?.batch_size || 1000;
+
   const selectedDatasource = datasources?.find((datasource) => datasource.id === datasourceId);
   const writableDatasources = (datasources || []).filter(
     (datasource) => datasource.instance_capabilities?.canWriteWorkflow ?? false
@@ -36,26 +72,148 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
       ? [selectedDatasource, ...writableDatasources]
       : writableDatasources;
 
+  const capabilities = selectedDatasource?.instance_capabilities;
+  const canInferSchema = capabilities?.canInferSchema ?? false;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!datasourceId || !canInferSchema) {
+      setSchema(null);
+      setSchemaError(null);
+      setSchemaLoading(false);
+      return;
+    }
+
+    setSchemaLoading(true);
+    setSchemaError(null);
+
+    inferDatasourceSchemaForWorkflow(datasourceId)
+      .then((response) => {
+        if (!cancelled) {
+          setSchema(response);
+        }
+      })
+      .catch((error: Error) => {
+        if (!cancelled) {
+          setSchema(null);
+          setSchemaError(error.message || 'Schema inference failed');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setSchemaLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [datasourceId, canInferSchema]);
+
+  const inferredTables = schema?.tables || [];
+  const selectedTableSchema = useMemo(
+    () => inferredTables.find((table) => tableNameMatches(table.name, tableName)),
+    [inferredTables, tableName]
+  );
+
+  const filteredTargetColumns = useMemo(() => {
+    if (!selectedTableSchema) {
+      return [];
+    }
+
+    if (!columnSearch.trim()) {
+      return selectedTableSchema.columns;
+    }
+
+    const query = columnSearch.trim().toLowerCase();
+    return selectedTableSchema.columns.filter((column) =>
+      column.name.toLowerCase().includes(query)
+    );
+  }, [selectedTableSchema, columnSearch]);
+
+  const targetColumnNames = useMemo(
+    () => selectedTableSchema?.columns.map((column) => column.name) || [],
+    [selectedTableSchema]
+  );
+  const upstreamFieldNames = useMemo(
+    () => upstreamSchema.map((field) => field.name),
+    [upstreamSchema]
+  );
+
+  const matchedColumns = useMemo(
+    () => upstreamFieldNames.filter((field) => targetColumnNames.includes(field)),
+    [targetColumnNames, upstreamFieldNames]
+  );
+  const upstreamOnlyColumns = useMemo(
+    () => upstreamFieldNames.filter((field) => !targetColumnNames.includes(field)),
+    [targetColumnNames, upstreamFieldNames]
+  );
+  const targetRequiredColumns = useMemo(
+    () =>
+      selectedTableSchema?.columns
+        .filter((column) => column.nullable === false && !upstreamFieldNames.includes(column.name))
+        .map((column) => column.name) || [],
+    [selectedTableSchema, upstreamFieldNames]
+  );
+  const invalidKeyFields = useMemo(
+    () => keyFields.filter((field) => !targetColumnNames.includes(field)),
+    [keyFields, targetColumnNames]
+  );
+
+  useEffect(() => {
+    if (mode !== 'upsert' || !selectedTableSchema) {
+      return;
+    }
+
+    if (invalidKeyFields.length > 0) {
+      onUpdate({
+        key_fields: keyFields.filter((field) => targetColumnNames.includes(field)),
+      });
+    }
+  }, [invalidKeyFields, keyFields, mode, onUpdate, selectedTableSchema, targetColumnNames]);
+
+  const handleDatasourceChange = (value: string) => {
+    onUpdate({
+      datasource_id: value,
+      table_name: '',
+      key_fields: [],
+    });
+  };
+
+  const handleTargetTableSelection = (value: string) => {
+    onUpdate({
+      table_name: value,
+      key_fields: keyFields,
+    });
+  };
+
+  const handleKeyFieldToggle = (fieldName: string, checked: boolean) => {
+    const nextFields = checked
+      ? Array.from(new Set([...keyFields, fieldName]))
+      : keyFields.filter((field) => field !== fieldName);
+
+    onUpdate({ key_fields: nextFields });
+  };
+
   return (
     <div className="space-y-4">
-      {/* Header */}
       <div className="flex items-center gap-2 pb-2 border-b border-border">
         <Upload className="w-4 h-4 text-primary" />
         <h3 className="text-sm font-semibold text-foreground">Database Loader Configuration</h3>
       </div>
 
-      {/* Datasource Selection */}
       <div className="space-y-2">
         <Label htmlFor="datasource" className="text-xs font-medium text-foreground">
           Target Datasource <span className="text-red-500">*</span>
         </Label>
         <Select
           value={datasourceId}
-          onValueChange={(value) => onUpdate({ datasource_id: value })}
+          onValueChange={handleDatasourceChange}
           disabled={isLoading}
         >
           <SelectTrigger id="datasource" className="text-sm">
-            <SelectValue placeholder={isLoading ? "Loading..." : "Select datasource..."} />
+            <SelectValue placeholder={isLoading ? 'Loading...' : 'Select datasource...'} />
           </SelectTrigger>
           <SelectContent>
             {datasourceOptions.map((ds) => (
@@ -66,7 +224,7 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
           </SelectContent>
         </Select>
         <p className="text-xs text-muted-foreground">
-          Only datasources marked by the coordinator as workflow-writable are available here
+          Only datasources marked by the coordinator as workflow-writable are available here.
         </p>
       </div>
 
@@ -74,8 +232,8 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800">
-            No data sources currently support workflow loading. Add a writable target data source
-            first.
+            No data sources currently support workflow loading. Register a writable target data
+            source first.
           </div>
         </div>
       )}
@@ -89,7 +247,56 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
         </div>
       )}
 
-      {/* Table Name */}
+      {selectedDatasource && (
+        <div className="p-3 bg-background-secondary border border-border rounded text-xs space-y-1">
+          <div className="font-medium text-foreground mb-1">Target Capability Summary</div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Schema inference</span>
+            <span className="font-medium text-foreground">
+              {canInferSchema ? 'Available' : 'Manual table entry only'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Workflow write</span>
+            <span className="font-medium text-foreground">
+              {selectedDatasource.instance_capabilities?.canWriteWorkflow ? 'Enabled' : 'Blocked'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {canInferSchema && (
+        <div className="space-y-2">
+          <Label htmlFor="target-table-picker" className="text-xs font-medium text-foreground">
+            Target Table
+          </Label>
+          <Select
+            value={tableName}
+            onValueChange={handleTargetTableSelection}
+            disabled={schemaLoading || inferredTables.length === 0}
+          >
+            <SelectTrigger id="target-table-picker" className="text-sm">
+              <SelectValue
+                placeholder={
+                  schemaLoading
+                    ? 'Loading tables...'
+                    : inferredTables.length > 0
+                    ? 'Select table...'
+                    : 'No inferred tables'
+                }
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {inferredTables.map((table) => (
+                <SelectItem key={table.name} value={table.name}>
+                  {table.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
       <div className="space-y-2">
         <Label htmlFor="table-name" className="text-xs font-medium text-foreground">
           Table Name <span className="text-red-500">*</span>
@@ -97,17 +304,42 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
         <Input
           id="table-name"
           type="text"
-          placeholder="customers"
+          placeholder="customers_curated"
           value={tableName}
-          onChange={(e) => onUpdate({ table_name: e.target.value })}
+          onChange={(event) => onUpdate({ table_name: event.target.value })}
           className="text-sm font-mono"
         />
         <p className="text-xs text-muted-foreground">
-          Target table to load data into
+          Use a discovered table when available, or enter the target table manually.
         </p>
       </div>
 
-      {/* Load Mode */}
+      {schemaLoading && (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          Loading target schema...
+        </div>
+      )}
+
+      {schemaError && (
+        <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
+          <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="text-amber-800">
+            Target schema inference failed. Manual target configuration is still available.
+          </div>
+        </div>
+      )}
+
+      {!schemaLoading && !canInferSchema && selectedDatasource && (
+        <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
+          <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="text-amber-800">
+            This datasource does not expose target schema inference. Table and key-field selection
+            stay manual.
+          </div>
+        </div>
+      )}
+
       <div className="space-y-2">
         <Label htmlFor="mode" className="text-xs font-medium text-foreground">
           Load Mode <span className="text-red-500">*</span>
@@ -120,48 +352,87 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="insert">Insert - Add new records only</SelectItem>
-            <SelectItem value="upsert">Upsert - Insert or update existing</SelectItem>
-            <SelectItem value="replace">Replace - Truncate then insert</SelectItem>
+            <SelectItem value="insert">Insert</SelectItem>
+            <SelectItem value="upsert">Upsert</SelectItem>
+            <SelectItem value="replace">Replace</SelectItem>
           </SelectContent>
         </Select>
-        <div className="text-xs text-muted-foreground space-y-1 pl-3 border-l-2 border-border">
-          {mode === 'insert' && (
-            <p>Inserts new records. Fails if key already exists.</p>
-          )}
-          {mode === 'upsert' && (
-            <p>Updates existing records or inserts new ones. Requires key fields.</p>
-          )}
-          {mode === 'replace' && (
-            <p><span className="text-red-600 font-medium">Warning:</span> Deletes all existing data before loading.</p>
-          )}
-        </div>
       </div>
 
-      {/* Key Fields (for upsert mode) */}
       {mode === 'upsert' && (
         <div className="space-y-2">
-          <Label htmlFor="key-fields" className="text-xs font-medium text-foreground">
-            Key Fields <span className="text-red-500">*</span>
-          </Label>
-          <Input
-            id="key-fields"
-            type="text"
-            placeholder="customer_id, email"
-            value={keyFields.join(', ')}
-            onChange={(e) => {
-              const fields = e.target.value.split(',').map(f => f.trim()).filter(Boolean);
-              onUpdate({ key_fields: fields });
-            }}
-            className="text-sm font-mono"
-          />
+          <div className="flex items-center justify-between">
+            <Label className="text-xs font-medium text-foreground">
+              Key Fields <span className="text-red-500">*</span>
+            </Label>
+            <span className="text-xs text-muted-foreground">{keyFields.length} selected</span>
+          </div>
+
+          {selectedTableSchema ? (
+            <>
+              <div className="relative">
+                <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+                <Input
+                  type="search"
+                  value={columnSearch}
+                  onChange={(event) => setColumnSearch(event.target.value)}
+                  placeholder="Filter target columns..."
+                  className="pl-8 text-sm"
+                />
+              </div>
+              <ScrollArea className="h-40 rounded border border-border p-2">
+                <div className="space-y-2">
+                  {filteredTargetColumns.map((column) => (
+                    <label
+                      key={column.name}
+                      className="flex items-center justify-between gap-3 rounded border border-transparent px-2 py-1.5 hover:border-border"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Checkbox
+                          checked={keyFields.includes(column.name)}
+                          onCheckedChange={(value) =>
+                            handleKeyFieldToggle(column.name, Boolean(value))
+                          }
+                        />
+                        <div className="min-w-0">
+                          <div className="text-xs font-medium text-foreground truncate">
+                            {column.name}
+                          </div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {column.type}
+                            {column.primary_key ? ' • PK' : ''}
+                            {column.nullable === false ? ' • required' : ''}
+                          </div>
+                        </div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </ScrollArea>
+            </>
+          ) : (
+            <Input
+              id="key-fields"
+              type="text"
+              placeholder="customer_id, external_id"
+              value={keyFields.join(', ')}
+              onChange={(event) => {
+                const fields = event.target.value
+                  .split(',')
+                  .map((field) => field.trim())
+                  .filter(Boolean);
+                onUpdate({ key_fields: fields });
+              }}
+              className="text-sm font-mono"
+            />
+          )}
+
           <p className="text-xs text-muted-foreground">
-            Comma-separated list of fields to match on for updates
+            Select the key fields used to match existing rows during upsert.
           </p>
         </div>
       )}
 
-      {/* Batch Size */}
       <div className="space-y-2">
         <Label htmlFor="batch-size" className="text-xs font-medium text-foreground">
           Batch Size
@@ -170,32 +441,69 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
           id="batch-size"
           type="number"
           min="1"
-          max="10000"
+          max="50000"
           value={batchSize}
-          onChange={(e) => onUpdate({ batch_size: parseInt(e.target.value) || 1000 })}
+          onChange={(event) =>
+            onUpdate({ batch_size: Number.parseInt(event.target.value, 10) || 1000 })
+          }
           className="text-sm"
         />
-        <p className="text-xs text-muted-foreground">
-          Number of rows to insert per batch (1-10000)
-        </p>
       </div>
 
-      {/* Validation Messages */}
+      <div className="space-y-2 pt-2 border-t border-border">
+        <Label className="text-xs font-medium text-foreground">Target Compatibility</Label>
+
+        {upstreamSchema.length === 0 ? (
+          <div className="flex items-start gap-2 p-3 bg-background-secondary border border-border rounded text-xs">
+            <AlertCircle className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-0.5" />
+            <div className="text-muted-foreground">
+              Connect an upstream source or transformation to compare the output schema against the
+              target table.
+            </div>
+          </div>
+        ) : (
+          <div className="rounded border border-border overflow-hidden text-xs">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-px bg-border">
+              <div className="bg-background p-3 space-y-2">
+                <div className="font-medium text-foreground">Matched Columns</div>
+                <div className="text-muted-foreground">
+                  {matchedColumns.length > 0 ? matchedColumns.join(', ') : 'None yet'}
+                </div>
+              </div>
+              <div className="bg-background p-3 space-y-2">
+                <div className="font-medium text-foreground">Upstream Only</div>
+                <div className="text-muted-foreground">
+                  {upstreamOnlyColumns.length > 0 ? upstreamOnlyColumns.join(', ') : 'None'}
+                </div>
+              </div>
+              <div className="bg-background p-3 space-y-2">
+                <div className="font-medium text-foreground">Target Required Only</div>
+                <div className="text-muted-foreground">
+                  {targetRequiredColumns.length > 0 ? targetRequiredColumns.join(', ') : 'None'}
+                </div>
+              </div>
+              <div className="bg-background p-3 space-y-2">
+                <div className="font-medium text-foreground">Invalid Key Fields</div>
+                <div className="text-muted-foreground">
+                  {invalidKeyFields.length > 0 ? invalidKeyFields.join(', ') : 'None'}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {!datasourceId && (
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-          <div className="text-amber-800">
-            Target datasource is required
-          </div>
+          <div className="text-amber-800">Target datasource is required.</div>
         </div>
       )}
 
       {!tableName && (
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-          <div className="text-amber-800">
-            Table name is required
-          </div>
+          <div className="text-amber-800">Target table name is required.</div>
         </div>
       )}
 
@@ -203,29 +511,8 @@ export function DBLoaderConfigForm({ config, onUpdate }: DBLoaderConfigFormProps
         <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800">
-            Key fields are required for upsert mode
+            Upsert mode requires one or more key fields.
           </div>
-        </div>
-      )}
-
-      {/* Configuration Summary */}
-      {datasourceId && tableName && (
-        <div className="p-3 bg-background-secondary border border-border rounded text-xs space-y-1">
-          <div className="font-medium text-foreground mb-1">Load Summary</div>
-          <div className="flex items-center justify-between">
-            <span className="text-muted-foreground">Mode:</span>
-            <span className="font-medium text-foreground capitalize">{mode}</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-muted-foreground">Batch size:</span>
-            <span className="font-mono text-foreground">{batchSize.toLocaleString()}</span>
-          </div>
-          {mode === 'upsert' && keyFields.length > 0 && (
-            <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">Key fields:</span>
-              <span className="font-mono text-foreground text-right">{keyFields.join(', ')}</span>
-            </div>
-          )}
         </div>
       )}
     </div>

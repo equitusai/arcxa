@@ -29,15 +29,21 @@
 //! ```
 
 use super::{DataSource, DatabaseConnectionConfig, DatabaseType};
+use crate::common::databricks::{
+    build_loader_connection_string, workflow_connection_to_databricks,
+};
+use crate::common::oracle::build_workflow_connection_string as build_oracle_workflow_connection_string;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use futures::stream::Stream;
+use futures::{stream::Stream, StreamExt, TryStreamExt};
+use graphica_core::catalog::connectors::databricks::DatabricksSqlClient;
 use graphica_core::catalog::postgres_tls::connect_postgres_client;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::pin::Pin;
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
+use tokio_postgres::types::ToSql;
 
 /// Row of data read from a source
 pub type DataRow = HashMap<String, JsonValue>;
@@ -275,12 +281,12 @@ impl DatabaseQueryReader {
                     connection_config.username,
                     connection_config.password
                 ),
-                DatabaseType::Oracle => Self::build_oracle_connection_string(connection_config)?,
+                DatabaseType::Oracle => build_oracle_workflow_connection_string(connection_config)?,
                 DatabaseType::SAPHANA => Self::build_hana_connection_string(connection_config)?,
                 DatabaseType::Databricks => {
-                    return Err(anyhow!(
-                        "Databricks query reading not yet implemented - use Databricks executor integration"
-                    ))
+                    let (config, credentials) =
+                        workflow_connection_to_databricks(connection_config)?;
+                    build_loader_connection_string(&config, &credentials)
                 }
                 _ => {
                     return Err(anyhow!(
@@ -293,70 +299,6 @@ impl DatabaseQueryReader {
         } else {
             Err(anyhow!("Invalid source type for DatabaseQueryReader"))
         }
-    }
-
-    fn build_oracle_connection_string(
-        connection_config: &DatabaseConnectionConfig,
-    ) -> Result<String> {
-        if let Some(raw) = connection_config.extra_params.get("odbc_connection_string") {
-            return Ok(Self::apply_credentials_to_connection_string(
-                raw,
-                connection_config,
-            ));
-        }
-
-        let driver = connection_config
-            .extra_params
-            .get("odbc_driver")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_ORACLE_ODBC_DRIVER").ok())
-            .unwrap_or_else(|| "Oracle in OraClient19Home1".to_string());
-
-        let dsn = connection_config
-            .extra_params
-            .get("odbc_dsn")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_ORACLE_ODBC_DSN").ok());
-
-        let service_name = connection_config
-            .extra_params
-            .get("service_name")
-            .cloned()
-            .or_else(|| {
-                (!connection_config.database.is_empty()).then(|| connection_config.database.clone())
-            });
-        let sid = connection_config.extra_params.get("sid").cloned();
-
-        let mut conn = if let Some(dsn) = dsn {
-            format!(
-                "DSN={};UID={};PWD={}",
-                dsn, connection_config.username, connection_config.password
-            )
-        } else {
-            let dbq = if let Some(service_name) = service_name {
-                format!(
-                    "//{}:{}/{}",
-                    connection_config.host, connection_config.port, service_name
-                )
-            } else if let Some(sid) = sid {
-                format!(
-                    "{}:{}/{}",
-                    connection_config.host, connection_config.port, sid
-                )
-            } else {
-                return Err(anyhow!(
-                    "Oracle connection config requires service_name, sid, or a database value usable as the service name"
-                ));
-            };
-
-            format!(
-                "DRIVER={{{}}};DBQ={};UID={};PWD={};",
-                driver, dbq, connection_config.username, connection_config.password
-            )
-        };
-
-        Self::append_odbc_options(&mut conn, connection_config);
-        Ok(conn)
     }
 
     fn build_hana_connection_string(
@@ -479,9 +421,7 @@ impl DataSourceReader for DatabaseQueryReader {
                 DatabaseType::DB2 => self.read_odbc_query(query, *fetch_size, "DB2").await,
                 DatabaseType::Oracle => self.read_odbc_query(query, *fetch_size, "Oracle").await,
                 DatabaseType::SAPHANA => self.read_odbc_query(query, *fetch_size, "SAP HANA").await,
-                DatabaseType::Databricks => Err(anyhow!(
-                    "Databricks database query reading not yet implemented"
-                )),
+                DatabaseType::Databricks => self.read_databricks_query(query, *fetch_size).await,
                 _ => Err(anyhow!(
                     "Database type {:?} not yet supported for query reading",
                     database_type
@@ -498,8 +438,53 @@ impl DataSourceReader for DatabaseQueryReader {
 }
 
 impl DatabaseQueryReader {
+    fn postgres_row_value_to_json(row: &tokio_postgres::Row, idx: usize) -> JsonValue {
+        if let Ok(val) = row.try_get::<_, Option<bool>>(idx) {
+            return val.map(JsonValue::Bool).unwrap_or(JsonValue::Null);
+        }
+        if let Ok(val) = row.try_get::<_, Option<i16>>(idx) {
+            return val
+                .map(|value| JsonValue::Number((value as i64).into()))
+                .unwrap_or(JsonValue::Null);
+        }
+        if let Ok(val) = row.try_get::<_, Option<i32>>(idx) {
+            return val
+                .map(|value| JsonValue::Number(value.into()))
+                .unwrap_or(JsonValue::Null);
+        }
+        if let Ok(val) = row.try_get::<_, Option<i64>>(idx) {
+            return val
+                .map(|value| JsonValue::Number(value.into()))
+                .unwrap_or(JsonValue::Null);
+        }
+        if let Ok(val) = row.try_get::<_, Option<f64>>(idx) {
+            return val
+                .and_then(serde_json::Number::from_f64)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null);
+        }
+        if let Ok(val) = row.try_get::<_, Option<String>>(idx) {
+            return val.map(JsonValue::String).unwrap_or(JsonValue::Null);
+        }
+
+        JsonValue::Null
+    }
+
+    fn postgres_row_to_data_row(row: &tokio_postgres::Row) -> DataRow {
+        row.columns()
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                (
+                    column.name().to_string(),
+                    Self::postgres_row_value_to_json(row, idx),
+                )
+            })
+            .collect()
+    }
+
     /// Read from PostgreSQL database
-    async fn read_postgres_query(&self, query: &str, _fetch_size: usize) -> Result<DataStream> {
+    async fn read_postgres_query(&self, query: &str, fetch_size: usize) -> Result<DataStream> {
         let connection_string = Self::build_connection_string(&self.source)?;
         let ssl_mode = match &self.source {
             DataSource::DatabaseQuery {
@@ -512,48 +497,28 @@ impl DatabaseQueryReader {
             .await
             .context("Failed to connect to PostgreSQL")?;
 
-        // Execute query
         let query_owned = query.to_string();
-        let rows = client
-            .query(&query_owned, &[])
+        let row_stream = client
+            .query_raw(&query_owned, std::iter::empty::<&(dyn ToSql + Sync)>())
             .await
             .context("Failed to execute query")?;
+        let chunk_size = fetch_size.max(1);
 
-        // Convert rows to stream
         let stream = async_stream::stream! {
-            for row in rows {
-                let mut data_row: DataRow = HashMap::new();
-
-                // Iterate over columns
-                for (idx, column) in row.columns().iter().enumerate() {
-                    let col_name = column.name().to_string();
-
-                    // Try to extract value (support common types)
-                    let value: JsonValue = if let Ok(val) = row.try_get::<_, Option<String>>(idx) {
-                        val.map(JsonValue::String).unwrap_or(JsonValue::Null)
-                    } else if let Ok(val) = row.try_get::<_, Option<i32>>(idx) {
-                        val.map(|v| JsonValue::Number(v.into())).unwrap_or(JsonValue::Null)
-                    } else if let Ok(val) = row.try_get::<_, Option<i64>>(idx) {
-                        val.map(|v| JsonValue::Number(v.into())).unwrap_or(JsonValue::Null)
-                    } else if let Ok(val) = row.try_get::<_, Option<f64>>(idx) {
-                        if let Some(v) = val {
-                            serde_json::Number::from_f64(v)
-                                .map(JsonValue::Number)
-                                .unwrap_or(JsonValue::Null)
-                        } else {
-                            JsonValue::Null
+            let chunked = row_stream.try_chunks(chunk_size);
+            futures::pin_mut!(chunked);
+            while let Some(chunk_result) = chunked.next().await {
+                match chunk_result {
+                    Ok(rows) => {
+                        for row in rows {
+                            yield Ok(Self::postgres_row_to_data_row(&row));
                         }
-                    } else if let Ok(val) = row.try_get::<_, Option<bool>>(idx) {
-                        val.map(JsonValue::Bool).unwrap_or(JsonValue::Null)
-                    } else {
-                        // Fallback: try to get as string
-                        JsonValue::Null
-                    };
-
-                    data_row.insert(col_name, value);
+                    }
+                    Err(error) => {
+                        yield Err(anyhow!(error).context("Failed to stream PostgreSQL rows"));
+                        break;
+                    }
                 }
-
-                yield Ok(data_row);
             }
         };
 
@@ -588,6 +553,43 @@ impl DatabaseQueryReader {
         };
 
         let _ = fetch_size; // fetch_size is handled by the ODBC driver
+        Ok(Box::pin(stream))
+    }
+
+    async fn read_databricks_query(&self, query: &str, _fetch_size: usize) -> Result<DataStream> {
+        let connection_config = match &self.source {
+            DataSource::DatabaseQuery {
+                connection_config, ..
+            } => connection_config,
+            _ => return Err(anyhow!("Invalid source type for Databricks query reader")),
+        };
+
+        let (config, credentials) = workflow_connection_to_databricks(connection_config)?;
+        let client = DatabricksSqlClient::from_config(&config, &credentials)
+            .map_err(|error| anyhow!(error))
+            .context("Failed to create Databricks SQL client")?;
+        let result = client
+            .execute_query(query, HashMap::new(), None, 300)
+            .await
+            .map_err(|error| anyhow!(error))
+            .context("Failed to execute Databricks query")?;
+
+        let stream = async_stream::stream! {
+            for row in result.rows {
+                match row {
+                    JsonValue::Object(map) => {
+                        let data_row: DataRow = map.into_iter().collect();
+                        yield Ok(data_row);
+                    }
+                    value => {
+                        let mut data_row = HashMap::new();
+                        data_row.insert("value".to_string(), value);
+                        yield Ok(data_row);
+                    }
+                }
+            }
+        };
+
         Ok(Box::pin(stream))
     }
 }
@@ -831,6 +833,34 @@ mod tests {
     }
 
     #[test]
+    fn test_oracle_reader_accepts_camel_case_service_name_extra_param() {
+        use super::super::DatabaseConnectionConfig;
+        use super::super::DatabaseType;
+
+        let mut extra_params = HashMap::new();
+        extra_params.insert("serviceName".to_string(), "ORCLPDB1".to_string());
+
+        let source = DataSource::DatabaseQuery {
+            datasource_id: "test_oracle".to_string(),
+            database_type: DatabaseType::Oracle,
+            connection_config: DatabaseConnectionConfig {
+                host: "oracle.example.com".to_string(),
+                port: 1521,
+                database: String::new(),
+                username: "etl_user".to_string(),
+                password: "secret".to_string(),
+                ssl_mode: None,
+                extra_params,
+            },
+            query: "SELECT 1 FROM dual".to_string(),
+            fetch_size: 1000,
+        };
+
+        let connection_string = DatabaseQueryReader::build_connection_string(&source).unwrap();
+        assert!(connection_string.contains("DBQ=//oracle.example.com:1521/ORCLPDB1"));
+    }
+
+    #[test]
     fn test_hana_reader_builds_odbc_connection_string() {
         use super::super::DatabaseConnectionConfig;
         use super::super::DatabaseType;
@@ -860,5 +890,41 @@ mod tests {
         assert!(connection_string.contains("DATABASENAME=HXE;"));
         assert!(connection_string.contains("UID=SYSTEM"));
         assert!(connection_string.contains("PWD=secret"));
+    }
+
+    #[test]
+    fn test_databricks_reader_builds_loader_connection_string() {
+        use super::super::DatabaseConnectionConfig;
+        use super::super::DatabaseType;
+
+        let mut extra_params = HashMap::new();
+        extra_params.insert(
+            "http_path".to_string(),
+            "/sql/1.0/warehouses/abc123".to_string(),
+        );
+        extra_params.insert("schema".to_string(), "bronze".to_string());
+
+        let source = DataSource::DatabaseQuery {
+            datasource_id: "test_databricks".to_string(),
+            database_type: DatabaseType::Databricks,
+            connection_config: DatabaseConnectionConfig {
+                host: "https://adb-123.azuredatabricks.net".to_string(),
+                port: 443,
+                database: "main".to_string(),
+                username: "svc_arcxa".to_string(),
+                password: "token-value".to_string(),
+                ssl_mode: Some("require".to_string()),
+                extra_params,
+            },
+            query: "SELECT 1".to_string(),
+            fetch_size: 1000,
+        };
+
+        let connection_string = DatabaseQueryReader::build_connection_string(&source).unwrap();
+        assert!(connection_string.contains("workspace_url=https://adb-123.azuredatabricks.net"));
+        assert!(connection_string.contains("http_path=/sql/1.0/warehouses/abc123"));
+        assert!(connection_string.contains("catalog=main"));
+        assert!(connection_string.contains("schema=bronze"));
+        assert!(connection_string.contains("token=token-value"));
     }
 }

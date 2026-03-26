@@ -191,6 +191,7 @@ pub struct ImportJobRequest {
     pub name: Option<String>,
     pub source_id: String,
     pub table: String,
+    pub schema: Option<String>,
     pub where_clause: Option<String>,
     pub columns: Vec<String>,
     pub limit: Option<usize>,
@@ -205,6 +206,7 @@ impl From<&DatasourceImportRequest> for ImportJobRequest {
             name: req.name.clone(),
             source_id: req.source_id.clone(),
             table: req.table.clone(),
+            schema: req.schema.clone(),
             where_clause: req.where_clause.clone(),
             columns: req.columns.clone(),
             limit: req.limit,
@@ -245,6 +247,7 @@ mod tests {
             name: Some("Test Import".to_string()),
             source_id: "source_1".to_string(),
             table: "customers".to_string(),
+            schema: None,
             where_clause: None,
             columns: vec![],
             limit: None,
@@ -286,6 +289,7 @@ mod tests {
             name: Some("Failing Import".to_string()),
             source_id: "source_1".to_string(),
             table: "invalid_table".to_string(),
+            schema: None,
             where_clause: None,
             columns: vec![],
             limit: None,
@@ -323,6 +327,7 @@ mod tests {
             name: Some("Progress Test".to_string()),
             source_id: "source_1".to_string(),
             table: "data".to_string(),
+            schema: None,
             where_clause: None,
             columns: vec![],
             limit: None,
@@ -354,6 +359,7 @@ mod tests {
             name: Some("Profiled Import".to_string()),
             source_id: "source_1".to_string(),
             table: "customers".to_string(),
+            schema: None,
             where_clause: None,
             columns: vec![],
             limit: None,
@@ -404,6 +410,7 @@ mod tests {
                 name: Some(format!("Import {}", i)),
                 source_id: "source_1".to_string(),
                 table: "table".to_string(),
+                schema: None,
                 where_clause: None,
                 columns: vec![],
                 limit: None,
@@ -456,6 +463,7 @@ mod tests {
                 name: Some(format!("Import {}", i)),
                 source_id: "source_1".to_string(),
                 table: "table".to_string(),
+                schema: None,
                 where_clause: None,
                 columns: vec![],
                 limit: None,
@@ -522,6 +530,7 @@ mod tests {
                     name: Some(format!("Concurrent Import {}", i)),
                     source_id: "source_1".to_string(),
                     table: "table".to_string(),
+                    schema: None,
                     where_clause: None,
                     columns: vec![],
                     limit: None,
@@ -568,6 +577,7 @@ mod tests {
                 name: Some(format!("Import {}", i)),
                 source_id: "source_1".to_string(),
                 table: "table".to_string(),
+                schema: None,
                 where_clause: None,
                 columns: vec![],
                 limit: None,
@@ -598,6 +608,7 @@ mod tests {
         let datasource_req = DatasourceImportRequest {
             source_id: "pg_source".to_string(),
             table: "users".to_string(),
+            schema: Some("public".to_string()),
             name: Some("User Import".to_string()),
             where_clause: Some("active = true".to_string()),
             columns: vec!["id".to_string(), "email".to_string()],
@@ -613,6 +624,7 @@ mod tests {
 
         assert_eq!(job_req.source_id, "pg_source");
         assert_eq!(job_req.table, "users");
+        assert_eq!(job_req.schema, Some("public".to_string()));
         assert_eq!(job_req.name, Some("User Import".to_string()));
         assert_eq!(job_req.where_clause, Some("active = true".to_string()));
         assert_eq!(job_req.columns.len(), 2);

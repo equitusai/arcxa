@@ -27,8 +27,8 @@ export interface SchemaDiscoveryResponse {
 
 export interface SchemaDiscoveryRequest {
   sourceId: string;
-  table_name?: string | null;
-  sample_size?: number;
+  tableName?: string | null;
+  sampleSize?: number;
 }
 
 /**
@@ -37,8 +37,8 @@ export interface SchemaDiscoveryRequest {
 export async function discoverSchema(datasourceId: string): Promise<SchemaDiscoveryResponse> {
   const request: SchemaDiscoveryRequest = {
     sourceId: datasourceId,
-    table_name: null,
-    sample_size: 100,
+    tableName: null,
+    sampleSize: 100,
   };
 
   return api.post(`/datasources/${datasourceId}/schema/infer`, request);
@@ -53,8 +53,8 @@ export async function discoverTableSchema(
 ): Promise<SchemaDiscoveryResponse> {
   const request: SchemaDiscoveryRequest = {
     sourceId: datasourceId,
-    table_name: tableName,
-    sample_size: 100,
+    tableName,
+    sampleSize: 100,
   };
 
   return api.post(`/datasources/${datasourceId}/schema/infer`, request);

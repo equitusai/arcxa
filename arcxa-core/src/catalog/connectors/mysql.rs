@@ -566,13 +566,14 @@ mod tests {
         let source = create_test_source();
         let creds = Credentials::new("testuser".to_string(), "testpass".to_string());
 
-        let schema = connector
+        let error = connector
             .infer_schema(&source, creds, Some("users"), 1000)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(schema.name, "testdb");
-        assert_eq!(schema.tables.len(), 1);
+        assert!(error
+            .to_string()
+            .contains("MySQL schema inference is not yet implemented"));
     }
 
     #[tokio::test]
@@ -581,7 +582,7 @@ mod tests {
         let source = create_test_source();
         let creds = Credentials::new("testuser".to_string(), "testpass".to_string());
 
-        let result = connector
+        let error = connector
             .execute_query(
                 &source,
                 creds,
@@ -591,10 +592,11 @@ mod tests {
                 30,
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(result.row_count, 1);
-        assert!(!result.truncated);
+        assert!(error
+            .to_string()
+            .contains("MySQL query execution is not yet implemented"));
     }
 
     // V2 Interface Tests

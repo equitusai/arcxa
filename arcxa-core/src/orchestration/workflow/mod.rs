@@ -43,12 +43,14 @@ pub mod error;
 pub mod execution_context_v2;
 pub mod executor;
 pub mod executor_optimized;
+pub(crate) mod field_transformer;
 pub mod input;
 pub mod lineage_tracker;
 pub mod memory_monitor;
 pub mod progress;
 pub mod row_lineage_context;
 pub mod row_storage;
+pub mod runtime;
 #[cfg(feature = "workflow-storage")]
 pub mod streaming_deduplicator;
 pub mod traits;
@@ -117,6 +119,7 @@ pub use executor::{
 };
 #[cfg(feature = "workflow-storage")]
 pub use executor_optimized::OptimizedStepExecutor;
+pub(crate) use field_transformer::RowTransformationStats;
 pub use input::{
     DataSourceInputAdapter, DatasetInputAdapter, DatasetResolver, EntityFilterAdapter,
     ExecutionMode, InputAdapter, JsonInputAdapter, QueryExecutor, SparqlInputAdapter,
@@ -132,6 +135,13 @@ pub use row_lineage_context::{RowLineageContext, RowTransformationRecord};
 #[cfg(feature = "workflow-storage")]
 pub use row_storage::StorageManager;
 pub use row_storage::{RowAccessor, RowStorage, StorageType};
+pub use runtime::frame::{BatchFrame, BatchFrameMetadata};
+pub use runtime::lineage::RuntimeLineageMode;
+pub use runtime::metrics::RuntimeStepMetrics;
+pub use runtime::spill::{
+    SpillBackend, SpillDecision, SpillPolicy, SpillThresholds, StorageTieringPlan,
+    StorageTieringPolicy, StorageTieringThresholds,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

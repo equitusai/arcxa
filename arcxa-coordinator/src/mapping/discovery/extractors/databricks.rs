@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use graphica_core::catalog::connector::Credentials;
+use graphica_core::catalog::connectors::databricks::DatabricksSqlClient;
 use graphica_core::catalog::connectors::ConnectorRegistry;
 use graphica_core::catalog::types::{DataSource, SourceConfig};
 use std::collections::HashMap;
@@ -47,6 +48,16 @@ impl DatabricksExtractor {
             ));
         }
         Ok(())
+    }
+
+    fn quote_table_identifier(value: &str) -> Result<String> {
+        DatabricksSqlClient::quote_identifier(value).map_err(|error| anyhow!(error))
+    }
+
+    fn quote_column_identifier(value: &str) -> Result<String> {
+        let segment = DatabricksSqlClient::sanitize_identifier_segment(value)
+            .map_err(|error| anyhow!(error))?;
+        Ok(format!("`{segment}`"))
     }
 }
 
@@ -108,7 +119,8 @@ impl SchemaExtractor for DatabricksExtractor {
             .get("Databricks")
             .map_err(|e| anyhow!("Databricks connector unavailable: {}", e))?;
 
-        let query = format!("SELECT * FROM `{}` LIMIT {}", table_name, sample_size);
+        let quoted_table = Self::quote_table_identifier(table_name)?;
+        let query = format!("SELECT * FROM {}", quoted_table);
         let result = connector
             .execute_query(
                 source,
@@ -143,16 +155,18 @@ impl SchemaExtractor for DatabricksExtractor {
             .get("Databricks")
             .map_err(|e| anyhow!("Databricks connector unavailable: {}", e))?;
 
+        let quoted_table = Self::quote_table_identifier(table_name)?;
+        let quoted_column = Self::quote_column_identifier(column_name)?;
         let query = format!(
             r#"
 SELECT
-    COUNT(DISTINCT `{col}`) AS distinct_count,
-    SUM(CASE WHEN `{col}` IS NULL THEN 1 ELSE 0 END) AS null_count,
+    COUNT(DISTINCT {col}) AS distinct_count,
+    SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) AS null_count,
     COUNT(*) AS total_count
-FROM `{table}`
+FROM {table}
 "#,
-            table = table_name,
-            col = column_name
+            table = quoted_table,
+            col = quoted_column
         );
 
         let result = match connector
@@ -212,5 +226,13 @@ mod tests {
     fn validates_identifier_rules() {
         assert!(DatabricksExtractor::validate_identifier("bronze.events", "table").is_ok());
         assert!(DatabricksExtractor::validate_identifier("bad-name", "table").is_err());
+    }
+
+    #[test]
+    fn quotes_multi_part_table_identifiers() {
+        assert_eq!(
+            DatabricksExtractor::quote_table_identifier("main.bronze.events").unwrap(),
+            "`main`.`bronze`.`events`"
+        );
     }
 }

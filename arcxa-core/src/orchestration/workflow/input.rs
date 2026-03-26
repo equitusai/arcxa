@@ -62,6 +62,48 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use super::executor::ExecutionContext;
+use super::runtime::frame::{BatchFrame, BatchFrameMetadata};
+
+fn contexts_from_row_batches(
+    rows: &[JsonValue],
+    batch_size: usize,
+) -> Result<Vec<ExecutionContext>> {
+    contexts_from_row_batches_with_metadata(rows, batch_size, BatchFrameMetadata::default())
+}
+
+fn contexts_from_row_batches_with_metadata(
+    rows: &[JsonValue],
+    batch_size: usize,
+    metadata: BatchFrameMetadata,
+) -> Result<Vec<ExecutionContext>> {
+    let mut contexts = Vec::new();
+
+    for chunk in rows.chunks(batch_size) {
+        let frame = BatchFrame::from_json_values(chunk)?.with_metadata(metadata.clone());
+        contexts.push(ExecutionContext::from_batch_frame(frame)?);
+    }
+
+    if contexts.is_empty() {
+        let frame = BatchFrame::from_json_values(&[])?.with_metadata(metadata);
+        contexts.push(ExecutionContext::from_batch_frame(frame)?);
+    }
+
+    Ok(contexts)
+}
+
+fn input_batch_metadata(source_kind: &str, source_id: Option<String>) -> BatchFrameMetadata {
+    BatchFrameMetadata {
+        source_step_id: None,
+        source_kind: Some(source_kind.to_string()),
+        source_id,
+    }
+}
+
+fn apply_batch_metadata(contexts: &mut [ExecutionContext], metadata: BatchFrameMetadata) {
+    for context in contexts {
+        context.set_batch_frame_metadata(metadata.clone());
+    }
+}
 
 /// Workflow input specification
 ///
@@ -417,7 +459,9 @@ impl InputAdapter for JsonInputAdapter {
         match input {
             WorkflowInput::Json { data } => {
                 // Single execution context with JSON data
-                Ok(vec![ExecutionContext::new(data.clone())])
+                let mut context = ExecutionContext::from_input_value(data.clone())?;
+                context.set_batch_frame_metadata(input_batch_metadata("json_input", None));
+                Ok(vec![context])
             }
             _ => anyhow::bail!("JsonInputAdapter only handles Json input type"),
         }
@@ -464,18 +508,11 @@ impl InputAdapter for DatasetInputAdapter {
                     .await
                     .with_context(|| format!("Failed to load dataset {}", dataset_id))?;
 
-                let batch_sz = batch_size.unwrap_or(1000);
-                let mut contexts = Vec::new();
-
-                for chunk in rows.chunks(batch_sz) {
-                    contexts.push(ExecutionContext::new(JsonValue::Array(chunk.to_vec())));
-                }
-
-                if contexts.is_empty() {
-                    contexts.push(ExecutionContext::new(JsonValue::Array(vec![])));
-                }
-
-                Ok(contexts)
+                contexts_from_row_batches_with_metadata(
+                    &rows,
+                    batch_size.unwrap_or(1000),
+                    input_batch_metadata("dataset_input", Some(dataset_id.clone())),
+                )
             }
             _ => anyhow::bail!("DatasetInputAdapter only handles Dataset input type"),
         }
@@ -529,15 +566,17 @@ impl InputAdapter for SparqlInputAdapter {
                 // Convert results to execution contexts
                 if let Some(batch_sz) = batch_size {
                     // Batched execution
-                    let mut contexts = Vec::new();
-                    for chunk in results.chunks(*batch_sz) {
-                        let context = ExecutionContext::new(JsonValue::Array(chunk.to_vec()));
-                        contexts.push(context);
-                    }
-                    Ok(contexts)
+                    contexts_from_row_batches_with_metadata(
+                        &results,
+                        *batch_sz,
+                        input_batch_metadata("sparql_query", graph.clone()),
+                    )
                 } else {
-                    // Single execution
-                    Ok(vec![ExecutionContext::new(JsonValue::Array(results))])
+                    contexts_from_row_batches_with_metadata(
+                        &results,
+                        results.len().max(1),
+                        input_batch_metadata("sparql_query", graph.clone()),
+                    )
                 }
             }
             _ => anyhow::bail!("SparqlInputAdapter only handles SparqlQuery input type"),
@@ -642,7 +681,14 @@ impl InputAdapter for EntityFilterAdapter {
 
         // Delegate to SPARQL adapter
         let sparql_adapter = SparqlInputAdapter::new(self.query_executor.clone());
-        sparql_adapter.prepare_context(&sparql_input).await
+        let mut contexts = sparql_adapter.prepare_context(&sparql_input).await?;
+        if let WorkflowInput::EntityFilter { entity_type, .. } = input {
+            apply_batch_metadata(
+                &mut contexts,
+                input_batch_metadata("entity_filter", Some(entity_type.clone())),
+            );
+        }
+        Ok(contexts)
     }
 
     fn name(&self) -> &str {
@@ -691,21 +737,11 @@ impl InputAdapter for DataSourceInputAdapter {
                     .context("Failed to execute data source query")?;
 
                 // Convert query results to execution contexts
-                let batch_sz = batch_size.unwrap_or(1000);
-
-                let mut contexts = Vec::new();
-                for chunk in query_result.rows.chunks(batch_sz) {
-                    // Convert rows to JSON array
-                    let context = ExecutionContext::new(JsonValue::Array(chunk.to_vec()));
-                    contexts.push(context);
-                }
-
-                if contexts.is_empty() {
-                    // Return single empty context if no results
-                    contexts.push(ExecutionContext::new(JsonValue::Array(vec![])));
-                }
-
-                Ok(contexts)
+                contexts_from_row_batches_with_metadata(
+                    &query_result.rows,
+                    batch_size.unwrap_or(1000),
+                    input_batch_metadata("data_source_query", Some(source_id.clone())),
+                )
             }
             _ => anyhow::bail!("DataSourceInputAdapter only handles DataSourceQuery input type"),
         }
@@ -731,10 +767,127 @@ pub trait QueryExecutor: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::api_types::{
+        ConnectionTestResult, DataSourceResponse, DataSourceStatus, ListDataSourcesRequest,
+        ListDataSourcesResponse, QueryResult, SchemaDefinition, UpdateDataSourcePatch,
+    };
+    use crate::catalog::client::{CatalogResult, DataSourceCatalog, UsageStatistics};
+    use crate::catalog::types::DataSource;
     use std::sync::Arc;
 
     struct MockDatasetResolver {
         rows: Vec<JsonValue>,
+    }
+
+    struct MockQueryExecutor {
+        rows: Vec<JsonValue>,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryExecutor for MockQueryExecutor {
+        async fn execute_query(
+            &self,
+            _query: &str,
+            _graph: Option<&str>,
+        ) -> Result<Vec<JsonValue>> {
+            Ok(self.rows.clone())
+        }
+    }
+
+    struct MockCatalog {
+        rows: Vec<JsonValue>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSourceCatalog for MockCatalog {
+        async fn register_source(&self, _source: DataSource) -> CatalogResult<DataSourceResponse> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn get_source(&self, _id: &str) -> CatalogResult<DataSourceResponse> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn update_source(
+            &self,
+            _id: &str,
+            _updates: UpdateDataSourcePatch,
+        ) -> CatalogResult<DataSourceResponse> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn delete_source(&self, _id: &str) -> CatalogResult<()> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn list_sources(
+            &self,
+            _request: &ListDataSourcesRequest,
+        ) -> CatalogResult<ListDataSourcesResponse> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn test_connection(&self, _id: &str) -> CatalogResult<ConnectionTestResult> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn infer_schema(
+            &self,
+            _id: &str,
+            _table_name: Option<&str>,
+            _sample_size: usize,
+        ) -> CatalogResult<SchemaDefinition> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn execute_query(
+            &self,
+            _id: &str,
+            _query: &str,
+            _parameters: std::collections::HashMap<String, serde_json::Value>,
+            _limit: Option<usize>,
+        ) -> CatalogResult<QueryResult> {
+            Ok(QueryResult {
+                rows: self.rows.clone(),
+                row_count: self.rows.len(),
+                execution_time_ms: 1,
+                truncated: false,
+                columns: None,
+            })
+        }
+
+        async fn mark_synced(&self, _id: &str) -> CatalogResult<()> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: DataSourceStatus,
+            _error_message: Option<String>,
+        ) -> CatalogResult<()> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn search_sources(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> CatalogResult<Vec<DataSourceResponse>> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn get_sources_by_tag(&self, _tag: &str) -> CatalogResult<Vec<DataSourceResponse>> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn get_usage_stats(&self, _id: &str) -> CatalogResult<UsageStatistics> {
+            unreachable!("not used in input adapter tests")
+        }
+
+        async fn get_source_by_title(&self, _title: &str) -> CatalogResult<DataSourceResponse> {
+            unreachable!("not used in input adapter tests")
+        }
     }
 
     #[async_trait::async_trait]
@@ -1008,6 +1161,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_adapter_normalizes_row_arrays_through_batch_frame_bridge() {
+        let adapter = JsonInputAdapter;
+        let input = WorkflowInput::Json {
+            data: serde_json::json!([
+                {"id": 1, "status": "new"},
+                {"id": 2, "status": "done"}
+            ]),
+        };
+
+        let contexts = adapter.prepare_context(&input).await.unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].get_batch_frame().unwrap().row_count(), 2);
+    }
+
+    #[tokio::test]
     async fn test_dataset_adapter_batches_rows() {
         let adapter = DatasetInputAdapter::new(Arc::new(MockDatasetResolver {
             rows: vec![
@@ -1026,5 +1194,128 @@ mod tests {
         assert_eq!(contexts.len(), 2);
         assert_eq!(contexts[0].input_data.as_array().unwrap().len(), 2);
         assert_eq!(contexts[1].input_data.as_array().unwrap().len(), 1);
+        let frame = contexts[0].get_batch_frame().unwrap();
+        assert_eq!(frame.row_count(), 2);
+        assert_eq!(
+            frame.metadata().source_kind.as_deref(),
+            Some("dataset_input")
+        );
+        assert_eq!(
+            frame.metadata().source_id.as_deref(),
+            Some("ds_datasource_123")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sparql_adapter_batches_rows_through_batch_frame_bridge() {
+        let adapter = SparqlInputAdapter::new(Arc::new(MockQueryExecutor {
+            rows: vec![
+                serde_json::json!({"id": 1, "name": "alice"}),
+                serde_json::json!({"id": 2, "name": "bob"}),
+                serde_json::json!({"id": 3, "name": "carol"}),
+            ],
+        }));
+        let input = WorkflowInput::SparqlQuery {
+            query: "SELECT ?id ?name WHERE { ?s ?p ?o }".to_string(),
+            graph: Some("http://graphica.io/latest".to_string()),
+            batch_size: Some(2),
+            limit: None,
+        };
+
+        let contexts = adapter.prepare_context(&input).await.unwrap();
+        assert_eq!(contexts.len(), 2);
+        let frame = contexts[0].get_batch_frame().unwrap();
+        assert_eq!(frame.row_count(), 2);
+        assert_eq!(
+            frame.metadata().source_kind.as_deref(),
+            Some("sparql_query")
+        );
+        assert_eq!(
+            frame.metadata().source_id.as_deref(),
+            Some("http://graphica.io/latest")
+        );
+        assert_eq!(contexts[1].get_batch_frame().unwrap().row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_data_source_adapter_batches_rows_through_batch_frame_bridge() {
+        let adapter = DataSourceInputAdapter::new(Arc::new(MockCatalog {
+            rows: vec![
+                serde_json::json!({"id": 1, "status": "new"}),
+                serde_json::json!({"id": 2, "status": "processed"}),
+                serde_json::json!({"id": 3, "status": "archived"}),
+            ],
+        }));
+        let input = WorkflowInput::DataSourceQuery {
+            source_id: "urn:graphica:datasource:test".to_string(),
+            query: "SELECT id, status FROM items".to_string(),
+            parameters: None,
+            batch_size: Some(2),
+            limit: None,
+            timeout_secs: None,
+        };
+
+        let contexts = adapter.prepare_context(&input).await.unwrap();
+        assert_eq!(contexts.len(), 2);
+        let frame = contexts[0].get_batch_frame().unwrap();
+        assert_eq!(frame.row_count(), 2);
+        assert_eq!(
+            frame.metadata().source_kind.as_deref(),
+            Some("data_source_query")
+        );
+        assert_eq!(
+            frame.metadata().source_id.as_deref(),
+            Some("urn:graphica:datasource:test")
+        );
+        assert_eq!(contexts[1].get_batch_frame().unwrap().row_count(), 1);
+        assert_eq!(
+            contexts[0].input_data,
+            serde_json::json!([
+                {"id": 1, "status": "new"},
+                {"id": 2, "status": "processed"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entity_filter_adapter_overrides_ingress_metadata() {
+        let adapter = EntityFilterAdapter::new(Arc::new(MockQueryExecutor {
+            rows: vec![
+                serde_json::json!({"entity": "cust_1"}),
+                serde_json::json!({"entity": "cust_2"}),
+            ],
+        }));
+        let input = WorkflowInput::EntityFilter {
+            entity_type: "gph:Customer".to_string(),
+            graph: Some("http://graphica.io/latest".to_string()),
+            created_after: None,
+            updated_after: None,
+            limit: None,
+            batch_size: Some(2),
+        };
+
+        let contexts = adapter.prepare_context(&input).await.unwrap();
+        let frame = contexts[0].get_batch_frame().unwrap();
+        assert_eq!(
+            frame.metadata().source_kind.as_deref(),
+            Some("entity_filter")
+        );
+        assert_eq!(frame.metadata().source_id.as_deref(), Some("gph:Customer"));
+    }
+
+    #[tokio::test]
+    async fn test_json_adapter_stamps_batch_ingress_metadata() {
+        let adapter = JsonInputAdapter;
+        let input = WorkflowInput::Json {
+            data: serde_json::json!([
+                {"id": 1, "status": "new"},
+                {"id": 2, "status": "done"}
+            ]),
+        };
+
+        let contexts = adapter.prepare_context(&input).await.unwrap();
+        let frame = contexts[0].get_batch_frame().unwrap();
+        assert_eq!(frame.metadata().source_kind.as_deref(), Some("json_input"));
+        assert_eq!(frame.metadata().source_id, None);
     }
 }

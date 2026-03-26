@@ -1,10 +1,9 @@
 //! External execution ports for migration backends.
 //!
 //! This module introduces an application-facing execution boundary so orchestration
-//! can target backends (Databricks, Oracle, DB2) without coupling handlers to
+//! can target external backends (Oracle, DB2) without coupling handlers to
 //! backend-specific SDKs/protocols.
 
-pub mod databricks;
 pub mod db2;
 pub mod oracle;
 
@@ -15,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub use databricks::DatabricksExecutor;
 pub use db2::Db2Executor;
 pub use oracle::OracleExecutor;
 
@@ -25,7 +23,6 @@ pub use oracle::OracleExecutor;
 pub enum ExecutionBackend {
     Db2,
     Oracle,
-    Databricks,
 }
 
 /// Request contract for an external backend execution.
@@ -133,7 +130,6 @@ impl ExecutorRegistry {
     /// Default scaffold used by API for early integration and contract tests.
     pub fn default_scaffold() -> Self {
         let mut registry = Self::new();
-        registry.register(DatabricksExecutor::new());
         registry.register(Db2Executor::new());
         registry.register(OracleExecutor::new());
         registry
@@ -151,17 +147,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn default_registry_executes_databricks_backend() {
+    async fn default_registry_executes_db2_backend() {
         let registry = ExecutorRegistry::default_scaffold();
         let outcome = registry
             .execute(
-                ExecutionBackend::Databricks,
+                ExecutionBackend::Db2,
                 ExecutionRequest {
                     run_id: "run-1".to_string(),
                     session_id: "session-1".to_string(),
-                    target_host: "https://adb-1.azuredatabricks.net".to_string(),
-                    target_port: 443,
-                    target_database: "lakehouse".to_string(),
+                    target_host: "db2.internal".to_string(),
+                    target_port: 50000,
+                    target_database: "warehouse".to_string(),
                     target_username: "svc_graphica".to_string(),
                     options: HashMap::new(),
                 },
@@ -169,7 +165,7 @@ mod tests {
             .await
             .expect("outcome");
 
-        assert_eq!(outcome.backend, ExecutionBackend::Databricks);
+        assert_eq!(outcome.backend, ExecutionBackend::Db2);
         assert_eq!(outcome.status, ExecutionStatus::Submitted);
     }
 }

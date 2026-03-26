@@ -525,7 +525,7 @@ impl ConnectorRegistry {
                     validation_regex: Some(r"^\d+$".to_string()),
                 },
                 ConfigField {
-                    name: "service_name".to_string(),
+                    name: "serviceName".to_string(),
                     description: "Oracle service name (required if SID not provided)".to_string(),
                     field_type: FieldType::String,
                     default_value: None,
@@ -533,7 +533,7 @@ impl ConnectorRegistry {
                 },
                 ConfigField {
                     name: "sid".to_string(),
-                    description: "Oracle SID (required if service_name not provided)".to_string(),
+                    description: "Oracle SID (required if serviceName not provided)".to_string(),
                     field_type: FieldType::String,
                     default_value: None,
                     validation_regex: None,
@@ -901,18 +901,18 @@ impl ConnectorRegistry {
         ConnectorMetadata {
             id: "databricks".to_string(),
             name: "Databricks".to_string(),
-            version: "0.1.0".to_string(),
+            version: "1.0.0".to_string(),
             description:
-                "Databricks SQL Warehouse connector scaffold; query execution and schema inference are not yet implemented"
+                "Databricks SQL Warehouse connector with connection testing, schema inference, and Statement API query execution"
                     .to_string(),
             source_type: "Databricks".to_string(),
             capabilities: ConnectorCapabilities {
-                parameterized_queries: false,
-                schema_inference: false,
-                query_timeout: false,
+                parameterized_queries: true,
+                schema_inference: true,
+                query_timeout: true,
                 streaming: false,
                 transactions: false,
-                max_batch_size: Some(200000),
+                max_batch_size: Some(50000),
             },
             required_credentials: vec![
                 CredentialField {
@@ -925,15 +925,22 @@ impl ConnectorRegistry {
             ],
             optional_config: vec![
                 ConfigField {
-                    name: "workspace_url".to_string(),
+                    name: "workspaceUrl".to_string(),
                     description: "Databricks workspace URL".to_string(),
                     field_type: FieldType::Url,
                     default_value: None,
                     validation_regex: Some(r"^https://.+$".to_string()),
                 },
                 ConfigField {
-                    name: "http_path".to_string(),
+                    name: "httpPath".to_string(),
                     description: "Databricks SQL endpoint HTTP path".to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "warehouseId".to_string(),
+                    description: "Optional Databricks SQL warehouse ID override".to_string(),
                     field_type: FieldType::String,
                     default_value: None,
                     validation_regex: None,
@@ -1044,7 +1051,7 @@ mod tests {
         let metadata = registry.get_metadata("Snowflake").unwrap();
         assert_eq!(metadata.name, "Snowflake");
         assert!(metadata.description.contains("clustering"));
-        assert!(metadata.capabilities.streaming);
+        assert!(!metadata.capabilities.streaming);
         assert_eq!(metadata.capabilities.max_batch_size, Some(100000));
 
         // Check Snowflake-specific config
@@ -1058,6 +1065,18 @@ mod tests {
         let dbx = registry.get_metadata("Databricks").unwrap();
         assert_eq!(dbx.name, "Databricks");
         assert!(dbx.tags.contains(&"lakehouse".to_string()));
+        assert!(dbx
+            .optional_config
+            .iter()
+            .any(|field| field.name == "workspaceUrl"));
+        assert!(dbx
+            .optional_config
+            .iter()
+            .any(|field| field.name == "httpPath"));
+        assert!(dbx
+            .optional_config
+            .iter()
+            .any(|field| field.name == "warehouseId"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ import {
   ExecuteWorkflowRequest,
   Workflow,
   WorkflowDefinition,
+  ValidateWorkflowResponse,
   RegisterWorkflowRequest,
   RegisterWorkflowResponse,
   WorkflowExecutionRequest,
@@ -358,8 +359,8 @@ export async function deleteWorkflow(workflowId: string): Promise<void> {
 export async function validateWorkflow(
   _workflowId: string,
   definition: WorkflowDefinition
-): Promise<{ valid: boolean; message: string; errors?: string[] }> {
-  return api.post(`/workflows/validate`, definition);
+): Promise<ValidateWorkflowResponse> {
+  return validateWorkflowDefinition(definition);
 }
 
 /**
@@ -539,8 +540,8 @@ export async function abortExecution(
  * @returns Validation result
  */
 export async function validateWorkflowDefinition(
-  definition: import('./types').ValidateWorkflowRequest
-): Promise<import('./types').ValidateWorkflowResponse> {
+  definition: WorkflowDefinition
+): Promise<ValidateWorkflowResponse> {
   return api.post(`/workflows/validate`, definition);
 }
 
