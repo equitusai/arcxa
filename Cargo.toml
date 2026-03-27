@@ -132,3 +132,10 @@ debug-assertions = true
 overflow-checks = true
 incremental = true     # should be default, but make it explicit
 codegen-units = 256    # more parallelism for codegen
+
+[profile.bench-quick]
+inherits = "release"
+lto = "off"
+codegen-units = 64
+debug = 1
+strip = "none"

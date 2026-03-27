@@ -1106,104 +1106,111 @@ impl InMemoryDataSourceCatalog {
 
         // Execute via pooled connection or fallback to non-pooled when parameters require native
         // ODBC binding support.
-        #[cfg(feature = "odbc")]
-        let result = match &source.connection.config {
-            SourceConfig::Oracle(_) => {
-                if !parameters.is_empty() {
-                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
-                    execute_odbc_query_with_metadata_and_params(
-                        &connection_string,
-                        &final_query,
-                        parameters.clone(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        GraphicaError::Internal(format!(
-                            "Oracle parameterized query execution failed: {}",
-                            e
-                        ))
-                    })?
-                } else {
-                    let pool = self
-                        .get_or_create_oracle_pool(&source.id, &connection_string)
-                        .await?;
-                    let mut conn = pool.get().await.map_err(|e| {
-                        GraphicaError::Internal(format!(
-                            "Failed to acquire Oracle connection from pool: {}",
-                            e
-                        ))
-                    })?;
-                    conn.execute_query_with_metadata(&final_query)
-                        .map_err(|e| {
-                            GraphicaError::Internal(format!("Oracle query failed: {}", e))
-                        })?
+        let result: crate::mapping::discovery::extractors::odbc::OdbcQueryResult = {
+            #[cfg(feature = "odbc")]
+            {
+                match &source.connection.config {
+                    SourceConfig::Oracle(_) => {
+                        if !parameters.is_empty() {
+                            use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
+                            execute_odbc_query_with_metadata_and_params(
+                                &connection_string,
+                                &final_query,
+                                parameters.clone(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                GraphicaError::Internal(format!(
+                                    "Oracle parameterized query execution failed: {}",
+                                    e
+                                ))
+                            })?
+                        } else {
+                            let pool = self
+                                .get_or_create_oracle_pool(&source.id, &connection_string)
+                                .await?;
+                            let mut conn = pool.get().await.map_err(|e| {
+                                GraphicaError::Internal(format!(
+                                    "Failed to acquire Oracle connection from pool: {}",
+                                    e
+                                ))
+                            })?;
+                            conn.execute_query_with_metadata(&final_query)
+                                .map_err(|e| {
+                                    GraphicaError::Internal(format!("Oracle query failed: {}", e))
+                                })?
+                        }
+                    }
+                    SourceConfig::SAPHANA(_) => {
+                        if !parameters.is_empty() {
+                            use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
+                            execute_odbc_query_with_metadata_and_params(
+                                &connection_string,
+                                &final_query,
+                                parameters.clone(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                GraphicaError::Internal(format!(
+                                    "SAP HANA parameterized query execution failed: {}",
+                                    e
+                                ))
+                            })?
+                        } else {
+                            let pool = self
+                                .get_or_create_saphana_pool(&source.id, &connection_string)
+                                .await?;
+                            let mut conn = pool.get().await.map_err(|e| {
+                                GraphicaError::Internal(format!(
+                                    "Failed to acquire SAP HANA connection from pool: {}",
+                                    e
+                                ))
+                            })?;
+                            conn.execute_query_with_metadata(&final_query)
+                                .map_err(|e| {
+                                    GraphicaError::Internal(format!("SAP HANA query failed: {}", e))
+                                })?
+                        }
+                    }
+                    SourceConfig::DB2(_) => {
+                        if !parameters.is_empty() {
+                            use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
+                            execute_odbc_query_with_metadata_and_params(
+                                &connection_string,
+                                &final_query,
+                                parameters.clone(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                GraphicaError::Internal(format!(
+                                    "DB2 parameterized query execution failed: {}",
+                                    e
+                                ))
+                            })?
+                        } else {
+                            // DB2 uses its own dedicated pool via workflow system
+                            // Fallback to non-pooled execution for catalog queries
+                            use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata;
+                            execute_odbc_query_with_metadata(&connection_string, &final_query)
+                                .await
+                                .map_err(|e| {
+                                    GraphicaError::Internal(format!(
+                                        "DB2 query execution failed: {}",
+                                        e
+                                    ))
+                                })?
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
-            SourceConfig::SAPHANA(_) => {
-                if !parameters.is_empty() {
-                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
-                    execute_odbc_query_with_metadata_and_params(
-                        &connection_string,
-                        &final_query,
-                        parameters.clone(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        GraphicaError::Internal(format!(
-                            "SAP HANA parameterized query execution failed: {}",
-                            e
-                        ))
-                    })?
-                } else {
-                    let pool = self
-                        .get_or_create_saphana_pool(&source.id, &connection_string)
-                        .await?;
-                    let mut conn = pool.get().await.map_err(|e| {
-                        GraphicaError::Internal(format!(
-                            "Failed to acquire SAP HANA connection from pool: {}",
-                            e
-                        ))
-                    })?;
-                    conn.execute_query_with_metadata(&final_query)
-                        .map_err(|e| {
-                            GraphicaError::Internal(format!("SAP HANA query failed: {}", e))
-                        })?
-                }
-            }
-            SourceConfig::DB2(_) => {
-                if !parameters.is_empty() {
-                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata_and_params;
-                    execute_odbc_query_with_metadata_and_params(
-                        &connection_string,
-                        &final_query,
-                        parameters.clone(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        GraphicaError::Internal(format!(
-                            "DB2 parameterized query execution failed: {}",
-                            e
-                        ))
-                    })?
-                } else {
-                    // DB2 uses its own dedicated pool via workflow system
-                    // Fallback to non-pooled execution for catalog queries
-                    use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata;
-                    execute_odbc_query_with_metadata(&connection_string, &final_query)
-                        .await
-                        .map_err(|e| {
-                            GraphicaError::Internal(format!("DB2 query execution failed: {}", e))
-                        })?
-                }
-            }
-            _ => unreachable!(),
-        };
 
-        #[cfg(not(feature = "odbc"))]
-        let result = {
-            return Err(GraphicaError::Internal(
-                "ODBC feature is not enabled".to_string(),
-            ));
+            #[cfg(not(feature = "odbc"))]
+            {
+                return Err(GraphicaError::Internal(
+                    "ODBC feature is not enabled".to_string(),
+                ));
+            }
         };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;

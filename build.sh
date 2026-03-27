@@ -70,16 +70,18 @@ show_help() {
     echo "ENVIRONMENT VARIABLES:"
     echo "  ENABLE_AUDIT=true|false        Enable cryptographic audit (default: true)"
     echo "  ENABLE_HA=true|false           Enable HA Raft consensus (default: false)"
-    echo "  ENABLE_DB2=true|false          Enable DB2/ODBC support (default: true)"
+    echo "  ENABLE_ODBC=true|false         Enable ODBC-backed connectors for local builds (default: false)"
+    echo "  ENABLE_DB2=true|false          Backward-compatible alias for ENABLE_ODBC"
     echo ""
     echo "ALWAYS ENABLED FEATURES:"
     echo "  workflow-storage               Streaming deduplication with RocksDB (always on)"
     echo ""
     echo "EXAMPLES:"
-    echo "  ./build.sh                     # Build release with default features"
+    echo "  ./build.sh                     # Build release with local/dev default features"
     echo "  ./build.sh debug               # Build debug mode"
     echo "  ./build.sh --status            # Show build status without building"
     echo "  ENABLE_HA=true ./build.sh      # Build with HA support"
+    echo "  ENABLE_ODBC=true ./build.sh    # Build local binary with Oracle/DB2/SAP HANA connector code"
     echo "  ENABLE_AUDIT=false ./build.sh debug  # Build debug without audit"
     echo ""
     echo "BINARIES:"
@@ -99,12 +101,15 @@ show_status() {
     # Detect current configuration
     ENABLE_AUDIT=${ENABLE_AUDIT:-true}
     ENABLE_HA=${ENABLE_HA:-false}
-    ENABLE_DB2=${ENABLE_DB2:-true}
+    if [ -z "${ENABLE_ODBC+x}" ] && [ -n "${ENABLE_DB2+x}" ]; then
+        ENABLE_ODBC="${ENABLE_DB2}"
+    fi
+    ENABLE_ODBC=${ENABLE_ODBC:-false}
 
     echo "Current Configuration:"
     echo "  Cryptographic Audit: $([ "$ENABLE_AUDIT" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
     echo "  HA Raft Consensus:   $([ "$ENABLE_HA" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
-    echo "  DB2/ODBC Support:    $([ "$ENABLE_DB2" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
+    echo "  ODBC Connectors:     $([ "$ENABLE_ODBC" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
     echo ""
 
     echo "Release Binaries:"
@@ -214,9 +219,13 @@ ENABLE_AUDIT=${ENABLE_AUDIT:-true}
 # Set ENABLE_HA=true to enable
 ENABLE_HA=${ENABLE_HA:-false}
 
-# DB2/ODBC support (enabled by default - requires UnixODBC libraries)
-# Set ENABLE_DB2=false to disable (requires: sudo apt-get install unixodbc-dev)
-ENABLE_DB2=${ENABLE_DB2:-true}
+# ODBC-backed connector support (disabled by default for driverless local builds)
+# Set ENABLE_ODBC=true to build Oracle/DB2/SAP HANA support.
+# ENABLE_DB2 remains as a backward-compatible alias.
+if [ -z "${ENABLE_ODBC+x}" ] && [ -n "${ENABLE_DB2+x}" ]; then
+    ENABLE_ODBC="${ENABLE_DB2}"
+fi
+ENABLE_ODBC=${ENABLE_ODBC:-false}
 
 # Build feature list for coordinator
 COORDINATOR_FEATURES=""
@@ -242,15 +251,15 @@ else
     echo -e "${YELLOW}HA Raft Consensus: ${RED}DISABLED${NC}"
 fi
 
-if [ "$ENABLE_DB2" = "true" ]; then
+if [ "$ENABLE_ODBC" = "true" ]; then
     if [ -n "$COORDINATOR_FEATURES" ]; then
         COORDINATOR_FEATURES="${COORDINATOR_FEATURES},odbc"
     else
         COORDINATOR_FEATURES="odbc"
     fi
-    echo -e "${YELLOW}DB2/ODBC Support: ${GREEN}ENABLED${NC}"
+    echo -e "${YELLOW}ODBC-backed connectors: ${GREEN}ENABLED${NC}"
 else
-    echo -e "${YELLOW}DB2/ODBC Support: ${RED}DISABLED${NC}"
+    echo -e "${YELLOW}ODBC-backed connectors: ${RED}DISABLED${NC}"
 fi
 
 if [ -n "$COORDINATOR_FEATURES" ]; then
@@ -333,21 +342,22 @@ if [ "$ENABLE_HA" = "false" ]; then
     echo -e "  To enable: ${YELLOW}ENABLE_HA=true ./build.sh${NC}"
     echo ""
 fi
-if [ "$ENABLE_DB2" = "false" ]; then
-    echo -e "${YELLOW}Note: DB2/ODBC support is DISABLED${NC}"
-    echo -e "  DB2 is enabled by default. To re-enable: ${YELLOW}ENABLE_DB2=true ./build.sh${NC}"
+if [ "$ENABLE_ODBC" = "false" ]; then
+    echo -e "${YELLOW}Note: ODBC-backed connectors are DISABLED${NC}"
+    echo -e "  To enable Oracle/DB2/SAP HANA support: ${YELLOW}ENABLE_ODBC=true ./build.sh${NC}"
     echo ""
 fi
 echo -e "${BLUE}Build options:${NC}"
 echo -e "  Debug build:       ${YELLOW}./build.sh debug${NC}"
 echo -e "  Without audit:     ${YELLOW}ENABLE_AUDIT=false ./build.sh${NC}"
-echo -e "  Without DB2:       ${YELLOW}ENABLE_DB2=false ./build.sh${NC} (DB2 is ON by default)"
+echo -e "  With ODBC:         ${YELLOW}ENABLE_ODBC=true ./build.sh${NC}"
 echo -e "  With HA support:   ${YELLOW}ENABLE_HA=true ./build.sh${NC}"
-echo -e "  Full enterprise:   ${YELLOW}ENABLE_HA=true ENABLE_AUDIT=true ./build.sh${NC} (DB2 included)"
+echo -e "  Full enterprise:   ${YELLOW}ENABLE_HA=true ENABLE_AUDIT=true ENABLE_ODBC=true ./build.sh${NC}"
 echo ""
-echo -e "${BLUE}DB2/ODBC Requirements:${NC}"
-echo -e "  Install libraries: ${YELLOW}sudo apt-get install unixodbc-dev${NC}"
-echo -e "  Note: DB2 is enabled by default (disable with ENABLE_DB2=false)"
+echo -e "${BLUE}ODBC Build Profile:${NC}"
+echo -e "  Driverless local builds are the default"
+echo -e "  Enable Oracle/DB2/SAP HANA support with: ${YELLOW}ENABLE_ODBC=true ./build.sh${NC}"
+echo -e "  ODBC build prerequisites: ${YELLOW}sudo apt-get install unixodbc-dev${NC}"
 echo ""
 echo -e "${BLUE}Observability:${NC}"
 echo -e "  Prometheus: ${YELLOW}http://localhost:9090${NC}"

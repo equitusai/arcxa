@@ -4,14 +4,18 @@
 # Stage 1: Build
 FROM rust:1.75-slim as builder
 
+ARG ENABLE_ODBC=true
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
-    unixodbc-dev \
     protobuf-compiler \
     cmake \
     clang \
+    && if [ "$ENABLE_ODBC" = "true" ]; then \
+         apt-get install -y unixodbc-dev; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -24,18 +28,25 @@ COPY arcxa-coordinator ./arcxa-coordinator
 
 # Build coordinator (release mode)
 WORKDIR /build/arcxa-coordinator
-RUN cargo build --release --bin arcxa-coordinator
+RUN if [ "$ENABLE_ODBC" = "true" ]; then \
+      cargo build --release --bin arcxa-coordinator --features odbc; \
+    else \
+      cargo build --release --bin arcxa-coordinator; \
+    fi
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
+ARG ENABLE_ODBC=true
+
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     libssl3 \
-    unixodbc \
-    libaio1 \
     ca-certificates \
     curl \
+    && if [ "$ENABLE_ODBC" = "true" ]; then \
+         apt-get install -y unixodbc libaio1; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory and user

@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use graphica_coordinator::api::auth::AuthConfig;
 use graphica_coordinator::api::setup_token::SetupTokenManager;
 use graphica_coordinator::api::{rest::build_router, ApiState};
+use graphica_coordinator::common::odbc_runtime::log_odbc_runtime_inventory;
 use graphica_coordinator::config::CoordinatorConfig;
 use graphica_coordinator::governance::distributed::{
     CoordinatorServiceConfig, CoordinatorServiceImpl, CoordinatorServiceServer, ShardId,
@@ -95,6 +96,8 @@ async fn main() -> Result<()> {
     } else {
         warn!("WARNING: No shards configured - running in standalone mode");
     }
+
+    log_odbc_runtime_inventory();
 
     // Initialize application context FIRST (before any components)
     info!("Initializing application context...");

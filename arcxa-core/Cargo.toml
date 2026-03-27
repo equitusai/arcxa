@@ -15,6 +15,7 @@ simd = []
 power10-optimized = []
 lambda = ["aws-config", "aws-sdk-lambda"]  # Enable AWS Lambda invocation
 workflow-storage = ["rocksdb"]  # Enable RocksDB-backed workflow storage
+odbc = ["dep:odbc-api"]  # Enable ODBC-backed connectors such as Oracle, DB2, and SAP HANA
 
 [dependencies]
 # Core utilities
@@ -75,7 +76,7 @@ zstd = "0.13"
 base64 = "0.21"
 num_cpus = "1.16"
 hostname = "0.4"
-odbc-api = "20.1"
+odbc-api = { version = "20.1", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tokio-postgres-rustls = "0.13"
 rustls = "0.23"
@@ -123,6 +124,11 @@ tonic-build = "0.11"
 prost-build = "0.12"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1.4"
 tempfile = "3.8"
 tokio-test = "0.4"
+
+[[bench]]
+name = "workflow_runtime_bench"
+harness = false

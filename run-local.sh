@@ -10,6 +10,8 @@
 #   --dev       Build in debug mode (faster builds, slower runtime)
 #
 # NOTE: This is for single-coordinator development mode (no HA, no Raft coordination)
+# Container deployments now default to the ODBC-enabled profile. This script keeps
+# ODBC disabled by default for local convenience unless ENABLE_ODBC=true is set.
 # For high-availability with Raft leader election, use: ./run-local-ha.sh
 
 set -e
@@ -58,6 +60,11 @@ run_cargo() {
         cargo +${RUST_TOOLCHAIN} "${cargo_args[@]}"
 }
 
+if [ -z "${ENABLE_ODBC+x}" ] && [ -n "${ENABLE_DB2+x}" ]; then
+    ENABLE_ODBC="${ENABLE_DB2}"
+fi
+ENABLE_ODBC=${ENABLE_ODBC:-false}
+
 # Parse command line arguments
 BUILD_MODE="release"
 BUILD_FLAG="--release"
@@ -81,6 +88,7 @@ show_help() {
     echo ""
     echo "NOTES:"
     echo "  - This runs single-coordinator mode (development)"
+    echo "  - ODBC-backed connectors stay off locally unless ENABLE_ODBC=true is set"
     echo "  - For HA with Raft coordination: ./run-local-ha.sh"
     echo "  - Logs: ./data/coordinator/coordinator.log"
     exit 0
@@ -264,7 +272,14 @@ echo ""
 
 echo -e "${YELLOW}Building workspace components (coordinator, model-service, core) in ${BUILD_MODE} mode...${NC}"
 echo -e "${YELLOW}Note: Clearing conda environment variables to avoid OpenSSL conflicts${NC}"
-run_cargo cargo build $BUILD_FLAG --features cryptographic-audit,odbc 2>&1 | tail -1
+COORDINATOR_FEATURES="cryptographic-audit"
+if [ "$ENABLE_ODBC" = "true" ]; then
+    COORDINATOR_FEATURES="${COORDINATOR_FEATURES},odbc"
+    echo -e "${YELLOW}ODBC-backed connectors: ${GREEN}ENABLED${NC}"
+else
+    echo -e "${YELLOW}ODBC-backed connectors: ${RED}DISABLED${NC}"
+fi
+run_cargo cargo build $BUILD_FLAG --features "${COORDINATOR_FEATURES}" 2>&1 | tail -1
 
 echo -e "${YELLOW}Building arcxa-shard (separate build) in ${BUILD_MODE} mode...${NC}"
 echo -e "${YELLOW}Note: Clearing conda environment variables to avoid OpenSSL conflicts${NC}"

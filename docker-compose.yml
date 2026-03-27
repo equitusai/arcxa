@@ -492,6 +492,7 @@ services:
       dockerfile: Dockerfile.coordinator
       args:
         ENABLE_CRYPTOGRAPHIC_AUDIT: "true"  # Enable audit chain compilation
+        ENABLE_ODBC: "${ENABLE_ODBC:-true}"  # Standard deploy profile includes Oracle/DB2/SAP HANA connector code
     image: arcxa-coordinator:latest
     container_name: arcxa-coordinator
     depends_on:

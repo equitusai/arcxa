@@ -1,6 +1,8 @@
 #!/bin/bash
 # Run ARCXA in single-node mode (coordinator only, no shards)
-# Useful for development and testing without distributed complexity
+# Useful for development and testing without distributed complexity.
+# Container deployments now default to the ODBC-enabled profile. This script keeps
+# ODBC disabled by default for local convenience unless ENABLE_ODBC=true is set.
 
 set -e
 
@@ -28,6 +30,11 @@ run_cargo() {
         RUSTFLAGS="" \
         cargo +${RUST_TOOLCHAIN} "${cargo_args[@]}"
 }
+
+if [ -z "${ENABLE_ODBC+x}" ] && [ -n "${ENABLE_DB2+x}" ]; then
+    ENABLE_ODBC="${ENABLE_DB2}"
+fi
+ENABLE_ODBC=${ENABLE_ODBC:-false}
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Running ARCXA (Single-Node Mode)${NC}"
@@ -85,7 +92,13 @@ echo ""
 
 # Build coordinator
 echo -e "${YELLOW}Building arcxa-coordinator...${NC}"
-(cd arcxa-coordinator && run_cargo cargo build --release 2>&1 | tail -3)
+if [ "$ENABLE_ODBC" = "true" ]; then
+    echo -e "${YELLOW}ODBC-backed connectors: ${GREEN}ENABLED${NC}"
+    (cd arcxa-coordinator && run_cargo cargo build --release --features odbc 2>&1 | tail -3)
+else
+    echo -e "${YELLOW}ODBC-backed connectors: ${RED}DISABLED${NC}"
+    (cd arcxa-coordinator && run_cargo cargo build --release 2>&1 | tail -3)
+fi
 
 echo -e "${GREEN}✓ Coordinator built successfully${NC}"
 echo ""

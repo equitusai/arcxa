@@ -5,13 +5,16 @@
 pub mod csv;
 pub mod database_stats; // Phase 1: Database-agnostic statistics extraction
 pub mod databricks;
+#[cfg(feature = "odbc")]
 pub mod db2;
 pub mod enhanced_inference;
 pub mod mysql;
+#[cfg(feature = "odbc")]
 pub mod oracle;
 pub mod postgresql;
 pub mod rdf_ntriples;
 pub mod s3_parquet;
+#[cfg(feature = "odbc")]
 pub mod saphana;
 pub mod snowflake;
 
@@ -123,11 +126,14 @@ impl ConnectorRegistry {
             Arc::new(mysql::MySQLConnector::new()),
             Self::mysql_metadata(),
         );
+        #[cfg(feature = "odbc")]
         registry.register_with_metadata(
             Arc::new(oracle::OracleConnector::new()),
             Self::oracle_metadata(),
         );
+        #[cfg(feature = "odbc")]
         registry.register_with_metadata(Arc::new(db2::DB2Connector::new()), Self::db2_metadata());
+        #[cfg(feature = "odbc")]
         registry.register_with_metadata(
             Arc::new(saphana::SAPHANAConnector::new()),
             Self::saphana_metadata(),
@@ -1025,18 +1031,36 @@ pub struct RegistryStatistics {
 mod tests {
     use super::*;
 
+    fn expected_connector_types() -> Vec<&'static str> {
+        let mut types = vec![
+            "PostgreSQL",
+            "MySQL",
+            "Snowflake",
+            "Databricks",
+            "S3Parquet",
+            "CsvFile",
+            "RDFNTriples",
+        ];
+
+        if cfg!(feature = "odbc") {
+            types.extend(["Oracle", "DB2", "SAPHANA"]);
+        }
+
+        types
+    }
+
     #[test]
     fn test_registry_creation() {
         let registry = ConnectorRegistry::new();
-        assert!(registry.supports("PostgreSQL"));
-        assert!(registry.supports("Oracle"));
-        assert!(registry.supports("DB2"));
-        assert!(registry.supports("SAPHANA"));
-        assert!(registry.supports("Snowflake"));
-        assert!(registry.supports("Databricks"));
-        assert!(registry.supports("S3Parquet"));
-        assert!(registry.supports("CsvFile"));
-        assert!(registry.supports("RDFNTriples"));
+        for source_type in expected_connector_types() {
+            assert!(registry.supports(source_type));
+        }
+
+        if !cfg!(feature = "odbc") {
+            assert!(!registry.supports("Oracle"));
+            assert!(!registry.supports("DB2"));
+            assert!(!registry.supports("SAPHANA"));
+        }
     }
 
     #[test]
@@ -1050,7 +1074,7 @@ mod tests {
     fn test_registry_list() {
         let registry = ConnectorRegistry::new();
         let types = registry.list_types();
-        assert_eq!(types.len(), 10); // Includes Databricks
+        assert_eq!(types.len(), expected_connector_types().len());
     }
 
     #[test]
@@ -1065,7 +1089,7 @@ mod tests {
         let registry = ConnectorRegistry::new();
         let connectors = registry.list_connectors();
 
-        assert_eq!(connectors.len(), 10); // Includes Databricks
+        assert_eq!(connectors.len(), expected_connector_types().len());
 
         // Verify PostgreSQL metadata
         let pg = connectors.iter().find(|c| c.id == "postgresql").unwrap();
@@ -1116,15 +1140,16 @@ mod tests {
     #[test]
     fn test_enable_disable_connector() {
         let mut registry = ConnectorRegistry::new();
+        let total_count = expected_connector_types().len();
 
-        assert_eq!(registry.list_enabled_connectors().len(), 10); // Includes Databricks
+        assert_eq!(registry.list_enabled_connectors().len(), total_count);
 
         registry.disable_connector("PostgreSQL").unwrap();
-        assert_eq!(registry.list_enabled_connectors().len(), 9); // 10 - 1 = 9
+        assert_eq!(registry.list_enabled_connectors().len(), total_count - 1);
         assert!(!registry.supports("PostgreSQL"));
 
         registry.enable_connector("PostgreSQL").unwrap();
-        assert_eq!(registry.list_enabled_connectors().len(), 10); // Includes Databricks
+        assert_eq!(registry.list_enabled_connectors().len(), total_count);
         assert!(registry.supports("PostgreSQL"));
     }
 
@@ -1132,14 +1157,18 @@ mod tests {
     fn test_registry_statistics() {
         let registry = ConnectorRegistry::new();
         let stats = registry.get_statistics();
+        let total_count = expected_connector_types().len();
 
-        assert_eq!(stats.total_count, 10); // Includes Databricks
-        assert_eq!(stats.enabled_count, 10); // Includes Databricks
+        assert_eq!(stats.total_count, total_count);
+        assert_eq!(stats.enabled_count, total_count);
         assert_eq!(stats.disabled_count, 0);
 
-        // Should have at least "database" and "file" categories
-        assert!(stats.by_category.get("database").unwrap() >= &5);
-        assert!(stats.by_category.get("file").unwrap() >= &2);
+        let expected_database_count = if cfg!(feature = "odbc") { 7 } else { 4 };
+        assert_eq!(
+            stats.by_category.get("database").copied(),
+            Some(expected_database_count)
+        );
+        assert_eq!(stats.by_category.get("file").copied(), Some(2));
 
         assert_eq!(stats.total_usage, 0);
     }

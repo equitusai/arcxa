@@ -19,14 +19,14 @@ path = "src/main.rs"
 # path = "src/bin/migrate.rs"
 
 [features]
-default = ["async-governance", "workflow-storage", "odbc"]  # Production-ready defaults
+default = ["async-governance", "workflow-storage"]  # Default build avoids local ODBC driver-manager dependencies
 async-governance = []
 sync-governance = []
 all-governance = ["async-governance", "sync-governance"]
 simd = []
 power10-optimized = []
-odbc = ["dep:odbc-api"]  # Enable ODBC connectivity for DB2 (requires DB2 drivers installed)
-# NOTE: If building without DB2 drivers, use: cargo build --no-default-features --features async-governance,workflow-storage
+odbc = ["dep:odbc-api", "graphica-core/odbc"]  # Enable ODBC-backed connectors such as Oracle, DB2, and SAP HANA
+# NOTE: Enable this feature only when building a profile that needs vendor ODBC drivers.
 
 # Workflow optimization features
 workflow-storage = ["graphica-core/workflow-storage"]  # Enable RocksDB-backed workflow storage for streaming dedup

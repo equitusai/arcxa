@@ -57,14 +57,15 @@ show_help() {
     echo "ENVIRONMENT VARIABLES:"
     echo "  ENABLE_AUDIT=true|false        Enable cryptographic audit features (default: true)"
     echo "  ENABLE_HA=true|false           Enable HA Raft consensus features (default: false)"
-    echo "  ENABLE_DB2=true|false          Enable DB2/ODBC features (default: true)"
+    echo "  ENABLE_ODBC=true|false         Enable ODBC-backed connectors for tests (default: true)"
+    echo "  ENABLE_DB2=true|false          Backward-compatible alias for ENABLE_ODBC"
     echo ""
     echo "EXAMPLES:"
     echo "  ./test.sh                      # Test workspace (debug)"
     echo "  ./test.sh core                 # Test arcxa-core"
     echo "  ./test.sh coordinator -- --nocapture"
     echo "  ./test.sh --release            # Release-mode tests"
-    echo "  ENABLE_DB2=false ./test.sh coordinator"
+    echo "  ENABLE_ODBC=false ./test.sh coordinator"
     echo ""
 }
 
@@ -76,12 +77,15 @@ show_status() {
 
     ENABLE_AUDIT=${ENABLE_AUDIT:-true}
     ENABLE_HA=${ENABLE_HA:-false}
-    ENABLE_DB2=${ENABLE_DB2:-true}
+    if [ -z "${ENABLE_ODBC+x}" ] && [ -n "${ENABLE_DB2+x}" ]; then
+        ENABLE_ODBC="${ENABLE_DB2}"
+    fi
+    ENABLE_ODBC=${ENABLE_ODBC:-true}
 
     echo "Current Configuration:"
     echo "  Cryptographic Audit: $([ "$ENABLE_AUDIT" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
     echo "  HA Raft Consensus:   $([ "$ENABLE_HA" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
-    echo "  DB2/ODBC Support:    $([ "$ENABLE_DB2" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
+    echo "  ODBC Connectors:     $([ "$ENABLE_ODBC" = "true" ] && echo -e "${GREEN}ENABLED${NC}" || echo -e "${RED}DISABLED${NC}")"
     echo ""
     echo "Conda-safe environment variables will be cleared before running tests."
     echo ""
@@ -178,7 +182,10 @@ fi
 # Feature flags (coordinator only)
 ENABLE_AUDIT=${ENABLE_AUDIT:-true}
 ENABLE_HA=${ENABLE_HA:-false}
-ENABLE_DB2=${ENABLE_DB2:-true}
+if [ -z "${ENABLE_ODBC+x}" ] && [ -n "${ENABLE_DB2+x}" ]; then
+    ENABLE_ODBC="${ENABLE_DB2}"
+fi
+ENABLE_ODBC=${ENABLE_ODBC:-true}
 
 COORDINATOR_FEATURES=""
 if [ "$ENABLE_AUDIT" = "true" ]; then
@@ -191,7 +198,7 @@ if [ "$ENABLE_HA" = "true" ]; then
         COORDINATOR_FEATURES="raft-consensus"
     fi
 fi
-if [ "$ENABLE_DB2" = "true" ]; then
+if [ "$ENABLE_ODBC" = "true" ]; then
     if [ -n "$COORDINATOR_FEATURES" ]; then
         COORDINATOR_FEATURES="${COORDINATOR_FEATURES},odbc"
     else

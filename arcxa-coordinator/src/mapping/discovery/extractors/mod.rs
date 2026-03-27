@@ -7,9 +7,11 @@ pub mod databricks;
 pub mod db2;
 pub mod odbc;
 pub mod oracle;
+#[cfg(feature = "odbc")]
 pub mod oracle_pool;
 pub mod postgresql;
 pub mod saphana;
+#[cfg(feature = "odbc")]
 pub mod saphana_pool;
 mod shared;
 pub mod traits;
@@ -18,9 +20,11 @@ pub use csv::CsvExtractor;
 pub use databricks::DatabricksExtractor;
 pub use db2::DB2Extractor;
 pub use oracle::OracleExtractor;
+#[cfg(feature = "odbc")]
 pub use oracle_pool::OdbcOracleConnection;
 pub use postgresql::PostgreSQLExtractor;
 pub use saphana::SAPHANAExtractor;
+#[cfg(feature = "odbc")]
 pub use saphana_pool::OdbcSAPHANAConnection;
 pub use traits::{ExtractorRegistry, SchemaExtractor};
 

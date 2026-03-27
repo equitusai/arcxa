@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[cfg(feature = "odbc")]
 use odbc_api::{
@@ -374,8 +375,6 @@ pub async fn execute_odbc_query_with_metadata(
 use deadpool::managed::{Manager, Pool, PoolError, RecycleError, RecycleResult};
 #[cfg(feature = "odbc")]
 use std::marker::PhantomData;
-#[cfg(feature = "odbc")]
-use std::time::Duration;
 
 /// Trait for ODBC connections that can be pooled
 ///
