@@ -95,6 +95,70 @@ function normalizeConfiguredValue(
   return value;
 }
 
+function isOraclePlugin(plugin: AvailablePlugin | null): boolean {
+  if (!plugin) {
+    return false;
+  }
+
+  return plugin.source_type === 'Oracle' || plugin.name === 'Oracle';
+}
+
+function looksLikeRawOdbcConnectionString(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return true;
+  }
+
+  return /(^|;)\s*[^=;]+\s*=/.test(trimmed);
+}
+
+function getFieldPresentation(
+  plugin: AvailablePlugin | null,
+  key: string,
+  schema: WizardConfigField
+): WizardConfigField {
+  if (!isOraclePlugin(plugin)) {
+    return schema;
+  }
+
+  switch (key) {
+    case 'metadata.odbc_driver':
+      return {
+        ...schema,
+        label: 'Oracle ODBC Driver Override',
+        placeholder: 'Oracle in instantclient_23_0',
+        description:
+          'Optional registered Oracle ODBC driver name. Leave the raw ODBC connection string blank when using this path.',
+      };
+    case 'metadata.odbc_dsn':
+      return {
+        ...schema,
+        label: 'Oracle ODBC DSN Override',
+        placeholder: 'OracleInDocker',
+        description:
+          'Optional registered ODBC DSN. Leave the raw ODBC connection string blank when using DSN resolution.',
+      };
+    case 'metadata.odbc_connection_string':
+      return {
+        ...schema,
+        label: 'Raw Oracle ODBC Connection String',
+        placeholder: 'Driver={Oracle in instantclient_23_0};DBQ=localhost:1521/XE;',
+        description:
+          'Optional full raw ODBC connection string. This overrides the Oracle host/serviceName/sid fields and takes precedence over ODBC DSN and driver overrides.',
+      };
+    case 'metadata.odbc_options':
+      return {
+        ...schema,
+        label: 'Extra Oracle ODBC Options',
+        placeholder: 'StatementCacheSize=50;FetchBufferSize=65536;',
+        description:
+          'Optional extra ODBC segments appended to the resolved connection string.',
+      };
+    default:
+      return schema;
+  }
+}
+
 const STEPS: StepInfo[] = [
   {
     id: 1,
@@ -205,6 +269,24 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
           newErrors[key] = `${schema.label || key} is required`;
         }
       });
+
+      if (isOraclePlugin(selectedPlugin)) {
+        const rawConnectionStringValue = normalizeConfiguredValue(
+          config['metadata.odbc_connection_string'],
+          (
+            selectedPlugin.config_schema as Record<string, WizardConfigField>
+          )['metadata.odbc_connection_string']
+        );
+
+        if (
+          typeof rawConnectionStringValue === 'string' &&
+          rawConnectionStringValue !== '' &&
+          !looksLikeRawOdbcConnectionString(rawConnectionStringValue)
+        ) {
+          newErrors['metadata.odbc_connection_string'] =
+            'Enter a full ODBC connection string like Driver={Oracle in instantclient_23_0};DBQ=localhost:1521/XE; or leave this blank to use the DSN/driver fields.';
+        }
+      }
     }
 
     setErrors(newErrors);
@@ -466,14 +548,17 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
                 {Object.keys(selectedPlugin.config_schema).length > 0 ? (
                   Object.entries(
                     selectedPlugin.config_schema as Record<string, WizardConfigField>
-                  ).map(([key, schema]) => (
+                  ).map(([key, schema]) => {
+                    const fieldSchema = getFieldPresentation(selectedPlugin, key, schema);
+
+                    return (
                     <div key={key}>
                       <Label className="text-sm font-medium">
-                        {schema.label || key}
-                        {schema.required && <span className="text-destructive ml-1">*</span>}
+                        {fieldSchema.label || key}
+                        {fieldSchema.required && <span className="text-destructive ml-1">*</span>}
                       </Label>
 
-                      {schema.type === 'string' && (
+                      {fieldSchema.type === 'string' && (
                         <div className="relative">
                           <Input
                             value={typeof config[key] === 'boolean' ? '' : (config[key] ?? '')}
@@ -483,13 +568,13 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
                                 setErrors((prev) => ({ ...prev, [key]: '' }));
                               }
                             }}
-                            placeholder={schema.placeholder || ''}
-                            type={schema.secret && !showPasswords[key] ? 'password' : 'text'}
+                            placeholder={fieldSchema.placeholder || ''}
+                            type={fieldSchema.secret && !showPasswords[key] ? 'password' : 'text'}
                             className={`mt-1.5 ${errors[key] ? 'border-destructive' : ''} ${
-                              schema.secret ? 'pr-10' : ''
+                              fieldSchema.secret ? 'pr-10' : ''
                             }`}
                           />
-                          {schema.secret && (
+                          {fieldSchema.secret && (
                             <button
                               type="button"
                               onClick={() => togglePasswordVisibility(key)}
@@ -505,7 +590,7 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
                         </div>
                       )}
 
-                      {schema.type === 'number' && (
+                      {fieldSchema.type === 'number' && (
                         <Input
                           type="number"
                           value={typeof config[key] === 'boolean' ? '' : (config[key] ?? '')}
@@ -521,12 +606,12 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
                               setErrors((prev) => ({ ...prev, [key]: '' }));
                             }
                           }}
-                          placeholder={schema.placeholder || ''}
+                          placeholder={fieldSchema.placeholder || ''}
                           className={`mt-1.5 ${errors[key] ? 'border-destructive' : ''}`}
                         />
                       )}
 
-                      {schema.type === 'boolean' && (
+                      {fieldSchema.type === 'boolean' && (
                         <div className="flex items-center gap-2 mt-1.5">
                           <Switch
                             checked={config[key] === true}
@@ -549,12 +634,15 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
                           {errors[key]}
                         </p>
                       ) : (
-                        schema.description && (
-                          <p className="text-xs text-muted-foreground mt-1">{schema.description}</p>
+                        fieldSchema.description && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {fieldSchema.description}
+                          </p>
                         )
                       )}
                     </div>
-                  ))
+                  );
+                  })
                 ) : (
                   <div>
                     <Label className="text-sm font-medium">Configuration (JSON)</Label>
