@@ -117,7 +117,8 @@ pub mod ontology_ddl;
 pub use types::*;
 
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use serde_json::Value as JsonValue;
+use std::{fs::File, path::Path, sync::Arc};
 use tracing::{info, warn};
 
 use crate::governance::rdf_store::GraphicaRdfStore;
@@ -527,29 +528,17 @@ impl MappingEngine {
         let allow_demo_fallback = std::env::var("ALLOW_DEMO_MAPPING_FALLBACK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let created_by = request.user_id.clone();
+        let requested_tables = request.tables.clone();
+        let config = Self::build_mapping_session_config(&request);
 
         info!(
             "Starting mapping analysis for source: {}, user: {}",
-            source_id, request.user_id
+            source_id, created_by
         );
-
-        // Generate session ID
-        let session_id = format!(
-            "session_{}",
-            uuid::Uuid::new_v4().to_string().replace('-', "")
-        );
-
-        // Build configuration
-        let config = MappingSessionConfig {
-            sample_size: request.sample_size.unwrap_or(1000),
-            auto_approve_threshold: request.auto_approve_threshold.unwrap_or(0.95),
-            min_confidence: request.min_confidence.unwrap_or(0.5),
-            max_candidates: request.max_candidates.unwrap_or(10),
-            ontology_namespaces: request.ontology_namespaces.clone(),
-        };
 
         // Get tables to analyze (query data source when not provided)
-        let tables_to_analyze = if let Some(tables) = request.tables {
+        let tables_to_analyze = if let Some(tables) = requested_tables {
             tables
         } else if let Some(discovery_service) = &self.discovery_service {
             info!("No tables specified, discovering tables from datasource");
@@ -583,13 +572,11 @@ impl MappingEngine {
             );
         };
 
-        let mut table_mappings = Vec::new();
+        let mut table_inputs = Vec::new();
 
         // Analyze each table
         for table_name in &tables_to_analyze {
             info!("  Analyzing table: {}", table_name);
-
-            let mut field_mappings = Vec::new();
 
             // Use intelligent discovery if service is available
             let discovered_fields = if let Some(discovery_service) = &self.discovery_service {
@@ -652,10 +639,82 @@ impl MappingEngine {
                 ));
             };
 
+            table_inputs.push((table_name.clone(), discovered_fields));
+        }
+
+        self.create_mapping_session_from_field_inputs(
+            source_id,
+            &created_by,
+            config,
+            table_inputs,
+            start,
+        )
+        .await
+    }
+
+    /// Analyze a managed Parquet-backed dataset and create a source mapping session.
+    pub async fn analyze_dataset_for_mapping(
+        &self,
+        dataset_id: &str,
+        parquet_path: &str,
+        request: AnalyzeForMappingRequest,
+    ) -> Result<AnalyzeForMappingResponse> {
+        let start = std::time::Instant::now();
+        let config = Self::build_mapping_session_config(&request);
+        let created_by = request.user_id.clone();
+        let table_name = request
+            .tables
+            .clone()
+            .and_then(|tables| tables.into_iter().find(|name| !name.trim().is_empty()))
+            .unwrap_or_else(|| derive_parquet_table_name(dataset_id, parquet_path));
+
+        info!(
+            "Starting mapping analysis for dataset: {}, user: {}, path: {}",
+            dataset_id, created_by, parquet_path
+        );
+
+        let discovered_fields =
+            discover_fields_from_parquet_path(parquet_path, config.sample_size)?;
+
+        self.create_mapping_session_from_field_inputs(
+            dataset_id,
+            &created_by,
+            config,
+            vec![(table_name, discovered_fields)],
+            start,
+        )
+        .await
+    }
+
+    fn build_mapping_session_config(request: &AnalyzeForMappingRequest) -> MappingSessionConfig {
+        MappingSessionConfig {
+            sample_size: request.sample_size.unwrap_or(1000),
+            auto_approve_threshold: request.auto_approve_threshold.unwrap_or(0.95),
+            min_confidence: request.min_confidence.unwrap_or(0.5),
+            max_candidates: request.max_candidates.unwrap_or(10),
+            ontology_namespaces: request.ontology_namespaces.clone(),
+        }
+    }
+
+    async fn create_mapping_session_from_field_inputs(
+        &self,
+        source_id: &str,
+        created_by: &str,
+        config: MappingSessionConfig,
+        table_inputs: Vec<(String, Vec<SchemaFieldInput>)>,
+        start: std::time::Instant,
+    ) -> Result<AnalyzeForMappingResponse> {
+        let session_id = format!(
+            "session_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        );
+        let mut table_mappings = Vec::new();
+
+        for (table_name, discovered_fields) in table_inputs {
+            let mut field_mappings = Vec::new();
+
             for field_input in discovered_fields {
                 let field_id = format!("{}_{}_{}", source_id, table_name, field_input.name);
-
-                // Analyze schema
                 let analyze_req = AnalyzeSchemaRequest {
                     source_id: source_id.to_string(),
                     table_name: table_name.clone(),
@@ -665,8 +724,6 @@ impl MappingEngine {
 
                 let analyzed = self.analyze_schema(analyze_req).await?;
                 let analyzed_field = &analyzed.fields[0];
-
-                // Get mapping candidates (filtered by ontology namespaces if specified)
                 let candidates_response = self
                     .get_candidates(
                         &analyzed_field.id,
@@ -676,11 +733,9 @@ impl MappingEngine {
                     )
                     .await?;
 
-                // Determine approval status and selected mapping
                 let (approval_status, selected_mapping) =
                     if let Some(top_candidate) = candidates_response.candidates.first() {
                         if top_candidate.confidence >= config.auto_approve_threshold {
-                            // Auto-approve high-confidence mappings
                             (
                                 FieldApprovalStatus::AutoApproved,
                                 Some(SelectedMapping {
@@ -697,8 +752,7 @@ impl MappingEngine {
                         (FieldApprovalStatus::Pending, None)
                     };
 
-                // Create field mapping state
-                let field_mapping = FieldMappingState {
+                field_mappings.push(FieldMappingState {
                     field_id,
                     field_name: field_input.name.clone(),
                     data_type: field_input.data_type.clone(),
@@ -709,22 +763,16 @@ impl MappingEngine {
                     reviewed_by: None,
                     reviewed_at: None,
                     notes: None,
-                };
-
-                field_mappings.push(field_mapping);
+                });
             }
 
-            // Create table mapping
-            let table_mapping = TableMapping {
-                table_name: table_name.clone(),
+            table_mappings.push(TableMapping {
+                table_name,
                 field_mappings,
                 metadata: None,
-            };
-
-            table_mappings.push(table_mapping);
+            });
         }
 
-        // Create session
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -735,7 +783,7 @@ impl MappingEngine {
             source_id: source_id.to_string(),
             status: MappingSessionStatus::Draft,
             tables: table_mappings,
-            created_by: request.user_id.clone(),
+            created_by: created_by.to_string(),
             created_at: now,
             reviewed_by: None,
             reviewed_at: None,
@@ -744,13 +792,9 @@ impl MappingEngine {
             summary: MappingSessionSummary::default(),
         };
 
-        // Compute summary
         session.summary = storage::MappingStorage::compute_summary(&session);
-
-        // Store session
         self.storage.store_session(&session)?;
 
-        // Auto-transition to PendingReview if there are fields to review
         if session.summary.pending_review > 0 {
             self.storage
                 .update_session_status(&session.session_id, MappingSessionStatus::PendingReview)?;
@@ -1239,6 +1283,117 @@ impl MappingEngine {
     }
 }
 
+fn derive_parquet_table_name(source_id: &str, parquet_path: &str) -> String {
+    let candidate = Path::new(parquet_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(source_id);
+
+    let normalized: String = candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let normalized = normalized.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        source_id.replace('-', "_")
+    } else {
+        normalized
+    }
+}
+
+fn discover_fields_from_parquet_path(
+    parquet_path: &str,
+    sample_size: usize,
+) -> Result<Vec<SchemaFieldInput>> {
+    let mut file = File::open(parquet_path)
+        .with_context(|| format!("Failed to open managed Parquet file {}", parquet_path))?;
+    let metadata = arrow2::io::parquet::read::read_metadata(&mut file)
+        .with_context(|| format!("Failed to read Parquet metadata from {}", parquet_path))?;
+    let schema = arrow2::io::parquet::read::infer_schema(&metadata)
+        .with_context(|| format!("Failed to infer Parquet schema for {}", parquet_path))?;
+    let sample_rows =
+        crate::workflows::dataset_input::read_parquet_rows(parquet_path, Some(sample_size))?;
+
+    let mut fields = Vec::with_capacity(schema.fields.len());
+
+    for field in &schema.fields {
+        let mut sample_values = Vec::new();
+        let mut saw_null = false;
+
+        for row in &sample_rows {
+            let value = row
+                .as_object()
+                .and_then(|object| object.get(&field.name))
+                .unwrap_or(&JsonValue::Null);
+
+            if value.is_null() {
+                saw_null = true;
+                continue;
+            }
+
+            if sample_values.len() < 10 {
+                sample_values.push(json_value_to_sample_string(value));
+            }
+        }
+
+        fields.push(SchemaFieldInput {
+            name: field.name.clone(),
+            data_type: parquet_data_type_to_schema_type(field.data_type()),
+            nullable: field.is_nullable || saw_null,
+            sample_values: Some(sample_values),
+            description: None,
+        });
+    }
+
+    Ok(fields)
+}
+
+fn parquet_data_type_to_schema_type(data_type: &arrow2::datatypes::DataType) -> String {
+    use arrow2::datatypes::DataType;
+
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => "INTEGER",
+        DataType::Int64 | DataType::UInt64 => "BIGINT",
+        DataType::Float32 => "FLOAT",
+        DataType::Float64 => "DOUBLE",
+        DataType::Boolean => "BOOLEAN",
+        DataType::Date32 | DataType::Date64 => "DATE",
+        DataType::Timestamp(_, _) => "TIMESTAMP",
+        DataType::Time32(_) | DataType::Time64(_) => "TIME",
+        DataType::Decimal(_, _) => "DECIMAL",
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "BINARY",
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::Struct(_)
+        | DataType::Map(_, _)
+        | DataType::Dictionary(_, _, _)
+        | DataType::Union(_, _, _) => "JSON",
+        _ => "VARCHAR",
+    }
+    .to_string()
+}
+
+fn json_value_to_sample_string(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(text) => text.clone(),
+        _ => value.to_string(),
+    }
+}
+
 /// Normalize a field name (lowercase, remove special chars)
 fn normalize_name(name: &str) -> String {
     name.to_lowercase()
@@ -1250,11 +1405,68 @@ fn normalize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graphica_core::catalog::api_types::QueryResult;
+    use serde_json::json;
 
     #[test]
     fn test_normalize_name() {
         assert_eq!(normalize_name("customer_email"), "customeremail");
         assert_eq!(normalize_name("Customer-Email"), "customeremail");
         assert_eq!(normalize_name("CUST_EMAIL_ADDR"), "custemailaddr");
+    }
+
+    #[test]
+    fn test_derive_parquet_table_name_sanitizes_file_stem() {
+        let table_name =
+            derive_parquet_table_name("ds_import_123", "/tmp/Customer Feed 2026-03.parquet");
+
+        assert_eq!(table_name, "Customer_Feed_2026_03");
+    }
+
+    #[test]
+    fn test_discover_fields_from_parquet_path_reads_schema_and_samples() {
+        let parquet_path = std::env::temp_dir().join(format!(
+            "mapping_discovery_{}.parquet",
+            uuid::Uuid::new_v4()
+        ));
+        let parquet_path_str = parquet_path.to_string_lossy().to_string();
+        let query_result = QueryResult {
+            rows: vec![
+                json!({"customer_id": "C001", "lifetime_value": 123.45, "active": true}),
+                json!({"customer_id": "C002", "lifetime_value": 456.78, "active": false}),
+            ],
+            row_count: 2,
+            execution_time_ms: 1,
+            truncated: false,
+            columns: None,
+        };
+
+        crate::api::handlers::datasets::write_query_result_to_parquet(
+            &query_result,
+            &parquet_path_str,
+        )
+        .expect("parquet write should succeed");
+
+        let fields =
+            discover_fields_from_parquet_path(&parquet_path_str, 10).expect("schema discovery");
+
+        let customer_id = fields
+            .iter()
+            .find(|field| field.name == "customer_id")
+            .expect("customer_id field");
+        let active = fields
+            .iter()
+            .find(|field| field.name == "active")
+            .expect("active field");
+
+        assert_eq!(customer_id.data_type, "VARCHAR");
+        assert!(customer_id
+            .sample_values
+            .clone()
+            .unwrap_or_default()
+            .contains(&"C001".to_string()));
+        assert_eq!(active.data_type, "BOOLEAN");
+
+        let _ = std::fs::remove_file(parquet_path);
     }
 }

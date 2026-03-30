@@ -103,6 +103,7 @@ fn test_build_step_execution_record_extracts_modifications() {
         started_at,
         completed_at,
         batch_metadata: None,
+        runtime_metrics: None,
         batch_frame: None,
     };
 
@@ -207,6 +208,7 @@ fn test_build_ml_prediction_step_record_extracts_predictions() {
         started_at,
         completed_at,
         batch_metadata: None,
+        runtime_metrics: None,
         batch_frame: None,
     };
 
@@ -403,6 +405,7 @@ async fn test_record_step_lineage_routes_standard_and_ml_records() {
         started_at,
         completed_at,
         batch_metadata: None,
+        runtime_metrics: None,
         batch_frame: None,
     };
 
@@ -445,6 +448,7 @@ async fn test_record_step_lineage_routes_standard_and_ml_records() {
         started_at,
         completed_at,
         batch_metadata: None,
+        runtime_metrics: None,
         batch_frame: None,
     };
 
@@ -733,6 +737,7 @@ async fn test_compute_final_decision_applies_threshold_and_manual_review_fallbac
             started_at: chrono::Utc::now(),
             completed_at: chrono::Utc::now(),
             batch_metadata: None,
+            runtime_metrics: None,
             batch_frame: None,
         },
     )]);
@@ -765,6 +770,7 @@ async fn test_compute_final_confidence_averages_step_results() {
                 started_at: chrono::Utc::now(),
                 completed_at: chrono::Utc::now(),
                 batch_metadata: None,
+                runtime_metrics: None,
                 batch_frame: None,
             },
         ),
@@ -778,6 +784,7 @@ async fn test_compute_final_confidence_averages_step_results() {
                 started_at: chrono::Utc::now(),
                 completed_at: chrono::Utc::now(),
                 batch_metadata: None,
+                runtime_metrics: None,
                 batch_frame: None,
             },
         ),
@@ -1006,6 +1013,7 @@ async fn test_finalize_step_execution_records_lineage_and_stores_step_result() {
         started_at: chrono::Utc::now(),
         completed_at: chrono::Utc::now(),
         batch_metadata: Some(frame.metadata().clone()),
+        runtime_metrics: None,
         batch_frame: Some(frame),
     };
     let mut state = ExecuteLoopState::new(ExecutionContext::new(serde_json::json!({})));
@@ -1083,6 +1091,7 @@ fn test_complete_failed_step_execution_builds_reject_result() {
         started_at,
         completed_at: started_at,
         batch_metadata: None,
+        runtime_metrics: None,
         batch_frame: None,
     };
     let mut state = ExecuteLoopState::new(ExecutionContext::new(serde_json::json!({})));
@@ -1143,6 +1152,7 @@ fn test_build_failed_workflow_completion_preserves_run_state_and_output_rows() {
         started_at,
         completed_at: started_at,
         batch_metadata: None,
+        runtime_metrics: None,
         batch_frame: None,
     };
     let mut state = ExecuteLoopState::new(ExecutionContext::new(serde_json::json!({})));
@@ -1199,6 +1209,7 @@ async fn test_complete_successful_workflow_execution_records_completion_lineage(
             started_at,
             completed_at: started_at,
             batch_metadata: None,
+            runtime_metrics: None,
             batch_frame: None,
         },
     );
@@ -1256,6 +1267,7 @@ fn test_build_successful_workflow_completion_preserves_run_state_and_output_rows
             started_at,
             completed_at: started_at,
             batch_metadata: None,
+            runtime_metrics: None,
             batch_frame: None,
         },
     );
@@ -1536,6 +1548,7 @@ async fn test_complete_session_outcome_finalizes_completed_result() {
             started_at: session.run_state.started_at,
             completed_at: session.run_state.started_at,
             batch_metadata: None,
+            runtime_metrics: None,
             batch_frame: None,
         },
     );

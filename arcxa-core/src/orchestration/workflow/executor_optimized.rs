@@ -40,6 +40,21 @@ impl OptimizedStepExecutor {
         Self { storage_manager }
     }
 
+    fn build_runtime_metrics_value(
+        &self,
+        context: &ExecutionContextV2,
+        input_rows: usize,
+        output_rows: usize,
+        materialization_count: usize,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(context.build_runtime_step_metrics(
+            input_rows,
+            output_rows,
+            materialization_count,
+        ))
+        .map_err(|error| WorkflowError::InvalidData(error.to_string()))
+    }
+
     /// Optimized deduplicator that streams data
     pub async fn execute_deduplicator(
         &self,
@@ -110,6 +125,12 @@ impl OptimizedStepExecutor {
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
                 "_method": config.method.to_string(),
+                "_runtime_metrics": self.build_runtime_metrics_value(
+                    context,
+                    original_count,
+                    deduped_count,
+                    if execution_path == "row_json" { 1 } else { 0 },
+                )?,
             }),
         ))
     }
@@ -376,6 +397,12 @@ impl OptimizedStepExecutor {
                 "_rows_written": rows_written,
                 "_storage_type": storage_type,
                 "_batch_size": batch_size,
+                "_runtime_metrics": self.build_runtime_metrics_value(
+                    context,
+                    row_count,
+                    rows_written,
+                    if storage_type == "streaming" { 0 } else { 1 },
+                )?,
             }),
         ))
     }
@@ -414,6 +441,12 @@ impl OptimizedStepExecutor {
                 "_storage_type": context.row_storage.as_ref()
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
+                "_runtime_metrics": self.build_runtime_metrics_value(
+                    context,
+                    row_count,
+                    mapped_count,
+                    if row_count > 50_000 { 0 } else { 1 },
+                )?,
             }),
         ))
     }
@@ -456,6 +489,12 @@ impl OptimizedStepExecutor {
                 "_storage_type": context.row_storage.as_ref()
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
+                "_runtime_metrics": self.build_runtime_metrics_value(
+                    context,
+                    row_count,
+                    row_count,
+                    if execution_path == "row_json" { 1 } else { 0 },
+                )?,
             }),
         ))
     }
@@ -509,6 +548,12 @@ impl OptimizedStepExecutor {
                 "_storage_type": context.row_storage.as_ref()
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
+                "_runtime_metrics": self.build_runtime_metrics_value(
+                    context,
+                    row_count,
+                    row_count,
+                    if execution_path == "row_json" { 1 } else { 0 },
+                )?,
             }),
         ))
     }
@@ -548,6 +593,12 @@ impl OptimizedStepExecutor {
                 "_storage_type": context.row_storage.as_ref()
                     .map(|s| s.storage_type().to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
+                "_runtime_metrics": self.build_runtime_metrics_value(
+                    context,
+                    original_count,
+                    aggregated_count,
+                    if execution_path == "row_json" { 1 } else { 0 },
+                )?,
             }),
         ))
     }
@@ -814,6 +865,9 @@ mod tests {
         assert_eq!(output["_row_count"], 3);
         assert_eq!(output["_duplicates_removed"], 2);
         assert_eq!(output["_execution_path"], "batch_frame");
+        assert_eq!(output["_runtime_metrics"]["input_rows"], 5);
+        assert_eq!(output["_runtime_metrics"]["output_rows"], 3);
+        assert_eq!(output["_runtime_metrics"]["storage_type"], "in_memory");
 
         // Verify deduplicated data
         let result_rows = context.get_rows().unwrap().to_vec().unwrap();
@@ -1075,6 +1129,10 @@ mod tests {
         assert_eq!(output["_row_count"], 2);
         assert_eq!(output["_original_count"], 3);
         assert_eq!(output["_execution_path"], "batch_frame");
+        assert_eq!(output["_runtime_metrics"]["input_rows"], 3);
+        assert_eq!(output["_runtime_metrics"]["output_rows"], 2);
+        assert_eq!(output["_runtime_metrics"]["storage_type"], "in_memory");
+        assert_eq!(output["_runtime_metrics"]["planned_tier"], "in_memory");
 
         let result_frame = context.get_batch_frame().unwrap();
         let result_rows = result_frame.to_json_values().unwrap();
@@ -1083,10 +1141,10 @@ mod tests {
             Some("extract_aggregate")
         );
         assert!(result_rows.iter().any(|row| {
-            row["region"] == "\"east\"" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
+            row["region"] == "east" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
         }));
         assert!(result_rows.iter().any(|row| {
-            row["region"] == "\"west\"" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
+            row["region"] == "west" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
         }));
     }
 

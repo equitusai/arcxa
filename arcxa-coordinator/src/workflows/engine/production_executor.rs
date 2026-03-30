@@ -105,7 +105,10 @@ impl ProductionWorkflowExecutor {
     /// 3. No other code accesses data during the await
     fn create_transformer_callback(registry: Arc<TransformerRegistry>) -> Arc<TransformerCallback> {
         Arc::new(Box::new(
-            move |name: &str, config: &serde_json::Value, data: &mut serde_json::Value| {
+            move |name: &str,
+                  config: &serde_json::Value,
+                  data: &mut serde_json::Value,
+                  _core_context: &graphica_core::orchestration::workflow::executor::ExecutionContext| {
                 // Clone values for the async block
                 let registry = registry.clone();
                 let name = name.to_string();

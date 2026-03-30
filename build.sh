@@ -42,6 +42,10 @@ run_cargo() {
     fi
 
     env -u CC \
+        -u AR \
+        -u RANLIB \
+        -u NM \
+        -u LD \
         -u CFLAGS \
         -u CPPFLAGS \
         -u LDFLAGS \

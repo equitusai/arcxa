@@ -1,5 +1,6 @@
 use super::*;
 use crate::orchestration::workflow::definition::{ConfidenceGateConfig, FallbackStrategy};
+use std::sync::{Arc, Mutex};
 
 fn create_test_workflow() -> WorkflowDefinition {
     WorkflowDefinition {
@@ -14,6 +15,52 @@ fn create_test_workflow() -> WorkflowDefinition {
         }],
         fusion_threshold: 0.8,
         fallback: FallbackStrategy::ManualReview,
+    }
+}
+
+#[derive(Default)]
+struct DbLoadLineageTracker {
+    row_events: Mutex<Vec<crate::core::lineage::row_level::RowLineageEvent>>,
+}
+
+#[async_trait::async_trait]
+impl crate::orchestration::workflow::lineage_tracker::LineageTracker for DbLoadLineageTracker {
+    async fn record_workflow_start(
+        &self,
+        _record: crate::orchestration::workflow::lineage_tracker::WorkflowExecutionRecord,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_step_execution(
+        &self,
+        _record: crate::orchestration::workflow::lineage_tracker::StepExecutionRecord,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_ml_predictions(
+        &self,
+        _record: crate::orchestration::workflow::lineage_tracker::MLPredictionStepRecord,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_workflow_complete(
+        &self,
+        _execution_id: String,
+        _success: bool,
+        _completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_row_lineage_batch(
+        &self,
+        events: Vec<crate::core::lineage::row_level::RowLineageEvent>,
+    ) -> anyhow::Result<()> {
+        self.row_events.lock().unwrap().extend(events);
+        Ok(())
     }
 }
 
@@ -176,7 +223,10 @@ async fn test_execute_db_loader_uses_callback_output_contract() {
                     assert_eq!(table_name, "customers");
                     assert_eq!(mode, "Upsert");
                     assert_eq!(key_fields, Some(vec!["id".to_string()]));
-                    Ok(rows.len() as u64)
+                    Ok(DbLoadResult {
+                        rows_loaded: rows.len() as u64,
+                        output_row_ids: Vec::new(),
+                    })
                 })
             },
         )));
@@ -209,6 +259,111 @@ async fn test_execute_db_loader_uses_callback_output_contract() {
     assert_eq!(output["_rows_loaded"], serde_json::json!(2));
     assert_eq!(output["_mode"], "Upsert");
     assert_eq!(output["_status"], "success");
+}
+
+#[tokio::test]
+async fn test_execute_db_loader_records_row_lineage_when_callback_returns_output_row_ids() {
+    use crate::core::lineage::row_level::{DatabaseType, RowId};
+    use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+    use crate::orchestration::rules::RuleExecutor;
+    use crate::orchestration::workflow::definition::{DbLoaderConfig, LoadMode};
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let tracker = Arc::new(DbLoadLineageTracker::default());
+    let executor =
+        WorkflowExecutor::with_lineage(workflow, invoker, rule_executor, tracker.clone())
+            .unwrap()
+            .with_db_loader_callback(Arc::new(Box::new(
+                |_datasource_id, _table_name, rows, _mode, _key_fields| {
+                    Box::pin(async move {
+                        Ok(DbLoadResult {
+                            rows_loaded: rows.len() as u64,
+                            output_row_ids: vec![
+                                Some(RowId::database(
+                                    DatabaseType::Oracle,
+                                    "CUSTOMER_DIM".to_string(),
+                                    std::collections::BTreeMap::from([(
+                                        "CUSTOMER_CODE".to_string(),
+                                        "CUST001".to_string(),
+                                    )]),
+                                )),
+                                Some(RowId::database(
+                                    DatabaseType::Oracle,
+                                    "CUSTOMER_DIM".to_string(),
+                                    std::collections::BTreeMap::from([(
+                                        "CUSTOMER_CODE".to_string(),
+                                        "CUST003".to_string(),
+                                    )]),
+                                )),
+                            ],
+                        })
+                    })
+                },
+            )));
+
+    let mut context = ExecutionContext::new(serde_json::json!({
+        "_rows": [
+            {
+                "_row_id": "oracle:CUSTOMER_FEED:STAGE_ROW_ID=FEED001",
+                "CUSTOMER_CODE": "CUST001",
+                "EMAIL": "alice@example.com"
+            },
+            {
+                "_row_id": "oracle:CUSTOMER_FEED:STAGE_ROW_ID=FEED003",
+                "CUSTOMER_CODE": "CUST003",
+                "EMAIL": "carla@example.com"
+            }
+        ]
+    }))
+    .with_row_lineage(
+        "exec_db_load".to_string(),
+        "job_db_load".to_string(),
+        "tenant_oracle".to_string(),
+    );
+    context
+        .metadata
+        .insert("job_id".to_string(), "job_db_load".to_string());
+    context
+        .metadata
+        .insert("tenant_id".to_string(), "tenant_oracle".to_string());
+    if let Some(ref mut row_lineage) = context.row_lineage {
+        row_lineage.set_current_step("load_customer_dim".to_string());
+    }
+
+    let config = DbLoaderConfig {
+        datasource_id: "oracle_ds".to_string(),
+        table_name: "CUSTOMER_DIM".to_string(),
+        mode: LoadMode::Replace,
+        key_fields: None,
+        batch_size: 1000,
+        create_table: false,
+        entity_uri: None,
+    };
+
+    let (success, output, confidence) = executor
+        .execute_db_loader(&config, &context)
+        .await
+        .expect("db_loader lineage path should execute");
+
+    assert!(success);
+    assert_eq!(confidence, 1.0);
+    assert_eq!(output["_rows_loaded"], serde_json::json!(2));
+
+    let row_events = tracker.row_events.lock().unwrap().clone();
+    assert_eq!(row_events.len(), 2);
+    assert_eq!(row_events[0].step_id.as_deref(), Some("load_customer_dim"));
+    assert_eq!(
+        row_events[0].output_row_id.as_ref().map(RowId::to_key),
+        Some("oracle:CUSTOMER_DIM:CUSTOMER_CODE=CUST001".to_string())
+    );
+    assert_eq!(
+        row_events[1].output_row_id.as_ref().map(RowId::to_key),
+        Some("oracle:CUSTOMER_DIM:CUSTOMER_CODE=CUST003".to_string())
+    );
 }
 
 #[tokio::test]
@@ -267,7 +422,7 @@ async fn test_execute_semantic_mapper_uses_transformer_callback_output_contract(
     let rule_executor = Arc::new(RuleExecutor::new());
     let executor = WorkflowExecutor::new(workflow, invoker, rule_executor)
         .unwrap()
-        .with_transformer_callback(Arc::new(Box::new(|name, config, data| {
+        .with_transformer_callback(Arc::new(Box::new(|name, config, data, _context| {
             let transformer_name = name.to_string();
             let config = config.clone();
 
@@ -465,21 +620,40 @@ fn test_finalize_step_result_stamps_db_extract_batch_metadata() {
     let frame =
         BatchFrame::from_json_values(&[serde_json::json!({"id": 1}), serde_json::json!({"id": 2})])
             .unwrap();
+    let mut output = build_rows_output(
+        vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})],
+        2,
+        vec![],
+    );
+    output
+        .as_object_mut()
+        .expect("batch output should be a JSON object")
+        .insert(
+            "_runtime_metrics".to_string(),
+            serde_json::json!({
+                "input_rows": 2,
+                "output_rows": 2,
+                "materialization_count": 0,
+                "spill_events": 1,
+                "spill_bytes": 4096,
+                "memory_high_water_mark": 8192,
+                "storage_type": "parquet",
+                "storage_operation": "set_rows",
+                "planned_tier": "parquet",
+                "storage_decision_reason": "planned",
+                "reserved_spill_bytes": 4096,
+                "execution_reserved_spill_bytes": 4096,
+                "total_reserved_spill_bytes": 4096,
+                "storage_location": "spill/extract_step.parquet",
+                "pushdown_applied": false
+            }),
+        );
 
     let step_result = executor.finalize_step_result(
         &step,
         chrono::Utc::now(),
         chrono::Utc::now(),
-        BatchStepExecutionResult::with_frame(
-            true,
-            build_rows_output(
-                vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})],
-                2,
-                vec![],
-            ),
-            1.0,
-            frame,
-        ),
+        BatchStepExecutionResult::with_frame(true, output, 1.0, frame),
     );
 
     assert_eq!(
@@ -497,6 +671,20 @@ fn test_finalize_step_result_stamps_db_extract_batch_metadata() {
         Some("db_extract")
     );
     assert!(step_result.batch_frame.is_some());
+    assert_eq!(
+        step_result
+            .runtime_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.storage_type.as_deref()),
+        Some("parquet")
+    );
+    assert_eq!(
+        step_result
+            .runtime_metrics
+            .as_ref()
+            .map(|metrics| metrics.reserved_spill_bytes),
+        Some(4096)
+    );
 }
 
 #[test]

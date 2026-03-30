@@ -5,7 +5,7 @@
 
 use super::dto::*;
 use crate::workflows::domain::{ExecutionMode, Workflow};
-use crate::workflows::engine::{StreamExecutor, StreamHandle, StreamStats};
+use crate::workflows::engine::{StreamExecutor, StreamHandle, StreamRuntimeSummary, StreamStats};
 use crate::workflows::storage::{ExecutionStore, WorkflowStore};
 use axum::{
     extract::{Path, State},
@@ -23,6 +23,7 @@ pub struct StreamingApiState {
     pub workflow_store: Arc<WorkflowStore>,
     pub execution_store: Arc<ExecutionStore>,
     pub stream_executor: Arc<StreamExecutor>,
+    pub metrics: Option<Arc<crate::observability::metrics::WorkflowMetrics>>,
 }
 
 impl StreamingApiState {
@@ -39,6 +40,21 @@ impl StreamingApiState {
             workflow_store: workflow_store_arc,
             execution_store: execution_store_arc,
             stream_executor,
+            metrics: None,
+        }
+    }
+
+    pub fn from_shared(
+        workflow_store: Arc<WorkflowStore>,
+        execution_store: Arc<ExecutionStore>,
+        stream_executor: Arc<StreamExecutor>,
+        metrics: Option<Arc<crate::observability::metrics::WorkflowMetrics>>,
+    ) -> Self {
+        Self {
+            workflow_store,
+            execution_store,
+            stream_executor,
+            metrics,
         }
     }
 }
@@ -64,6 +80,9 @@ pub struct StartStreamResponse {
 
     /// Message
     pub message: String,
+
+    /// Runtime/storage summary for the started stream
+    pub runtime: StreamRuntimeResponse,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,12 +116,49 @@ pub struct StreamStatsResponse {
 
     /// Active workers
     pub active_workers: usize,
+
+    /// Runtime/storage summary for this stream
+    pub runtime: StreamRuntimeResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StreamRuntimeResponse {
+    pub execution_engine: String,
+    pub storage_backend: String,
+    pub persistent_state: bool,
+    pub state_location: Option<String>,
+    pub checkpoint_interval_records: u64,
+    pub configured_checkpoint_interval_ms: u64,
+}
+
+impl From<StreamRuntimeSummary> for StreamRuntimeResponse {
+    fn from(value: StreamRuntimeSummary) -> Self {
+        Self {
+            execution_engine: value.execution_engine,
+            storage_backend: value.storage_backend,
+            persistent_state: value.persistent_state,
+            state_location: value.state_location,
+            checkpoint_interval_records: value.checkpoint_interval_records,
+            configured_checkpoint_interval_ms: value.configured_checkpoint_interval_ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActiveStreamResponse {
+    pub workflow_id: String,
+    pub workers: usize,
+    pub consumer_group: String,
+    pub runtime: StreamRuntimeResponse,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListStreamsResponse {
     /// Active streaming workflows
     pub streams: Vec<String>,
+
+    /// Active stream details with runtime/storage metadata
+    pub details: Vec<ActiveStreamResponse>,
 
     /// Total count
     pub total: usize,
@@ -141,7 +197,7 @@ impl From<anyhow::Error> for StreamApiError {
 ///
 /// POST /api/v1/workflows/{id}/stream/start
 pub async fn start_stream(
-    State(state): State<Arc<StreamingApiState>>,
+    State(state): State<StreamingApiState>,
     Path(workflow_id): Path<String>,
 ) -> Result<Json<StartStreamResponse>, StreamApiError> {
     info!("Starting streaming execution for workflow: {}", workflow_id);
@@ -187,6 +243,7 @@ pub async fn start_stream(
             "Streaming execution started with {} workers",
             handle.workers
         ),
+        runtime: handle.runtime.into(),
     }))
 }
 
@@ -194,7 +251,7 @@ pub async fn start_stream(
 ///
 /// POST /api/v1/workflows/{id}/stream/stop
 pub async fn stop_stream(
-    State(state): State<Arc<StreamingApiState>>,
+    State(state): State<StreamingApiState>,
     Path(workflow_id): Path<String>,
 ) -> Result<Json<StopStreamResponse>, StreamApiError> {
     info!("Stopping streaming execution for workflow: {}", workflow_id);
@@ -213,7 +270,7 @@ pub async fn stop_stream(
 ///
 /// GET /api/v1/workflows/{id}/stream/stats
 pub async fn get_stream_stats(
-    State(state): State<Arc<StreamingApiState>>,
+    State(state): State<StreamingApiState>,
     Path(workflow_id): Path<String>,
 ) -> Result<Json<StreamStatsResponse>, StreamApiError> {
     info!("Getting streaming stats for workflow: {}", workflow_id);
@@ -228,6 +285,7 @@ pub async fn get_stream_stats(
         lag: stats.lag,
         watermark: stats.watermark,
         active_workers: stats.active_workers,
+        runtime: stats.runtime.into(),
     }))
 }
 
@@ -235,14 +293,30 @@ pub async fn get_stream_stats(
 ///
 /// GET /api/v1/workflows/stream/active
 pub async fn list_active_streams(
-    State(state): State<Arc<StreamingApiState>>,
+    State(state): State<StreamingApiState>,
 ) -> Result<Json<ListStreamsResponse>, StreamApiError> {
     info!("Listing active streaming workflows");
 
     let streams = state.stream_executor.list_active_streams().await;
+    let details = state
+        .stream_executor
+        .list_active_stream_details()
+        .await
+        .into_iter()
+        .map(|handle| ActiveStreamResponse {
+            workflow_id: handle.workflow_id,
+            workers: handle.workers,
+            consumer_group: handle.consumer_group,
+            runtime: handle.runtime.into(),
+        })
+        .collect::<Vec<_>>();
     let total = streams.len();
 
-    Ok(Json(ListStreamsResponse { streams, total }))
+    Ok(Json(ListStreamsResponse {
+        streams,
+        details,
+        total,
+    }))
 }
 
 #[cfg(test)]
@@ -254,10 +328,10 @@ mod tests {
     use crate::workflows::storage::{ExecutionStore, WorkflowStore};
     use std::collections::HashMap;
 
-    fn create_test_state() -> Arc<StreamingApiState> {
+    fn create_test_state() -> StreamingApiState {
         let workflow_store = WorkflowStore::new();
         let execution_store = ExecutionStore::new();
-        Arc::new(StreamingApiState::new(workflow_store, execution_store))
+        StreamingApiState::new(workflow_store, execution_store)
     }
 
     fn create_streaming_workflow(id: &str, name: &str) -> Workflow {
@@ -326,6 +400,7 @@ mod tests {
 
         assert_eq!(result.0.total, 0);
         assert_eq!(result.0.streams.len(), 0);
+        assert_eq!(result.0.details.len(), 0);
     }
 
     #[tokio::test]

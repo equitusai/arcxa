@@ -25,6 +25,40 @@ pub struct InMemoryRdfStore {
     triples: Arc<RwLock<HashMap<String, Vec<Triple>>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryTerm {
+    Variable(String),
+    Constant(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriplePosition {
+    Subject,
+    Predicate,
+    Object,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimpleTriplePattern {
+    subject: QueryTerm,
+    predicate: QueryTerm,
+    object: QueryTerm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimpleSelectQuery {
+    projections: Vec<String>,
+    pattern: SimpleTriplePattern,
+    graph: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimpleAskQuery {
+    pattern: SimpleTriplePattern,
+    graph: Option<String>,
+}
+
 impl InMemoryRdfStore {
     /// Create a new in-memory RDF store
     pub fn new() -> Self {
@@ -95,37 +129,369 @@ impl InMemoryRdfStore {
     /// Parse a simple SPARQL query and return results
     /// This is a very basic implementation for testing purposes only
     fn parse_simple_sparql(&self, sparql: &str) -> Result<Vec<JsonValue>> {
-        // Very basic SPARQL parser for testing
-        // Supports simple SELECT queries like:
-        // SELECT ?s ?p ?o WHERE { ?s ?p ?o }
-
         let trimmed = sparql.trim();
+        let (prefixes, query_body) = self.parse_prefixes(trimmed);
+        let normalized = query_body.trim();
+        let upper = normalized.to_ascii_uppercase();
 
         // Count triples queries
-        if trimmed.contains("COUNT") {
+        if upper.contains("COUNT") {
             let count = self.count_all_triples()?;
             return Ok(vec![serde_json::json!({
                 "count": count
             })]);
         }
 
-        // Simple triple pattern matching
-        // For now, just return all triples as JSON
-        let all_triples = self.get_all_triples()?;
+        if upper.starts_with("ASK") {
+            let query = self.parse_simple_ask_query(normalized, &prefixes)?;
+            return self.execute_simple_ask_query(&query);
+        }
 
-        let results: Vec<JsonValue> = all_triples
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "subject": t.subject,
-                    "predicate": t.predicate,
-                    "object": t.object,
-                    "graph": t.graph,
-                })
-            })
-            .collect();
+        let query = self.parse_simple_select_query(normalized, &prefixes)?;
+        self.execute_simple_select_query(&query)
+    }
+
+    fn parse_prefixes(&self, sparql: &str) -> (HashMap<String, String>, String) {
+        let mut prefixes = HashMap::new();
+        let mut remaining_lines = Vec::new();
+
+        for line in sparql.lines() {
+            let trimmed = line.trim();
+            let upper = trimmed.to_ascii_uppercase();
+            if upper.starts_with("PREFIX ") || upper.starts_with("@PREFIX ") {
+                let parts = trimmed
+                    .trim_end_matches('.')
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                if parts.len() >= 3 {
+                    let prefix = parts[1].trim_end_matches(':');
+                    let value = parts[2].trim();
+                    if value.starts_with('<') && value.ends_with('>') && value.len() > 2 {
+                        prefixes.insert(prefix.to_string(), value[1..value.len() - 1].to_string());
+                    }
+                }
+                continue;
+            }
+
+            if !trimmed.is_empty() {
+                remaining_lines.push(trimmed.to_string());
+            }
+        }
+
+        (prefixes, remaining_lines.join("\n"))
+    }
+
+    fn parse_simple_select_query(
+        &self,
+        sparql: &str,
+        prefixes: &HashMap<String, String>,
+    ) -> Result<SimpleSelectQuery> {
+        let sparql = sparql.trim();
+        let upper = sparql.to_ascii_uppercase();
+
+        let where_idx = upper
+            .find("WHERE")
+            .ok_or_else(|| anyhow!("Unsupported SPARQL query: missing WHERE clause"))?;
+        if !upper.starts_with("SELECT ") {
+            return Err(anyhow!(
+                "Unsupported SPARQL query: only SELECT is supported"
+            ));
+        }
+
+        let projections = sparql["SELECT ".len()..where_idx]
+            .split_whitespace()
+            .filter_map(|token| token.strip_prefix('?').map(|name| name.to_string()))
+            .collect::<Vec<_>>();
+        if projections.is_empty() {
+            return Err(anyhow!("Unsupported SPARQL query: missing projections"));
+        }
+
+        let where_body = self.extract_where_body(&sparql[where_idx + "WHERE".len()..])?;
+        let (graph, pattern_source) = self.parse_optional_graph_clause(where_body)?;
+        let pattern = self.parse_triple_pattern(pattern_source, prefixes)?;
+        let limit = self.parse_limit_clause(sparql)?;
+
+        Ok(SimpleSelectQuery {
+            projections,
+            pattern,
+            graph,
+            limit,
+        })
+    }
+
+    fn parse_simple_ask_query(
+        &self,
+        sparql: &str,
+        prefixes: &HashMap<String, String>,
+    ) -> Result<SimpleAskQuery> {
+        let sparql = sparql.trim();
+        let upper = sparql.to_ascii_uppercase();
+        if !upper.starts_with("ASK") {
+            return Err(anyhow!("Unsupported SPARQL query: only ASK is supported"));
+        }
+
+        let body_source = if let Some(where_idx) = upper.find("WHERE") {
+            &sparql[where_idx + "WHERE".len()..]
+        } else {
+            &sparql["ASK".len()..]
+        };
+
+        let where_body = self.extract_where_body(body_source)?;
+        let (graph, pattern_source) = self.parse_optional_graph_clause(where_body)?;
+        let pattern = self.parse_triple_pattern(pattern_source, prefixes)?;
+
+        Ok(SimpleAskQuery { pattern, graph })
+    }
+
+    fn extract_where_body<'a>(&self, input: &'a str) -> Result<&'a str> {
+        let open_idx = input
+            .find('{')
+            .ok_or_else(|| anyhow!("Unsupported SPARQL query: missing opening brace"))?;
+        let close_idx = input
+            .rfind('}')
+            .ok_or_else(|| anyhow!("Unsupported SPARQL query: missing closing brace"))?;
+        if close_idx <= open_idx {
+            return Err(anyhow!("Unsupported SPARQL query: malformed WHERE body"));
+        }
+
+        Ok(input[open_idx + 1..close_idx].trim())
+    }
+
+    fn parse_optional_graph_clause<'a>(&self, body: &'a str) -> Result<(Option<String>, &'a str)> {
+        let trimmed = body.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if !upper.starts_with("GRAPH ") {
+            return Ok((None, trimmed));
+        }
+
+        let uri_start = trimmed
+            .find('<')
+            .ok_or_else(|| anyhow!("Unsupported GRAPH clause: missing graph URI"))?;
+        let uri_end = trimmed[uri_start + 1..]
+            .find('>')
+            .ok_or_else(|| anyhow!("Unsupported GRAPH clause: missing graph URI terminator"))?
+            + uri_start
+            + 1;
+        let graph_uri = trimmed[uri_start + 1..uri_end].to_string();
+
+        let inner = self.extract_where_body(&trimmed[uri_end + 1..])?;
+        Ok((Some(graph_uri), inner))
+    }
+
+    fn parse_triple_pattern(
+        &self,
+        pattern: &str,
+        prefixes: &HashMap<String, String>,
+    ) -> Result<SimpleTriplePattern> {
+        let normalized = pattern.trim().trim_end_matches('.').trim();
+        let tokens = self.tokenize_pattern(normalized);
+        if tokens.len() != 3 {
+            return Err(anyhow!(
+                "Unsupported SPARQL query: expected one triple pattern, got {:?}",
+                tokens
+            ));
+        }
+
+        Ok(SimpleTriplePattern {
+            subject: self.parse_query_term(&tokens[0], prefixes),
+            predicate: self.parse_query_term(&tokens[1], prefixes),
+            object: self.parse_query_term(&tokens[2], prefixes),
+        })
+    }
+
+    fn tokenize_pattern(&self, pattern: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut in_uri = false;
+
+        for ch in pattern.chars() {
+            match ch {
+                '"' => {
+                    in_quotes = !in_quotes;
+                    current.push(ch);
+                }
+                '<' if !in_quotes => {
+                    in_uri = true;
+                    current.push(ch);
+                }
+                '>' if in_uri && !in_quotes => {
+                    in_uri = false;
+                    current.push(ch);
+                }
+                c if c.is_whitespace() && !in_quotes && !in_uri => {
+                    if !current.is_empty() {
+                        tokens.push(current.clone());
+                        current.clear();
+                    }
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+
+        tokens
+    }
+
+    fn parse_query_term(&self, token: &str, prefixes: &HashMap<String, String>) -> QueryTerm {
+        if let Some(variable) = token.strip_prefix('?') {
+            return QueryTerm::Variable(variable.to_string());
+        }
+
+        let constant = if token.starts_with('<') && token.ends_with('>') && token.len() > 2 {
+            token[1..token.len() - 1].to_string()
+        } else if !token.starts_with('"') {
+            if let Some((prefix, local)) = token.split_once(':') {
+                if let Some(base) = prefixes.get(prefix) {
+                    format!("{}{}", base, local)
+                } else {
+                    token.to_string()
+                }
+            } else {
+                token.to_string()
+            }
+        } else {
+            token.to_string()
+        };
+        QueryTerm::Constant(constant)
+    }
+
+    fn parse_limit_clause(&self, sparql: &str) -> Result<Option<usize>> {
+        let upper = sparql.to_ascii_uppercase();
+        let Some(limit_idx) = upper.rfind("LIMIT") else {
+            return Ok(None);
+        };
+
+        let limit_str = sparql[limit_idx + "LIMIT".len()..]
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow!("Invalid LIMIT clause"))?;
+        let limit = limit_str
+            .parse::<usize>()
+            .map_err(|e| anyhow!("Invalid LIMIT value '{}': {}", limit_str, e))?;
+        Ok(Some(limit))
+    }
+
+    fn execute_simple_select_query(&self, query: &SimpleSelectQuery) -> Result<Vec<JsonValue>> {
+        let subject = match &query.pattern.subject {
+            QueryTerm::Constant(value) => Some(value.as_str()),
+            QueryTerm::Variable(_) => None,
+        };
+        let predicate = match &query.pattern.predicate {
+            QueryTerm::Constant(value) => Some(value.as_str()),
+            QueryTerm::Variable(_) => None,
+        };
+
+        let graph = query.graph.as_ref().map(NamedGraph::new);
+        let triples = self.find_triples(subject, predicate, None, graph.as_ref())?;
+        let mut results = Vec::with_capacity(triples.len());
+
+        for triple in triples {
+            if !self.triple_matches_query(&query.pattern, &triple) {
+                continue;
+            }
+
+            let mut row = serde_json::Map::new();
+            for projection in &query.projections {
+                match projection.as_str() {
+                    name if matches!(query.pattern.subject, QueryTerm::Variable(ref var) if var == name) =>
+                    {
+                        row.insert(name.to_string(), JsonValue::String(triple.subject.clone()));
+                    }
+                    name if matches!(query.pattern.predicate, QueryTerm::Variable(ref var) if var == name) =>
+                    {
+                        row.insert(
+                            name.to_string(),
+                            JsonValue::String(triple.predicate.clone()),
+                        );
+                    }
+                    name if matches!(query.pattern.object, QueryTerm::Variable(ref var) if var == name) =>
+                    {
+                        row.insert(name.to_string(), JsonValue::String(triple.object.clone()));
+                    }
+                    "graph" => {
+                        row.insert("graph".to_string(), JsonValue::String(triple.graph.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            results.push(JsonValue::Object(row));
+        }
+
+        if let Some(limit) = query.limit {
+            results.truncate(limit);
+        }
 
         Ok(results)
+    }
+
+    fn execute_simple_ask_query(&self, query: &SimpleAskQuery) -> Result<Vec<JsonValue>> {
+        let subject = match &query.pattern.subject {
+            QueryTerm::Constant(value) => Some(value.as_str()),
+            QueryTerm::Variable(_) => None,
+        };
+        let predicate = match &query.pattern.predicate {
+            QueryTerm::Constant(value) => Some(value.as_str()),
+            QueryTerm::Variable(_) => None,
+        };
+
+        let graph = query.graph.as_ref().map(NamedGraph::new);
+        let triples = self.find_triples(subject, predicate, None, graph.as_ref())?;
+        let matched = triples
+            .iter()
+            .any(|triple| self.triple_matches_query(&query.pattern, triple));
+
+        Ok(vec![serde_json::json!({
+            "ASK": matched
+        })])
+    }
+
+    fn triple_matches_query(&self, pattern: &SimpleTriplePattern, triple: &Triple) -> bool {
+        self.term_matches(&pattern.subject, &triple.subject, TriplePosition::Subject)
+            && self.term_matches(
+                &pattern.predicate,
+                &triple.predicate,
+                TriplePosition::Predicate,
+            )
+            && self.term_matches(&pattern.object, &triple.object, TriplePosition::Object)
+    }
+
+    fn term_matches(&self, term: &QueryTerm, candidate: &str, position: TriplePosition) -> bool {
+        match term {
+            QueryTerm::Variable(_) => true,
+            QueryTerm::Constant(expected) => {
+                if candidate == expected {
+                    return true;
+                }
+
+                if position == TriplePosition::Object {
+                    let bracketed = format!("<{}>", expected);
+                    if candidate == bracketed {
+                        return true;
+                    }
+
+                    if expected.starts_with('"') && expected.ends_with('"') && expected.len() >= 2 {
+                        let unquoted = &expected[1..expected.len() - 1];
+                        if candidate == unquoted {
+                            return true;
+                        }
+                    }
+
+                    if expected == "true" || expected == "false" {
+                        let quoted = format!("\"{}\"", expected);
+                        let typed_boolean = format!("{}^^<xsd:boolean>", quoted);
+                        if candidate == quoted || candidate == typed_boolean {
+                            return true;
+                        }
+                    }
+                }
+
+                false
+            }
+        }
     }
 
     /// Count all triples across all graphs
@@ -628,5 +994,200 @@ mod tests {
         assert_eq!(store.count_triples(Some(&graph1)).unwrap(), 1);
         assert_eq!(store.count_triples(Some(&graph2)).unwrap(), 1);
         assert_eq!(store.count_triples(None).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_query_filters_exact_subject_projection() {
+        let store = InMemoryRdfStore::new();
+        let graph = NamedGraph::current();
+
+        store
+            .insert_triple(
+                "http://example.org/workflow/1",
+                "http://graphica.io/governance#forWorkflow",
+                "http://example.org/workflow/target",
+                Some(&graph),
+            )
+            .unwrap();
+        store
+            .insert_triple(
+                "http://example.org/workflow/2",
+                "http://graphica.io/governance#forWorkflow",
+                "http://example.org/workflow/other",
+                Some(&graph),
+            )
+            .unwrap();
+
+        let results = store
+            .query(
+                r#"
+SELECT ?predicate ?object
+WHERE {
+  <http://example.org/workflow/1> ?predicate ?object .
+}
+LIMIT 50
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("predicate").and_then(|v| v.as_str()),
+            Some("http://graphica.io/governance#forWorkflow")
+        );
+        assert_eq!(
+            results[0].get("object").and_then(|v| v.as_str()),
+            Some("http://example.org/workflow/target")
+        );
+    }
+
+    #[test]
+    fn test_query_filters_by_graph_and_bound_object() {
+        let store = InMemoryRdfStore::new();
+        let workflow_graph = NamedGraph::workflow_executions();
+        let current_graph = NamedGraph::current();
+
+        store
+            .insert_triple(
+                "http://graphica.io/workflow-execution/exec-1",
+                "http://graphica.io/workflow#executedWorkflow",
+                "<http://graphica.io/workflow#/workflow/wf-1>",
+                Some(&workflow_graph),
+            )
+            .unwrap();
+        store
+            .insert_triple(
+                "http://graphica.io/workflow-execution/exec-2",
+                "http://graphica.io/workflow#executedWorkflow",
+                "http://graphica.io/workflow#/workflow/wf-2",
+                Some(&workflow_graph),
+            )
+            .unwrap();
+        store
+            .insert_triple(
+                "http://graphica.io/workflow-execution/exec-3",
+                "http://graphica.io/workflow#executedWorkflow",
+                "http://graphica.io/workflow#/workflow/wf-1",
+                Some(&current_graph),
+            )
+            .unwrap();
+
+        let results = store
+            .query(
+                r#"
+SELECT ?subject ?predicate
+WHERE {
+  GRAPH <http://graphica.io/graph/workflow-executions> {
+    ?subject ?predicate <http://graphica.io/workflow#/workflow/wf-1> .
+  }
+}
+LIMIT 200
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("subject").and_then(|v| v.as_str()),
+            Some("http://graphica.io/workflow-execution/exec-1")
+        );
+        assert_eq!(
+            results[0].get("predicate").and_then(|v| v.as_str()),
+            Some("http://graphica.io/workflow#executedWorkflow")
+        );
+    }
+
+    #[test]
+    fn test_query_limit_is_applied_after_filtering() {
+        let store = InMemoryRdfStore::new();
+        let graph = NamedGraph::current();
+
+        for idx in 0..3 {
+            store
+                .insert_triple(
+                    &format!("http://example.org/check/{}", idx),
+                    "http://graphica.io/governance#forWorkflow",
+                    "http://example.org/workflow/target",
+                    Some(&graph),
+                )
+                .unwrap();
+        }
+
+        let results = store
+            .query(
+                r#"
+SELECT ?subject
+WHERE {
+  ?subject <http://graphica.io/governance#forWorkflow> <http://example.org/workflow/target> .
+}
+LIMIT 2
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_query_supports_prefix_ask_without_where() {
+        let store = InMemoryRdfStore::new();
+        let graph = NamedGraph::current();
+
+        store
+            .insert_triple(
+                "http://graphica.io/user/dev-user",
+                "http://graphica.io/auth#canExecute",
+                "http://graphica.io/workflow/wf-123",
+                Some(&graph),
+            )
+            .unwrap();
+
+        let results = store
+            .query(
+                r#"
+PREFIX auth: <http://graphica.io/auth#>
+
+ASK {
+  <http://graphica.io/user/dev-user> auth:canExecute <http://graphica.io/workflow/wf-123> .
+}
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("ASK").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn test_query_supports_prefix_select_with_where() {
+        let store = InMemoryRdfStore::new();
+        let graph = NamedGraph::current();
+
+        store
+            .insert_triple(
+                "http://graphica.io/workflow/wf-123",
+                "http://graphica.io/workflow#requiresDataClassification",
+                "restricted",
+                Some(&graph),
+            )
+            .unwrap();
+
+        let results = store
+            .query(
+                r#"
+PREFIX wf: <http://graphica.io/workflow#>
+
+SELECT ?classification WHERE {
+  <http://graphica.io/workflow/wf-123> wf:requiresDataClassification ?classification .
+}
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("classification").and_then(|v| v.as_str()),
+            Some("restricted")
+        );
     }
 }

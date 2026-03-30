@@ -86,8 +86,9 @@ pub use rules::{
 
 // Re-export mapping handlers
 pub use mapping::{
-    analyze_for_mapping, analyze_schema, apply_mappings, get_candidates, get_session,
-    health_check as mapping_health_check, import_from_mappings, record_feedback, review_mappings,
+    analyze_dataset_for_mapping, analyze_for_mapping, analyze_schema, apply_mappings,
+    get_candidates, get_session, health_check as mapping_health_check, import_from_mappings,
+    record_feedback, review_mappings,
 };
 
 // Re-export manual mapping handlers

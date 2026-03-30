@@ -50,7 +50,10 @@ pub(crate) fn apply_transform_operation(
             }
         }
         TransformOperation::Round { decimals } => {
-            if let Some(num) = value.as_f64() {
+            let numeric_value = value
+                .as_f64()
+                .or_else(|| str_value.trim().parse::<f64>().ok());
+            if let Some(num) = numeric_value {
                 let factor = 10_f64.powi(*decimals as i32);
                 let rounded = (num * factor).round() / factor;
                 serde_json::json!(rounded)
@@ -124,6 +127,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, value);
+    }
+
+    #[test]
+    fn rounds_numeric_strings() {
+        let result = apply_transform_operation(
+            &json!("1250.555"),
+            &TransformOperation::Round { decimals: 2 },
+        )
+        .unwrap();
+
+        assert_eq!(result, json!(1250.56));
     }
 
     #[test]

@@ -3,18 +3,170 @@
 //! Tracks workflow execution state, history, and logs.
 
 use chrono::{DateTime, Utc};
+use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// Persisted result for a graph-native workflow step.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedStepResult {
     pub step_id: String,
     pub success: bool,
     pub output: JsonValue,
     pub confidence: f64,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<RuntimeStepMetrics>,
+}
+
+/// Aggregated runtime telemetry for a persisted workflow execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionRuntimeMetricsSummary {
+    pub steps_with_runtime_metrics: usize,
+    pub steps_with_disk_storage: usize,
+    pub total_spill_events: usize,
+    pub total_spill_bytes: usize,
+    pub max_memory_high_water_mark: usize,
+    pub max_reserved_spill_bytes: usize,
+    pub max_execution_reserved_spill_bytes: usize,
+    pub max_total_reserved_spill_bytes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub storage_backends: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub planned_tiers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub storage_decision_reasons: Vec<String>,
+}
+
+impl ExecutionRuntimeMetricsSummary {
+    pub fn from_runtime_metrics<'a, I>(metrics: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = &'a RuntimeStepMetrics>,
+    {
+        let collected: Vec<&RuntimeStepMetrics> = metrics.into_iter().collect();
+        if collected.is_empty() {
+            return None;
+        }
+
+        let mut storage_backends = BTreeSet::new();
+        let mut planned_tiers = BTreeSet::new();
+        let mut storage_decision_reasons = BTreeSet::new();
+
+        let mut steps_with_disk_storage = 0usize;
+        let mut total_spill_events = 0usize;
+        let mut total_spill_bytes = 0usize;
+        let mut max_memory_high_water_mark = 0usize;
+        let mut max_reserved_spill_bytes = 0usize;
+        let mut max_execution_reserved_spill_bytes = 0usize;
+        let mut max_total_reserved_spill_bytes = 0usize;
+
+        for metric in &collected {
+            if let Some(storage_type) = metric.storage_type.as_deref() {
+                storage_backends.insert(storage_type.to_string());
+                if !matches!(storage_type, "in_memory" | "shared_memory") {
+                    steps_with_disk_storage += 1;
+                }
+            }
+
+            if let Some(planned_tier) = metric.planned_tier.as_deref() {
+                planned_tiers.insert(planned_tier.to_string());
+            }
+
+            if let Some(reason) = metric.storage_decision_reason.as_deref() {
+                storage_decision_reasons.insert(reason.to_string());
+            }
+
+            total_spill_events += metric.spill_events;
+            total_spill_bytes += metric.spill_bytes;
+            max_memory_high_water_mark =
+                max_memory_high_water_mark.max(metric.memory_high_water_mark);
+            max_reserved_spill_bytes = max_reserved_spill_bytes.max(metric.reserved_spill_bytes);
+            max_execution_reserved_spill_bytes =
+                max_execution_reserved_spill_bytes.max(metric.execution_reserved_spill_bytes);
+            max_total_reserved_spill_bytes =
+                max_total_reserved_spill_bytes.max(metric.total_reserved_spill_bytes);
+        }
+
+        Some(Self {
+            steps_with_runtime_metrics: collected.len(),
+            steps_with_disk_storage,
+            total_spill_events,
+            total_spill_bytes,
+            max_memory_high_water_mark,
+            max_reserved_spill_bytes,
+            max_execution_reserved_spill_bytes,
+            max_total_reserved_spill_bytes,
+            storage_backends: storage_backends.into_iter().collect(),
+            planned_tiers: planned_tiers.into_iter().collect(),
+            storage_decision_reasons: storage_decision_reasons.into_iter().collect(),
+        })
+    }
+
+    pub fn from_step_results(step_results: &[PersistedStepResult]) -> Option<Self> {
+        Self::from_runtime_metrics(
+            step_results
+                .iter()
+                .filter_map(|step| step.runtime_metrics.as_ref()),
+        )
+    }
+
+    pub fn from_summaries<'a, I>(summaries: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = &'a Self>,
+    {
+        let collected: Vec<&Self> = summaries.into_iter().collect();
+        if collected.is_empty() {
+            return None;
+        }
+
+        let mut storage_backends = BTreeSet::new();
+        let mut planned_tiers = BTreeSet::new();
+        let mut storage_decision_reasons = BTreeSet::new();
+
+        let mut steps_with_runtime_metrics = 0usize;
+        let mut steps_with_disk_storage = 0usize;
+        let mut total_spill_events = 0usize;
+        let mut total_spill_bytes = 0usize;
+        let mut max_memory_high_water_mark = 0usize;
+        let mut max_reserved_spill_bytes = 0usize;
+        let mut max_execution_reserved_spill_bytes = 0usize;
+        let mut max_total_reserved_spill_bytes = 0usize;
+
+        for summary in &collected {
+            steps_with_runtime_metrics += summary.steps_with_runtime_metrics;
+            steps_with_disk_storage += summary.steps_with_disk_storage;
+            total_spill_events += summary.total_spill_events;
+            total_spill_bytes += summary.total_spill_bytes;
+            max_memory_high_water_mark =
+                max_memory_high_water_mark.max(summary.max_memory_high_water_mark);
+            max_reserved_spill_bytes =
+                max_reserved_spill_bytes.max(summary.max_reserved_spill_bytes);
+            max_execution_reserved_spill_bytes =
+                max_execution_reserved_spill_bytes.max(summary.max_execution_reserved_spill_bytes);
+            max_total_reserved_spill_bytes =
+                max_total_reserved_spill_bytes.max(summary.max_total_reserved_spill_bytes);
+
+            storage_backends.extend(summary.storage_backends.iter().cloned());
+            planned_tiers.extend(summary.planned_tiers.iter().cloned());
+            storage_decision_reasons.extend(summary.storage_decision_reasons.iter().cloned());
+        }
+
+        Some(Self {
+            steps_with_runtime_metrics,
+            steps_with_disk_storage,
+            total_spill_events,
+            total_spill_bytes,
+            max_memory_high_water_mark,
+            max_reserved_spill_bytes,
+            max_execution_reserved_spill_bytes,
+            max_total_reserved_spill_bytes,
+            storage_backends: storage_backends.into_iter().collect(),
+            planned_tiers: planned_tiers.into_iter().collect(),
+            storage_decision_reasons: storage_decision_reasons.into_iter().collect(),
+        })
+    }
 }
 
 /// Workflow execution record
@@ -45,6 +197,10 @@ pub struct WorkflowExecution {
     /// Per-step results for graph-native workflow executions.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub step_results: Vec<PersistedStepResult>,
+
+    /// Aggregated runtime telemetry rolled up from per-step runtime metrics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
 
     /// Matched route ID (if any)
     pub matched_route: Option<String>,
@@ -127,6 +283,7 @@ impl WorkflowExecution {
             output: None,
             confidence: None,
             step_results: Vec::new(),
+            runtime_metrics: None,
             matched_route: None,
             matched_route_name: None,
             started_at: now,
@@ -172,6 +329,13 @@ impl WorkflowExecution {
     /// Set output data
     pub fn set_output(&mut self, output: JsonValue) {
         self.output = Some(output);
+    }
+
+    /// Return the persisted runtime summary, deriving it from step results when needed.
+    pub fn effective_runtime_metrics_summary(&self) -> Option<ExecutionRuntimeMetricsSummary> {
+        self.runtime_metrics
+            .clone()
+            .or_else(|| ExecutionRuntimeMetricsSummary::from_step_results(&self.step_results))
     }
 
     /// Set error
@@ -486,6 +650,7 @@ impl ExecutionFilters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
     use serde_json::json;
 
     #[test]
@@ -857,5 +1022,119 @@ mod tests {
         let new_data_ref = execution.checkpoint_data().unwrap();
         assert_eq!(new_data_ref, &new_data);
         assert_ne!(new_data_ref, &original_data);
+    }
+
+    #[test]
+    fn test_runtime_metrics_summary_rolls_up_step_storage_signals() {
+        let step_results = vec![
+            PersistedStepResult {
+                step_id: "spill_step".to_string(),
+                success: true,
+                output: json!({"_row_count": 120000}),
+                confidence: 0.91,
+                duration_ms: 25,
+                runtime_metrics: Some(RuntimeStepMetrics {
+                    input_rows: 120000,
+                    output_rows: 120000,
+                    materialization_count: 1,
+                    spill_events: 2,
+                    spill_bytes: 8192,
+                    memory_high_water_mark: 32768,
+                    storage_type: Some("parquet".to_string()),
+                    storage_operation: Some("set_rows".to_string()),
+                    planned_tier: Some("parquet".to_string()),
+                    storage_decision_reason: Some("planned".to_string()),
+                    reserved_spill_bytes: 4096,
+                    execution_reserved_spill_bytes: 4096,
+                    total_reserved_spill_bytes: 4096,
+                    storage_location: Some("spill/spill_step.parquet".to_string()),
+                    pushdown_applied: false,
+                }),
+            },
+            PersistedStepResult {
+                step_id: "memory_step".to_string(),
+                success: true,
+                output: json!({"_row_count": 2}),
+                confidence: 1.0,
+                duration_ms: 10,
+                runtime_metrics: Some(RuntimeStepMetrics {
+                    input_rows: 2,
+                    output_rows: 2,
+                    materialization_count: 0,
+                    spill_events: 0,
+                    spill_bytes: 0,
+                    memory_high_water_mark: 1024,
+                    storage_type: Some("in_memory".to_string()),
+                    storage_operation: Some("set_rows".to_string()),
+                    planned_tier: Some("in_memory".to_string()),
+                    storage_decision_reason: Some("planned".to_string()),
+                    reserved_spill_bytes: 0,
+                    execution_reserved_spill_bytes: 0,
+                    total_reserved_spill_bytes: 0,
+                    storage_location: None,
+                    pushdown_applied: false,
+                }),
+            },
+        ];
+
+        let summary = ExecutionRuntimeMetricsSummary::from_step_results(&step_results)
+            .expect("runtime metrics summary should exist");
+
+        assert_eq!(summary.steps_with_runtime_metrics, 2);
+        assert_eq!(summary.steps_with_disk_storage, 1);
+        assert_eq!(summary.total_spill_events, 2);
+        assert_eq!(summary.total_spill_bytes, 8192);
+        assert_eq!(summary.max_memory_high_water_mark, 32768);
+        assert_eq!(summary.storage_backends, vec!["in_memory", "parquet"]);
+        assert_eq!(summary.planned_tiers, vec!["in_memory", "parquet"]);
+        assert_eq!(summary.storage_decision_reasons, vec!["planned"]);
+    }
+
+    #[test]
+    fn test_runtime_metrics_summary_rolls_up_execution_summaries() {
+        let first = ExecutionRuntimeMetricsSummary {
+            steps_with_runtime_metrics: 1,
+            steps_with_disk_storage: 0,
+            total_spill_events: 1,
+            total_spill_bytes: 512,
+            max_memory_high_water_mark: 2048,
+            max_reserved_spill_bytes: 256,
+            max_execution_reserved_spill_bytes: 256,
+            max_total_reserved_spill_bytes: 256,
+            storage_backends: vec!["in_memory".to_string()],
+            planned_tiers: vec!["memory".to_string()],
+            storage_decision_reasons: vec!["planned".to_string()],
+        };
+        let second = ExecutionRuntimeMetricsSummary {
+            steps_with_runtime_metrics: 2,
+            steps_with_disk_storage: 1,
+            total_spill_events: 3,
+            total_spill_bytes: 2048,
+            max_memory_high_water_mark: 8192,
+            max_reserved_spill_bytes: 1024,
+            max_execution_reserved_spill_bytes: 1024,
+            max_total_reserved_spill_bytes: 1536,
+            storage_backends: vec!["parquet".to_string()],
+            planned_tiers: vec!["parquet".to_string()],
+            storage_decision_reasons: vec!["memory_pressure".to_string()],
+        };
+
+        let summary = ExecutionRuntimeMetricsSummary::from_summaries([&first, &second])
+            .expect("runtime metrics summary should exist");
+
+        assert_eq!(summary.steps_with_runtime_metrics, 3);
+        assert_eq!(summary.steps_with_disk_storage, 1);
+        assert_eq!(summary.total_spill_events, 4);
+        assert_eq!(summary.total_spill_bytes, 2560);
+        assert_eq!(summary.max_memory_high_water_mark, 8192);
+        assert_eq!(summary.max_reserved_spill_bytes, 1024);
+        assert_eq!(summary.max_execution_reserved_spill_bytes, 1024);
+        assert_eq!(summary.max_total_reserved_spill_bytes, 1536);
+        assert_eq!(summary.storage_backends, vec!["in_memory", "parquet"]);
+        assert_eq!(summary.planned_tiers, vec!["memory", "parquet"]);
+        assert_eq!(
+            summary.storage_decision_reasons,
+            vec!["memory_pressure", "planned"]
+        );
     }
 }

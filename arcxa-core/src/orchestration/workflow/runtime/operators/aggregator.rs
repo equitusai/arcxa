@@ -9,9 +9,8 @@ use super::RuntimeOperator;
 
 /// Batch-native aggregator for the optimized small-dataset path.
 ///
-/// This intentionally mirrors the legacy executor semantics exactly,
-/// including its current group-key stringification behavior and the fact
-/// that `count` only counts numeric values for the selected field.
+/// This mirrors the legacy executor contract while preserving usable
+/// grouped output values and accepting numeric strings from connector rows.
 #[derive(Debug, Default)]
 pub struct AggregatorBatchOperator;
 
@@ -55,7 +54,7 @@ impl AggregatorBatchOperator {
             let keys: Vec<&str> = key_str.split('|').collect();
             for (index, field) in config.group_by.iter().enumerate() {
                 if index < keys.len() {
-                    result_row.insert(field.clone(), json!(keys[index]));
+                    result_row.insert(field.clone(), parse_group_key_token(keys[index]));
                 }
             }
 
@@ -206,7 +205,18 @@ fn numeric_cell_value(
                 })?;
             Ok(Some(array.value(row_index)))
         }
-        arrow2::datatypes::DataType::Boolean | arrow2::datatypes::DataType::Utf8 => Ok(None),
+        arrow2::datatypes::DataType::Boolean => Ok(None),
+        arrow2::datatypes::DataType::Utf8 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<Utf8Array<i32>>()
+                .ok_or_else(|| {
+                    crate::orchestration::workflow::error::WorkflowError::InvalidData(
+                        "Expected Utf8Array in batch aggregator".into(),
+                    )
+                })?;
+            Ok(array.value(row_index).trim().parse::<f64>().ok())
+        }
         other => Err(
             crate::orchestration::workflow::error::WorkflowError::NotImplemented(format!(
                 "Batch aggregator does not support Arrow type {:?}",
@@ -214,6 +224,10 @@ fn numeric_cell_value(
             )),
         ),
     }
+}
+
+fn parse_group_key_token(token: &str) -> Value {
+    serde_json::from_str(token).unwrap_or_else(|_| Value::String(token.to_string()))
 }
 
 #[cfg(test)]
@@ -267,10 +281,44 @@ mod tests {
             Some("extract_aggregate")
         );
         assert!(rows.iter().any(|row| {
-            row["region"] == "\"east\"" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
+            row["region"] == "east" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
         }));
         assert!(rows.iter().any(|row| {
-            row["region"] == "\"west\"" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
+            row["region"] == "west" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
         }));
+    }
+
+    #[test]
+    fn aggregates_numeric_strings() {
+        let frame = BatchFrame::from_json_values(&[
+            json!({"segment": "gold", "amount": "1250.555"}),
+            json!({"segment": "gold", "amount": "2200.499"}),
+            json!({"segment": "silver", "amount": "850"}),
+        ])
+        .unwrap();
+
+        let operator = AggregatorBatchOperator;
+        let result = operator
+            .execute(
+                frame,
+                &AggregatorConfig {
+                    group_by: vec!["segment".to_string()],
+                    aggregations: vec![Aggregation {
+                        field: "amount".to_string(),
+                        function: AggFunction::Sum,
+                        alias: Some("total_amount".to_string()),
+                    }],
+                },
+            )
+            .unwrap();
+
+        let rows = result.to_json_values().unwrap();
+
+        assert!(rows
+            .iter()
+            .any(|row| row["segment"] == "gold" && row["total_amount"] == 3451.054));
+        assert!(rows
+            .iter()
+            .any(|row| row["segment"] == "silver" && row["total_amount"] == 850.0));
     }
 }

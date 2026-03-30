@@ -53,6 +53,55 @@ pub fn create_workflow_router() -> Router<Arc<ApiState>> {
             "/workflows/legacy/:id/execute",
             post(crate::workflows::api::handlers::execute_workflow_legacy),
         )
+        // Legacy route/action workflow API and streaming controls
+        .route(
+            "/routing-workflows",
+            post(crate::workflows::api::handlers::create_workflow),
+        )
+        .route(
+            "/routing-workflows",
+            get(crate::workflows::api::handlers::list_workflows),
+        )
+        .route(
+            "/routing-workflows/:id",
+            get(crate::workflows::api::handlers::get_workflow),
+        )
+        .route(
+            "/routing-workflows/:id",
+            put(crate::workflows::api::handlers::update_workflow),
+        )
+        .route(
+            "/routing-workflows/:id",
+            delete(crate::workflows::api::handlers::delete_workflow),
+        )
+        .route(
+            "/routing-workflows/:id/execute",
+            post(crate::workflows::api::handlers::execute_workflow),
+        )
+        .route(
+            "/routing-workflows/:id/execute/async",
+            post(crate::workflows::api::handlers::execute_workflow_async),
+        )
+        .route(
+            "/routing-workflows/:id/route-stats",
+            post(crate::workflows::api::handlers::get_route_stats),
+        )
+        .route(
+            "/routing-workflows/:id/stream/start",
+            post(crate::workflows::api::stream_handlers::start_stream),
+        )
+        .route(
+            "/routing-workflows/:id/stream/stop",
+            post(crate::workflows::api::stream_handlers::stop_stream),
+        )
+        .route(
+            "/routing-workflows/:id/stream/stats",
+            get(crate::workflows::api::stream_handlers::get_stream_stats),
+        )
+        .route(
+            "/routing-workflows/stream/active",
+            get(crate::workflows::api::stream_handlers::list_active_streams),
+        )
         .route(
             "/workflows/:id/route-stats",
             post(crate::workflows::api::handlers::get_route_stats),

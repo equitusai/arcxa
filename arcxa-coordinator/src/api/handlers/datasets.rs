@@ -24,6 +24,7 @@ use axum::{
 use chrono::Utc;
 use std::fs::File;
 use std::io::BufWriter;
+use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +46,7 @@ use arrow2::{
     array::*,
     chunk::Chunk,
     datatypes::{DataType, Field, Schema},
+    io::parquet::read as parquet_read,
     io::parquet::write::{
         CompressionOptions, Encoding, FileWriter, RowGroupIterator, Version, WriteOptions,
     },
@@ -188,7 +190,7 @@ pub async fn import_dataset(
 
     // Parse file and detect schema
     let (record_count, schema) =
-        parse_file_and_detect_schema(&file_data, file_format, metadata.schema.as_ref()).await?;
+        parse_file_and_detect_schema(&file_data, &file_format, metadata.schema.as_ref()).await?;
 
     info!(
         "✅ Parsed {} records with schema: {} columns",
@@ -213,9 +215,23 @@ pub async fn import_dataset(
 
     let parquet_path = format!("{}/{}.parquet", storage_path, dataset_id);
 
-    // Store as Parquet (placeholder - would use Apache Arrow in production)
-    // For now, just acknowledge the file
-    info!("💾 Storing dataset at: {}", parquet_path);
+    let parquet_storage_metadata = if matches!(&file_format, FileFormat::Parquet) {
+        std::fs::write(&parquet_path, &file_data).map_err(|e| {
+            create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORAGE_ERROR",
+                &format!("Failed to persist imported parquet dataset: {}", e),
+            )
+        })?;
+        info!("💾 Persisted imported parquet dataset at: {}", parquet_path);
+        Some(("parquet", parquet_path.as_str(), file_data.len() as u64))
+    } else {
+        info!(
+            "💾 Direct upload import did not materialize a parquet artifact for format {:?}",
+            file_format
+        );
+        None
+    };
 
     // Extract user ID from JWT auth context
     let user_id = claims
@@ -246,6 +262,7 @@ pub async fn import_dataset(
         record_count,
         &lineage,
         &schema,
+        parquet_storage_metadata,
     )
     .await
     {
@@ -264,8 +281,8 @@ pub async fn import_dataset(
         lineage,
         storage: StorageInfo {
             format: "parquet".to_string(),
-            path: parquet_path,
-            compressed: true,
+            path: parquet_path.clone(),
+            compressed: parquet_storage_metadata.is_some(),
         },
     };
 
@@ -832,7 +849,7 @@ fn detect_file_format(
 /// Parse file and detect schema
 async fn parse_file_and_detect_schema(
     data: &[u8],
-    format: FileFormat,
+    format: &FileFormat,
     provided_schema: Option<&SchemaDefinition>,
 ) -> Result<(u64, SchemaDefinition), (StatusCode, Json<ImportErrorResponse>)> {
     match format {
@@ -961,19 +978,76 @@ fn detect_delimiter_from_lines(lines: &[String]) -> String {
 
 /// Parse Parquet file
 async fn parse_parquet(
-    _data: &[u8],
+    data: &[u8],
     provided_schema: Option<&SchemaDefinition>,
 ) -> Result<(u64, SchemaDefinition), (StatusCode, Json<ImportErrorResponse>)> {
-    // TODO: Implement Parquet parsing with arrow crate
+    let mut cursor = Cursor::new(data);
+    let metadata = parquet_read::read_metadata(&mut cursor).map_err(|e| {
+        create_error(
+            StatusCode::BAD_REQUEST,
+            "PARQUET_PARSE_ERROR",
+            &format!("Failed to read parquet metadata: {}", e),
+        )
+    })?;
+
+    let record_count: usize = metadata
+        .row_groups
+        .iter()
+        .map(|group| group.num_rows())
+        .sum();
 
     let schema = provided_schema
         .cloned()
         .unwrap_or_else(|| SchemaDefinition {
             primary_key: None,
-            columns: vec![],
+            columns: parquet_read::infer_schema(&metadata)
+                .map(|inferred| {
+                    inferred
+                        .fields
+                        .iter()
+                        .map(|field| ColumnDefinition {
+                            name: field.name.clone(),
+                            data_type: parquet_data_type_to_string(&field.data_type),
+                            nullable: field.is_nullable,
+                        })
+                        .collect::<Vec<ColumnDefinition>>()
+                })
+                .unwrap_or_default(),
         });
 
-    Ok((0, schema))
+    Ok((record_count as u64, schema))
+}
+
+fn parquet_data_type_to_string(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Null => "NULL".to_string(),
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            "BIGINT".to_string()
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            "BIGINT".to_string()
+        }
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Decimal(_, _) => "DECIMAL".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            "BINARY".to_string()
+        }
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+            "TIMESTAMP".to_string()
+        }
+        DataType::Duration(_) | DataType::Interval(_) => "INTERVAL".to_string(),
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Struct(_)
+        | DataType::Union(_, _, _)
+        | DataType::Map(_, _)
+        | DataType::Dictionary(_, _, _) => "JSON".to_string(),
+        _ => "VARCHAR".to_string(),
+    }
 }
 
 /// Parse JSON Lines file
@@ -1125,11 +1199,25 @@ fn build_import_lineage_turtle(
     record_count: u64,
     lineage: &ImportLineage,
     schema: &SchemaDefinition,
+    storage_metadata: Option<(&str, &str, u64)>,
 ) -> String {
     let dataset = dataset_uri(dataset_id);
     let import = import_uri(import_id);
     let user = user_uri(&lineage.imported_by);
     let schema_triples = build_schema_triples(dataset_id, schema);
+    let storage_triples = storage_metadata
+        .map(|(storage_format, storage_path, file_size_bytes)| {
+            format!(
+                r#"
+    gph:storageFormat "{storage_format}" ;
+    gph:storagePath "{storage_path}" ;
+    gph:fileSizeBytes {file_size_bytes} ;"#,
+                storage_format = escape_turtle_literal(storage_format),
+                storage_path = escape_turtle_literal(storage_path),
+                file_size_bytes = file_size_bytes,
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         r#"
@@ -1143,6 +1231,7 @@ fn build_import_lineage_turtle(
     gph:datasetType "imported" ;
     gph:recordCount {record_count} ;
     gph:createdAt "{imported_at}"^^xsd:dateTime ;
+{storage_triples}
     gph:importedFrom <{import}> .
 
 # Import Activity (W3C PROV)
@@ -1163,6 +1252,7 @@ fn build_import_lineage_turtle(
         dataset_name = escape_turtle_literal(dataset_name),
         record_count = record_count,
         imported_at = lineage.imported_at,
+        storage_triples = storage_triples,
         import = import,
         user = user,
         source_file = escape_turtle_literal(&lineage.source_file),
@@ -1315,6 +1405,7 @@ async fn store_import_lineage(
     record_count: u64,
     lineage: &ImportLineage,
     schema: &SchemaDefinition,
+    storage_metadata: Option<(&str, &str, u64)>,
 ) -> Result<(), String> {
     use crate::governance::rdf_store::{NamedGraph, RdfStore};
 
@@ -1330,6 +1421,7 @@ async fn store_import_lineage(
         record_count,
         lineage,
         schema,
+        storage_metadata,
     );
 
     info!(

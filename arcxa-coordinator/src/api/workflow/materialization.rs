@@ -5,11 +5,14 @@ use crate::api::handlers::datasets::{
     store_workflow_output_lineage, write_query_result_to_parquet,
 };
 use crate::api::workflow::types::{
-    ExecutionResultDto, StepResultDto, WorkflowOutputDatasetRef, WorkflowOutputDatasetRequest,
+    ExecutionResultDto, ExecutionRuntimeMetricsDto, RuntimeStepMetricsDto, StepResultDto,
+    WorkflowOutputDatasetRef, WorkflowOutputDatasetRequest,
 };
 use crate::api::ApiState;
 use crate::governance::WorkflowResultPersistence;
-use crate::workflows::domain::{ExecutionStatus, PersistedStepResult, WorkflowExecution};
+use crate::workflows::domain::{
+    ExecutionRuntimeMetricsSummary, ExecutionStatus, PersistedStepResult, WorkflowExecution,
+};
 use axum::{http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use graphica_core::catalog::api_types::{ColumnDefinition as QueryColumnDefinition, QueryResult};
@@ -75,11 +78,16 @@ pub async fn finalize_execution_result(
                 .signed_duration_since(step.started_at)
                 .num_milliseconds()
                 .max(0) as u64,
+            runtime_metrics: step
+                .runtime_metrics
+                .as_ref()
+                .map(RuntimeStepMetricsDto::from),
         })
         .collect();
     step_results.sort_by(|left, right| left.step_id.cmp(&right.step_id));
     let final_output = final_output_for_response(&result);
     let execution_id = result.execution_id.clone();
+    let runtime_metrics = summarize_workflow_runtime_metrics(result.step_results.values());
 
     Ok(ExecutionResultDto {
         execution_id,
@@ -87,6 +95,9 @@ pub async fn finalize_execution_result(
         step_results,
         final_output,
         confidence: result.confidence,
+        runtime_metrics: runtime_metrics
+            .as_ref()
+            .map(ExecutionRuntimeMetricsDto::from),
         materialized_dataset,
     })
 }
@@ -128,19 +139,25 @@ pub async fn persist_execution_record_if_possible(
         ExecutionStatus::Failed
     };
     execution.error = result.error.clone();
-    execution.actions_executed = execution_result.step_results.len();
+    execution.actions_executed = result.step_results.len();
     execution.confidence = Some(result.confidence);
-    execution.step_results = execution_result
+    execution.step_results = result
         .step_results
         .iter()
-        .map(|step| PersistedStepResult {
-            step_id: step.step_id.clone(),
+        .map(|(step_id, step)| PersistedStepResult {
+            step_id: step_id.clone(),
             success: step.success,
             output: step.output.clone(),
             confidence: step.confidence,
-            duration_ms: step.duration_ms,
+            duration_ms: step
+                .completed_at
+                .signed_duration_since(step.started_at)
+                .num_milliseconds()
+                .max(0) as u64,
+            runtime_metrics: step.runtime_metrics.clone(),
         })
         .collect();
+    execution.runtime_metrics = summarize_workflow_runtime_metrics(result.step_results.values());
     execution.output = Some(build_persisted_execution_output(execution_result));
 
     if execution_store
@@ -342,6 +359,19 @@ fn build_persisted_execution_output(execution_result: &ExecutionResultDto) -> Js
     }
 }
 
+fn summarize_workflow_runtime_metrics<'a, I>(
+    step_results: I,
+) -> Option<ExecutionRuntimeMetricsSummary>
+where
+    I: IntoIterator<Item = &'a graphica_core::orchestration::workflow::executor::StepResult>,
+{
+    ExecutionRuntimeMetricsSummary::from_runtime_metrics(
+        step_results
+            .into_iter()
+            .filter_map(|step| step.runtime_metrics.as_ref()),
+    )
+}
+
 fn extract_output_rows(result: &WorkflowResult) -> Option<Vec<JsonValue>> {
     result.output_rows.clone().or_else(|| {
         result
@@ -527,11 +557,14 @@ fn merge_kinds(existing: ValueKind, observed: ValueKind) -> ValueKind {
 mod tests {
     use super::{
         build_persisted_execution_output, final_output_for_response, infer_schema_from_rows,
-        resolve_dataset_name,
+        resolve_dataset_name, summarize_workflow_runtime_metrics,
     };
     use crate::api::workflow::types::ExecutionResultDto;
     use chrono::{TimeZone, Utc};
-    use graphica_core::orchestration::workflow::executor::{FinalDecision, WorkflowResult};
+    use graphica_core::orchestration::workflow::executor::{
+        FinalDecision, StepResult, WorkflowResult,
+    };
+    use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
     use serde_json::{json, Value as JsonValue};
     use std::collections::HashMap;
 
@@ -596,6 +629,7 @@ mod tests {
             step_results: vec![],
             final_output: json!({"records": 12}),
             confidence: 0.92,
+            runtime_metrics: None,
             materialized_dataset: Some(super::WorkflowOutputDatasetRef {
                 dataset_id: "ds_workflow_test".to_string(),
                 name: "Workflow Output".to_string(),
@@ -616,5 +650,85 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("ds_workflow_test")
         );
+    }
+
+    #[test]
+    fn test_summarize_workflow_runtime_metrics_rolls_up_storage_signals() {
+        let started_at = Utc.with_ymd_and_hms(2026, 3, 9, 11, 0, 0).unwrap();
+        let completed_at = Utc.with_ymd_and_hms(2026, 3, 9, 11, 5, 0).unwrap();
+        let step_results = HashMap::from([
+            (
+                "spill_step".to_string(),
+                StepResult {
+                    step_id: "spill_step".to_string(),
+                    success: true,
+                    output: json!({"_row_count": 120000}),
+                    confidence: 0.91,
+                    started_at,
+                    completed_at,
+                    batch_metadata: None,
+                    runtime_metrics: Some(RuntimeStepMetrics {
+                        input_rows: 120000,
+                        output_rows: 120000,
+                        materialization_count: 1,
+                        spill_events: 2,
+                        spill_bytes: 8192,
+                        memory_high_water_mark: 16384,
+                        storage_type: Some("parquet".to_string()),
+                        storage_operation: Some("set_rows".to_string()),
+                        planned_tier: Some("parquet".to_string()),
+                        storage_decision_reason: Some("planned".to_string()),
+                        reserved_spill_bytes: 4096,
+                        execution_reserved_spill_bytes: 4096,
+                        total_reserved_spill_bytes: 4096,
+                        storage_location: Some("spill/spill_step.parquet".to_string()),
+                        pushdown_applied: false,
+                    }),
+                    batch_frame: None,
+                },
+            ),
+            (
+                "memory_step".to_string(),
+                StepResult {
+                    step_id: "memory_step".to_string(),
+                    success: true,
+                    output: json!({"_row_count": 2}),
+                    confidence: 1.0,
+                    started_at,
+                    completed_at,
+                    batch_metadata: None,
+                    runtime_metrics: Some(RuntimeStepMetrics {
+                        input_rows: 2,
+                        output_rows: 2,
+                        materialization_count: 0,
+                        spill_events: 0,
+                        spill_bytes: 0,
+                        memory_high_water_mark: 1024,
+                        storage_type: Some("in_memory".to_string()),
+                        storage_operation: Some("set_rows".to_string()),
+                        planned_tier: Some("in_memory".to_string()),
+                        storage_decision_reason: Some("planned".to_string()),
+                        reserved_spill_bytes: 0,
+                        execution_reserved_spill_bytes: 0,
+                        total_reserved_spill_bytes: 0,
+                        storage_location: None,
+                        pushdown_applied: false,
+                    }),
+                    batch_frame: None,
+                },
+            ),
+        ]);
+
+        let summary = summarize_workflow_runtime_metrics(step_results.values())
+            .expect("runtime metrics summary should be produced");
+
+        assert_eq!(summary.steps_with_runtime_metrics, 2);
+        assert_eq!(summary.steps_with_disk_storage, 1);
+        assert_eq!(summary.total_spill_events, 2);
+        assert_eq!(summary.total_spill_bytes, 8192);
+        assert_eq!(summary.max_memory_high_water_mark, 16384);
+        assert_eq!(summary.storage_backends, vec!["in_memory", "parquet"]);
+        assert_eq!(summary.planned_tiers, vec!["in_memory", "parquet"]);
+        assert_eq!(summary.storage_decision_reasons, vec!["planned"]);
     }
 }

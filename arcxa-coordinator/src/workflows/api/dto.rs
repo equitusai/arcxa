@@ -4,8 +4,8 @@
 
 use crate::workflows::domain::{
     Action, ActionResult, BatchJob, BatchJobConfig, BatchJobProgress, BatchJobStatus, Condition,
-    DataSource, ExecutionLog, ExecutionStatus, LogLevel, Route, TransactionMode, Workflow,
-    WorkflowExecution, WorkflowExecutionRef, WorkflowSummary,
+    DataSource, ExecutionLog, ExecutionMode, ExecutionStatus, LogLevel, Route, TransactionMode,
+    Workflow, WorkflowExecution, WorkflowExecutionRef, WorkflowSummary,
 };
 use crate::workflows::engine::{
     ResourceRequirements, ValidationCheck, ValidationError, ValidationWarning,
@@ -22,6 +22,8 @@ pub struct CreateWorkflowRequest {
     #[serde(default)]
     pub description: String,
     pub routes: Vec<RouteDto>,
+    #[serde(default)]
+    pub execution_mode: Option<ExecutionMode>,
     #[serde(default)]
     pub default_route: Option<String>,
     #[serde(default)]
@@ -57,6 +59,8 @@ pub struct UpdateWorkflowRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub routes: Option<Vec<RouteDto>>,
+    #[serde(default)]
+    pub execution_mode: Option<ExecutionMode>,
     #[serde(default)]
     pub default_route: Option<String>,
     #[serde(default)]
@@ -187,6 +191,8 @@ pub struct GetExecutionResponse {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub step_results: Vec<crate::workflows::domain::PersistedStepResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<crate::workflows::domain::ExecutionRuntimeMetricsSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_route: Option<String>,
@@ -221,6 +227,7 @@ pub struct GetExecutionResponse {
 
 impl From<WorkflowExecution> for GetExecutionResponse {
     fn from(exec: WorkflowExecution) -> Self {
+        let runtime_metrics = exec.effective_runtime_metrics_summary();
         Self {
             execution_id: exec.execution_id,
             workflow_id: exec.workflow_id,
@@ -229,6 +236,7 @@ impl From<WorkflowExecution> for GetExecutionResponse {
             input: exec.input,
             confidence: exec.confidence,
             step_results: exec.step_results,
+            runtime_metrics,
             output: exec.output,
             matched_route: exec.matched_route,
             matched_route_name: exec.matched_route_name,
@@ -322,10 +330,13 @@ pub struct ExecutionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub actions_executed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<crate::workflows::domain::ExecutionRuntimeMetricsSummary>,
 }
 
 impl From<WorkflowExecution> for ExecutionSummary {
     fn from(exec: WorkflowExecution) -> Self {
+        let runtime_metrics = exec.effective_runtime_metrics_summary();
         Self {
             execution_id: exec.execution_id,
             workflow_id: exec.workflow_id,
@@ -337,6 +348,7 @@ impl From<WorkflowExecution> for ExecutionSummary {
             duration_ms: exec.duration_ms,
             error: exec.error,
             actions_executed: exec.actions_executed,
+            runtime_metrics,
         }
     }
 }
@@ -498,7 +510,9 @@ pub struct GetBatchJobResponse {
     pub status: BatchJobStatus,
     pub progress: BatchJobProgress,
     pub config: BatchJobConfig,
-    pub workflow_executions: Vec<WorkflowExecutionRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<crate::workflows::domain::ExecutionRuntimeMetricsSummary>,
+    pub workflow_executions: Vec<BatchWorkflowExecutionDto>,
     pub metadata: std::collections::HashMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -509,6 +523,50 @@ pub struct GetBatchJobResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
     pub created_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchWorkflowExecutionDto {
+    pub execution_id: String,
+    pub source: DataSource,
+    pub target_table: String,
+    pub status: crate::workflows::domain::WorkflowExecutionStatus,
+    pub dependencies: Vec<String>,
+    pub attempt_number: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_processed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<crate::workflows::domain::ExecutionRuntimeMetricsSummary>,
+}
+
+impl BatchWorkflowExecutionDto {
+    pub fn from_execution_ref(
+        execution: WorkflowExecutionRef,
+        runtime_metrics: Option<crate::workflows::domain::ExecutionRuntimeMetricsSummary>,
+    ) -> Self {
+        Self {
+            execution_id: execution.execution_id,
+            source: execution.source,
+            target_table: execution.target_table,
+            status: execution.status,
+            dependencies: execution.dependencies,
+            attempt_number: execution.attempt_number,
+            started_at: execution.started_at,
+            completed_at: execution.completed_at,
+            error: execution.error,
+            rows_processed: execution.rows_processed,
+            duration_ms: execution.duration_ms,
+            runtime_metrics,
+        }
+    }
 }
 
 impl From<BatchJob> for GetBatchJobResponse {
@@ -523,7 +581,12 @@ impl From<BatchJob> for GetBatchJobResponse {
             status: batch.status,
             progress: batch.progress,
             config: batch.config,
-            workflow_executions: batch.workflow_executions,
+            runtime_metrics: None,
+            workflow_executions: batch
+                .workflow_executions
+                .into_iter()
+                .map(|execution| BatchWorkflowExecutionDto::from_execution_ref(execution, None))
+                .collect(),
             metadata: batch.metadata,
             created_at: batch.created_at,
             updated_at: batch.updated_at,
@@ -565,6 +628,8 @@ pub struct BatchJobSummary {
     pub workflow_id: String,
     pub status: BatchJobStatus,
     pub progress: BatchJobProgress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<crate::workflows::domain::ExecutionRuntimeMetricsSummary>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -583,6 +648,7 @@ impl From<BatchJob> for BatchJobSummary {
             workflow_id: batch.workflow_id,
             status: batch.status,
             progress: batch.progress,
+            runtime_metrics: None,
             created_at: batch.created_at,
             updated_at: batch.updated_at,
             started_at: batch.started_at,
@@ -794,6 +860,7 @@ mod tests {
                 }],
                 priority: 10,
             }],
+            execution_mode: None,
             default_route: None,
             tags: vec!["test".to_string()],
         };
@@ -892,6 +959,60 @@ mod tests {
         assert_eq!(resp.workflow_id, "wf_001");
         assert_eq!(resp.status, ExecutionStatus::Pending);
         assert_eq!(resp.triggered_by, Some("user@example.com".to_string()));
+        assert!(resp.runtime_metrics.is_none());
+    }
+
+    #[test]
+    fn test_get_execution_response_derives_runtime_metrics_from_step_results() {
+        use crate::workflows::domain::{PersistedStepResult, WorkflowExecution};
+        use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
+
+        let mut execution = WorkflowExecution::new(
+            "exec_002".to_string(),
+            "wf_002".to_string(),
+            "Runtime Workflow".to_string(),
+            json!({"input": "data"}),
+            None,
+        );
+        execution.step_results = vec![PersistedStepResult {
+            step_id: "step_1".to_string(),
+            success: true,
+            output: json!({"records": 3}),
+            confidence: 0.88,
+            duration_ms: 25,
+            runtime_metrics: Some(RuntimeStepMetrics {
+                input_rows: 3,
+                output_rows: 3,
+                materialization_count: 0,
+                spill_events: 1,
+                spill_bytes: 1024,
+                memory_high_water_mark: 4096,
+                storage_type: Some("parquet".to_string()),
+                storage_operation: Some("set_rows".to_string()),
+                planned_tier: Some("parquet".to_string()),
+                storage_decision_reason: Some("planned".to_string()),
+                reserved_spill_bytes: 1024,
+                execution_reserved_spill_bytes: 1024,
+                total_reserved_spill_bytes: 1024,
+                storage_location: Some("spill/step_1.parquet".to_string()),
+                pushdown_applied: false,
+            }),
+        }];
+
+        let resp: GetExecutionResponse = execution.into();
+
+        assert_eq!(
+            resp.runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(1)
+        );
+        assert_eq!(
+            resp.runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["parquet".to_string()])
+        );
     }
 
     #[test]
@@ -921,7 +1042,8 @@ mod tests {
 
     #[test]
     fn test_execution_summary_from_workflow_execution() {
-        use crate::workflows::domain::WorkflowExecution;
+        use crate::workflows::domain::{PersistedStepResult, WorkflowExecution};
+        use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
 
         let mut execution = WorkflowExecution::new(
             "exec_001".to_string(),
@@ -932,6 +1054,30 @@ mod tests {
         );
         execution.update_status(ExecutionStatus::Completed);
         execution.actions_executed = 5;
+        execution.step_results.push(PersistedStepResult {
+            step_id: "step_1".to_string(),
+            success: true,
+            output: json!({"rows": 10}),
+            confidence: 0.95,
+            duration_ms: 12,
+            runtime_metrics: Some(RuntimeStepMetrics {
+                input_rows: 10,
+                output_rows: 10,
+                materialization_count: 0,
+                spill_events: 1,
+                spill_bytes: 4096,
+                memory_high_water_mark: 8192,
+                storage_type: Some("rocksdb".to_string()),
+                storage_operation: Some("set_rows".to_string()),
+                planned_tier: Some("rocksdb".to_string()),
+                storage_decision_reason: Some("planned".to_string()),
+                reserved_spill_bytes: 4096,
+                execution_reserved_spill_bytes: 4096,
+                total_reserved_spill_bytes: 4096,
+                storage_location: Some("spill/exec_001.rocksdb".to_string()),
+                pushdown_applied: false,
+            }),
+        });
 
         let summary: ExecutionSummary = execution.into();
 
@@ -939,6 +1085,20 @@ mod tests {
         assert_eq!(summary.status, ExecutionStatus::Completed);
         assert_eq!(summary.actions_executed, 5);
         assert!(summary.duration_ms.is_some());
+        assert_eq!(
+            summary
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["rocksdb".to_string()])
+        );
     }
 
     #[test]

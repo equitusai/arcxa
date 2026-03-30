@@ -164,7 +164,9 @@ impl UnifiedTransformationProcessor {
                     .source_fields
                     .iter()
                     .find(|sf| {
-                        sf.datasource_id == *primary_source || sf.field_name == *primary_source
+                        sf.source_id_aliases()
+                            .iter()
+                            .any(|alias| alias == primary_source)
                     })
                     .and_then(|sf| row.get(&sf.field_name))
                     .cloned()
@@ -389,6 +391,57 @@ mod tests {
         assert_eq!(
             result[0].get("email"),
             Some(&"john@example.com".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conflict_resolution_use_primary_accepts_qualified_selector() -> Result<()> {
+        let processor = UnifiedTransformationProcessor::new(false);
+
+        let mut source_row = HashMap::new();
+        source_row.insert("email".to_string(), "picked@example.com".to_string());
+
+        let field_mappings = vec![UnifiedFieldMapping {
+            id: "mapping_1".to_string(),
+            source_fields: vec![
+                SourceFieldRef {
+                    session_id: "session_1".to_string(),
+                    datasource_id: "csv_1".to_string(),
+                    table_name: "users1.csv".to_string(),
+                    field_name: "email".to_string(),
+                    source_data_type: "TEXT".to_string(),
+                },
+                SourceFieldRef {
+                    session_id: "session_2".to_string(),
+                    datasource_id: "csv_2".to_string(),
+                    table_name: "users2.csv".to_string(),
+                    field_name: "email".to_string(),
+                    source_data_type: "TEXT".to_string(),
+                },
+            ],
+            ontology_term_uri: "http://schema.org/email".to_string(),
+            target_column: TargetColumnRef {
+                table_name: "customers".to_string(),
+                column_name: "email".to_string(),
+                data_type: "VARCHAR(255)".to_string(),
+            },
+            conflict_resolution: ConflictResolution::UsePrimary {
+                primary_source: "csv_1.email".to_string(),
+            },
+            transformation: None,
+            confidence: 0.95,
+        }];
+
+        let result = processor
+            .transform_batch(vec![source_row], &field_mappings)
+            .await?;
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("email"),
+            Some(&"picked@example.com".to_string())
         );
 
         Ok(())

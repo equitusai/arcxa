@@ -1,0 +1,116 @@
+services:
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: arcxa-mcp-oracle-db2-oracle
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: ARCXA_DEMO
+      APP_USER_PASSWORD: arcxa_demo
+    ports:
+      - "11521:1521"
+    volumes:
+      - ../oracle-e2e/initdb:/container-entrypoint-initdb.d:ro
+      - oracle-mcp-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  db2:
+    image: icr.io/db2_community/db2:11.5.9.0
+    container_name: arcxa-mcp-oracle-db2-db2
+    hostname: db2
+    networks:
+      default:
+        aliases:
+          - db2-server
+    privileged: true
+    ports:
+      - "50000:50000"
+      - "55000:55000"
+    environment:
+      LICENSE: accept
+      DB2INST1_PASSWORD: graphica-db2-pass
+      DB2INSTANCE: db2inst1
+      DBNAME: GRAPHICA
+      DB2_ENABLE_AUTOCONFIG: "NO"
+      BLU: "false"
+      PAGESIZE: "32768"
+      MAX_CONNECTIONS: "200"
+      LOGARCHMETH1: "OFF"
+      LOGFILSIZ: "4096"
+      LOGPRIMARY: "13"
+      LOGSECOND: "12"
+    volumes:
+      - db2-mcp-data:/database
+      - db2-global-reg:/var/db2
+      - ../db2/init:/docker-entrypoint-initdb.d:ro
+      - ../db2/scripts:/scripts
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "su - db2inst1 -c \". /database/config/db2inst1/sqllib/db2profile && db2 connect to GRAPHICA user db2inst1 using graphica-db2-pass >/dev/null && db2 'select 1 from sysibm.sysdummy1' >/dev/null && db2 terminate >/dev/null\" || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: docker/oracle-e2e/Dockerfile.coordinator.oracle-e2e
+      args:
+        CARGO_PROFILE: ${ORACLE_DB2_MCP_CARGO_PROFILE:-e2e}
+    image: arcxa-coordinator-oracle-db2-mcp:latest
+    container_name: arcxa-mcp-oracle-db2-coordinator
+    hostname: db2
+    depends_on:
+      oracle:
+        condition: service_healthy
+      db2:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      REST_PORT: "8080"
+      GRPC_PORT: "9090"
+      REST_BIND_ADDRESS: "0.0.0.0"
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+      ROCKSDB_PATH: /app/data/rocksdb
+      PARQUET_PATH: /app/data/parquet
+      ARCHIVE_PATH: /app/data/archive
+      ROW_LINEAGE_DB_PATH: /app/data/row-lineage-db
+      AUDIT_CHAIN_PATH: /app/data/audit
+      ENABLE_AUTH: "false"
+      ENABLE_METRICS: "true"
+      METRICS_PORT: "9091"
+      KAFKA_MODE: legacy
+      GRAPHICA_ORACLE_ODBC_DRIVER: Oracle in OraClient19Home1
+      DB2_HOST: db2-server
+      DB2_PORT: "50000"
+      DB2_DATABASE: GRAPHICA
+      DB2_USER: db2inst1
+      DB2_PASSWORD: graphica-db2-pass
+      RUST_LOG: info,graphica_coordinator::catalog_impl=debug,graphica_core::catalog::connectors::oracle=debug,graphica_core::catalog::connectors::db2=debug
+    ports:
+      - "18888:8080"
+      - "19095:9090"
+    volumes:
+      - coordinator-mcp-data:/app/data
+      - db2-mcp-data:/database
+      - db2-global-reg:/var/db2
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  oracle-mcp-data:
+  db2-mcp-data:
+  db2-global-reg:
+  coordinator-mcp-data:

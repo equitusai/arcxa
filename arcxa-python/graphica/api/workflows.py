@@ -96,7 +96,7 @@ class WorkflowsAPI:
         # Use async endpoint if async_mode is True
         endpoint = f"{self._base}/{workflow_id}/execute"
         if async_mode:
-            endpoint = f"{self._base}/{workflow_id}/execute/async"
+            endpoint = f"{self._base}/{workflow_id}/execute-async"
 
         return self._client.post(endpoint, json=data)
 
@@ -119,6 +119,26 @@ class WorkflowsAPI:
         if status:
             params["status"] = status
         return self._client.get(f"{self._base}/{workflow_id}/executions", params=params)
+
+    def get_execution(self, execution_id: str) -> Dict[str, Any]:
+        """Get detailed execution record by ID."""
+        return self._client.get(f"/api/v1/executions/{execution_id}")
+
+    def get_execution_progress(self, execution_id: str) -> Dict[str, Any]:
+        """Get real-time execution progress."""
+        return self._client.get(f"{self._base}/executions/{execution_id}/progress")
+
+    def list_execution_progress(self, workflow_id: str) -> List[Dict[str, Any]]:
+        """List progress snapshots for one workflow."""
+        return self._client.get(f"{self._base}/{workflow_id}/executions/progress")
+
+    def list_active_executions(self) -> List[Dict[str, Any]]:
+        """List all active workflow executions."""
+        return self._client.get(f"{self._base}/executions/active")
+
+    def cancel_execution(self, execution_id: str) -> Dict[str, Any]:
+        """Cancel a running execution."""
+        return self._client.delete(f"{self._base}/executions/{execution_id}")
 
     # Scheduling
     def create_schedule(

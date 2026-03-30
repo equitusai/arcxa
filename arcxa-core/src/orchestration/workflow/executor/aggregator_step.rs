@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_json::Value;
 use std::collections::HashMap;
 
 use super::{build_rows_output, BatchStepExecutionResult, ExecutionContext, WorkflowExecutor};
@@ -46,14 +47,14 @@ impl WorkflowExecutor {
             let keys: Vec<&str> = key_str.split('|').collect();
             for (index, field) in config.group_by.iter().enumerate() {
                 if index < keys.len() {
-                    result_row.insert(field.clone(), serde_json::json!(keys[index]));
+                    result_row.insert(field.clone(), parse_group_key_token(keys[index]));
                 }
             }
 
             for aggregation in &config.aggregations {
                 let values: Vec<f64> = group_rows
                     .iter()
-                    .filter_map(|row| row.get(&aggregation.field).and_then(|value| value.as_f64()))
+                    .filter_map(|row| row.get(&aggregation.field).and_then(json_numeric_value))
                     .collect();
 
                 let aggregated_value = match aggregation.function {
@@ -94,4 +95,16 @@ impl WorkflowExecutor {
             vec![("_original_count".to_string(), serde_json::json!(rows.len()))],
         )))
     }
+}
+
+fn json_numeric_value(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+    })
+}
+
+fn parse_group_key_token(token: &str) -> Value {
+    serde_json::from_str(token).unwrap_or_else(|_| Value::String(token.to_string()))
 }

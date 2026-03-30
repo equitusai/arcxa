@@ -76,95 +76,108 @@ impl MaterializedDatasetResolver {
     }
 
     fn resolve_storage_location(&self, dataset_id: &str) -> Result<DatasetStorageLocation> {
-        let mut dataset_type = None;
-        let mut storage_path = None;
-        let mut storage_format = None;
+        resolve_storage_location_from_state(&self.state, dataset_id)
+    }
+}
 
-        if let Some(rdf_store) = &self.state.rdf_store {
-            let query = SparqlTemplates::get_dataset_by_id(dataset_id);
-            if let Ok(results) = rdf_store.query(&query) {
-                for result in results {
-                    let Some(property_uri) =
-                        result.get("property").and_then(|value| value.as_str())
-                    else {
-                        continue;
-                    };
+pub(crate) fn resolve_materialized_dataset_path(
+    state: &ApiState,
+    dataset_id: &str,
+) -> Result<String> {
+    Ok(resolve_storage_location_from_state(state, dataset_id)?.path)
+}
 
-                    let property_name = property_uri
-                        .rsplit('#')
-                        .next()
-                        .or_else(|| property_uri.rsplit('/').next())
-                        .unwrap_or(property_uri);
+fn resolve_storage_location_from_state(
+    state: &ApiState,
+    dataset_id: &str,
+) -> Result<DatasetStorageLocation> {
+    let mut dataset_type = None;
+    let mut storage_path = None;
+    let mut storage_format = None;
 
-                    match property_name {
-                        "datasetType" => {
-                            dataset_type = result
-                                .get("value")
-                                .and_then(|value| value.as_str())
-                                .map(ToOwned::to_owned);
-                        }
-                        "storagePath" => {
-                            storage_path = result
-                                .get("value")
-                                .and_then(|value| value.as_str())
-                                .map(ToOwned::to_owned);
-                        }
-                        "storageFormat" => {
-                            storage_format = result
-                                .get("value")
-                                .and_then(|value| value.as_str())
-                                .map(ToOwned::to_owned);
-                        }
-                        _ => {}
+    if let Some(rdf_store) = &state.rdf_store {
+        let query = SparqlTemplates::get_dataset_by_id(dataset_id);
+        if let Ok(results) = rdf_store.query(&query) {
+            for result in results {
+                let Some(property_uri) = result.get("property").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+
+                let property_name = property_uri
+                    .rsplit('#')
+                    .next()
+                    .or_else(|| property_uri.rsplit('/').next())
+                    .unwrap_or(property_uri);
+
+                match property_name {
+                    "datasetType" => {
+                        dataset_type = result
+                            .get("value")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned);
                     }
+                    "storagePath" => {
+                        storage_path = result
+                            .get("value")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned);
+                    }
+                    "storageFormat" => {
+                        storage_format = result
+                            .get("value")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned);
+                    }
+                    _ => {}
                 }
             }
         }
-
-        if matches!(dataset_type.as_deref(), Some("source")) {
-            bail!(
-                "Dataset {} is a source asset. Materialize it before using it as workflow input",
-                dataset_id
-            );
-        }
-
-        if storage_path.is_none() {
-            let legacy_path = legacy_parquet_path(dataset_id);
-            if legacy_path.exists() {
-                storage_path = Some(legacy_path.to_string_lossy().to_string());
-                storage_format.get_or_insert_with(|| "parquet".to_string());
-            }
-        }
-
-        let path = storage_path.ok_or_else(|| {
-            anyhow!(
-                "Dataset {} does not have materialized storage metadata or a readable Parquet file",
-                dataset_id
-            )
-        })?;
-
-        if !Path::new(&path).exists() {
-            bail!(
-                "Dataset {} storage file does not exist at {}",
-                dataset_id,
-                path
-            );
-        }
-
-        let format = storage_format
-            .unwrap_or_else(|| infer_storage_format(&path))
-            .to_lowercase();
-
-        if format != "parquet" {
-            bail!(
-                "Dataset {} uses unsupported storage format {}. Only Parquet-backed datasets are supported right now",
-                dataset_id,
-                format
-            );
-        }
-
-        Ok(DatasetStorageLocation { path })
     }
+
+    if matches!(dataset_type.as_deref(), Some("source")) {
+        bail!(
+            "Dataset {} is a source asset. Materialize it before using it as workflow input",
+            dataset_id
+        );
+    }
+
+    if storage_path.is_none() {
+        let legacy_path = legacy_parquet_path(dataset_id);
+        if legacy_path.exists() {
+            storage_path = Some(legacy_path.to_string_lossy().to_string());
+            storage_format.get_or_insert_with(|| "parquet".to_string());
+        }
+    }
+
+    let path = storage_path.ok_or_else(|| {
+        anyhow!(
+            "Dataset {} does not have materialized storage metadata or a readable Parquet file",
+            dataset_id
+        )
+    })?;
+
+    if !Path::new(&path).exists() {
+        bail!(
+            "Dataset {} storage file does not exist at {}",
+            dataset_id,
+            path
+        );
+    }
+
+    let format = storage_format
+        .unwrap_or_else(|| infer_storage_format(&path))
+        .to_lowercase();
+
+    if format != "parquet" {
+        bail!(
+            "Dataset {} uses unsupported storage format {}. Only Parquet-backed datasets are supported right now",
+            dataset_id,
+            format
+        );
+    }
+
+    Ok(DatasetStorageLocation { path })
 }
 
 #[async_trait::async_trait]
@@ -196,7 +209,10 @@ fn infer_storage_format(path: &str) -> String {
         .to_string()
 }
 
-fn read_parquet_rows(parquet_path: &str, limit: Option<usize>) -> Result<Vec<JsonValue>> {
+pub(crate) fn read_parquet_rows(
+    parquet_path: &str,
+    limit: Option<usize>,
+) -> Result<Vec<JsonValue>> {
     let mut file = File::open(parquet_path)
         .with_context(|| format!("Failed to open dataset Parquet file {}", parquet_path))?;
 

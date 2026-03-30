@@ -62,17 +62,19 @@ pub fn resolve_owner_and_table(
 pub fn generate_insert_all_sql(
     table_name: &str,
     columns: &[String],
+    value_expressions: &[String],
     row_count: usize,
 ) -> Result<String> {
     validate_table_name(table_name)?;
     validate_column_names(columns)?;
+    validate_value_expressions(columns, value_expressions)?;
 
     if row_count == 0 {
         return Err(anyhow!("Oracle INSERT ALL requires at least one row"));
     }
 
     let column_list = columns.join(", ");
-    let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = value_expressions.join(", ");
 
     let mut sql = String::from("INSERT ALL\n");
     for _ in 0..row_count {
@@ -90,10 +92,12 @@ pub fn generate_merge_sql(
     table_name: &str,
     columns: &[String],
     key_fields: &[String],
+    value_expressions: &[String],
     row_count: usize,
 ) -> Result<String> {
     validate_table_name(table_name)?;
     validate_column_names(columns)?;
+    validate_value_expressions(columns, value_expressions)?;
 
     if key_fields.is_empty() {
         return Err(anyhow!("Oracle MERGE requires one or more key fields"));
@@ -118,14 +122,20 @@ pub fn generate_merge_sql(
         "SELECT {} FROM DUAL",
         columns
             .iter()
-            .map(|column| format!("? {}", column))
+            .zip(value_expressions.iter())
+            .map(|(column, expression)| format!("{expression} {column}"))
             .collect::<Vec<_>>()
             .join(", ")
     ));
 
     let plain_select = format!(
         "SELECT {} FROM DUAL",
-        columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+        columns
+            .iter()
+            .zip(value_expressions.iter())
+            .map(|(column, expression)| format!("{expression} {column}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for _ in 1..row_count {
         source_rows.push(plain_select.clone());
@@ -244,6 +254,25 @@ fn normalize_oracle_type(data_type: &str) -> Result<String> {
     Ok(rewritten)
 }
 
+fn validate_value_expressions(columns: &[String], value_expressions: &[String]) -> Result<()> {
+    if columns.len() != value_expressions.len() {
+        return Err(anyhow!(
+            "Oracle value expression count {} does not match column count {}",
+            value_expressions.len(),
+            columns.len()
+        ));
+    }
+
+    if value_expressions
+        .iter()
+        .any(|expression| expression.trim().is_empty())
+    {
+        return Err(anyhow!("Oracle value expressions cannot be empty"));
+    }
+
+    Ok(())
+}
+
 fn validate_identifier_segment(identifier: &str, identifier_type: &str) -> Result<()> {
     if identifier.is_empty() {
         return Err(anyhow!("Oracle {} cannot be empty", identifier_type));
@@ -292,7 +321,8 @@ mod tests {
     #[test]
     fn generates_insert_all_sql() {
         let columns = vec!["CUSTOMER_ID".to_string(), "NAME".to_string()];
-        let sql = generate_insert_all_sql("CRM.CUSTOMERS", &columns, 2).unwrap();
+        let expressions = vec!["?".to_string(), "?".to_string()];
+        let sql = generate_insert_all_sql("CRM.CUSTOMERS", &columns, &expressions, 2).unwrap();
 
         assert!(sql.contains("INSERT ALL"));
         assert!(sql.contains("INTO CRM.CUSTOMERS (CUSTOMER_ID, NAME) VALUES (?, ?)"));
@@ -303,7 +333,8 @@ mod tests {
     fn generates_merge_sql() {
         let columns = vec!["CUSTOMER_ID".to_string(), "NAME".to_string()];
         let keys = vec!["CUSTOMER_ID".to_string()];
-        let sql = generate_merge_sql("CRM.CUSTOMERS", &columns, &keys, 2).unwrap();
+        let expressions = vec!["?".to_string(), "?".to_string()];
+        let sql = generate_merge_sql("CRM.CUSTOMERS", &columns, &keys, &expressions, 2).unwrap();
 
         assert!(sql.contains("MERGE INTO CRM.CUSTOMERS target"));
         assert!(sql.contains("target.CUSTOMER_ID = source.CUSTOMER_ID"));
@@ -314,7 +345,21 @@ mod tests {
     #[test]
     fn rejects_invalid_identifier() {
         let columns = vec!["bad-name".to_string()];
-        assert!(generate_insert_all_sql("CRM.CUSTOMERS", &columns, 1).is_err());
+        let expressions = vec!["?".to_string()];
+        assert!(generate_insert_all_sql("CRM.CUSTOMERS", &columns, &expressions, 1).is_err());
+    }
+
+    #[test]
+    fn generates_timestamp_wrapped_merge_sql() {
+        let columns = vec!["CUSTOMER_ID".to_string(), "UPDATED_AT".to_string()];
+        let keys = vec!["CUSTOMER_ID".to_string()];
+        let expressions = vec![
+            "?".to_string(),
+            "TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS.FF6')".to_string(),
+        ];
+        let sql = generate_merge_sql("CRM.CUSTOMERS", &columns, &keys, &expressions, 1).unwrap();
+
+        assert!(sql.contains("TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS.FF6') UPDATED_AT"));
     }
 
     #[test]

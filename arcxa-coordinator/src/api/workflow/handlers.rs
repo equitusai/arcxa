@@ -18,6 +18,7 @@ use crate::api::ApiState;
 use crate::common::datasource_readiness::{evaluate_datasource_readiness, DatasourceOperation};
 use crate::governance::WorkflowResultPersistence;
 use crate::workflows::dataset_input::build_input_adapter;
+use crate::workflows::domain::ExecutionRuntimeMetricsSummary;
 use graphica_core::{
     catalog::{
         api_types::{DataSourceCapabilities, DataSourceStatus},
@@ -87,6 +88,48 @@ fn datasource_capabilities(capabilities: Option<DataSourceCapabilities>) -> Data
         supports_incremental: false,
         supports_cancellation: false,
     })
+}
+
+fn record_execution_runtime_metrics(
+    metrics: Option<&crate::observability::metrics::WorkflowMetrics>,
+    workflow_id: &str,
+    result: &graphica_core::orchestration::workflow::executor::WorkflowResult,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+
+    if let Some(summary) = ExecutionRuntimeMetricsSummary::from_runtime_metrics(
+        result
+            .step_results
+            .values()
+            .filter_map(|step| step.runtime_metrics.as_ref()),
+    ) {
+        metrics.record_execution_runtime_summary(workflow_id, &summary);
+    }
+}
+
+async fn build_progress_response(
+    state: &ApiState,
+    progress: graphica_core::orchestration::workflow::WorkflowProgress,
+) -> WorkflowExecutionProgressDto {
+    let runtime_metrics = if let Some(execution_store) = state.execution_store.as_ref() {
+        execution_store
+            .get(&progress.execution_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|execution| {
+                execution
+                    .effective_runtime_metrics_summary()
+                    .as_ref()
+                    .map(ExecutionRuntimeMetricsDto::from)
+            })
+    } else {
+        None
+    };
+
+    WorkflowExecutionProgressDto::from_progress(progress, runtime_metrics)
 }
 
 fn push_datasource_readiness_issue(
@@ -1190,6 +1233,8 @@ pub async fn execute_workflow(
         )
         .await?;
 
+        record_execution_runtime_metrics(state.metrics.as_deref(), &workflow_id, &result);
+
         if let Err(error) = persist_execution_record_if_possible(
             state.as_ref(),
             &workflow_id,
@@ -1870,6 +1915,10 @@ pub async fn list_workflow_executions(
                 execution.status,
                 crate::workflows::domain::ExecutionStatus::Completed
             );
+            let runtime_metrics = execution
+                .effective_runtime_metrics_summary()
+                .as_ref()
+                .map(crate::api::workflow::types::ExecutionRuntimeMetricsDto::from);
 
             WorkflowExecutionSummary {
                 execution_id: execution.execution_id,
@@ -1880,6 +1929,7 @@ pub async fn list_workflow_executions(
                 confidence: execution
                     .confidence
                     .unwrap_or(if success { 1.0 } else { 0.0 }),
+                runtime_metrics,
             }
         })
         .collect();
@@ -1898,7 +1948,7 @@ pub async fn list_workflow_executions(
         ("execution_id" = String, Path, description = "Unique execution identifier")
     ),
     responses(
-        (status = 200, description = "Successfully retrieved workflow execution progress. Returns real-time progress information including execution status (queued/running/completed/failed/cancelled), current step being executed, rows processed, percent complete, estimated time remaining (ETA), and last update timestamp. Progress is updated in real-time during workflow execution.", body = graphica_core::orchestration::workflow::progress::WorkflowProgress),
+        (status = 200, description = "Successfully retrieved workflow execution progress. Returns real-time progress information including execution status (queued/running/completed/failed/cancelled), current step being executed, rows processed, percent complete, estimated time remaining (ETA), and last update timestamp. Progress is updated in real-time during workflow execution.", body = WorkflowExecutionProgressDto),
         (status = 404, description = "Execution not found. No execution exists with the specified ID.", body = String),
         (status = 500, description = "Internal server error. Failed to retrieve progress from progress store.", body = String),
     ),
@@ -1909,10 +1959,7 @@ pub async fn list_workflow_executions(
 pub async fn get_execution_progress(
     State(state): State<Arc<ApiState>>,
     Path(execution_id): Path<String>,
-) -> Result<
-    Json<graphica_core::orchestration::workflow::progress::WorkflowProgress>,
-    (StatusCode, String),
-> {
+) -> Result<Json<WorkflowExecutionProgressDto>, (StatusCode, String)> {
     let progress_store = state.progress_store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1935,7 +1982,7 @@ pub async fn get_execution_progress(
             )
         })?;
 
-    Ok(Json(progress))
+    Ok(Json(build_progress_response(&state, progress).await))
 }
 
 #[utoipa::path(
@@ -1945,7 +1992,7 @@ pub async fn get_execution_progress(
         ("id" = String, Path, description = "Unique workflow identifier")
     ),
     responses(
-        (status = 200, description = "Successfully retrieved all execution progress records for the specified workflow. Returns array of progress snapshots sorted by started_at timestamp (most recent first). Includes both active (running/queued) and completed (completed/failed/cancelled) executions.", body = Vec<graphica_core::orchestration::workflow::progress::WorkflowProgress>),
+        (status = 200, description = "Successfully retrieved all execution progress records for the specified workflow. Returns array of progress snapshots sorted by started_at timestamp (most recent first). Includes both active (running/queued) and completed (completed/failed/cancelled) executions.", body = Vec<WorkflowExecutionProgressDto>),
         (status = 500, description = "Internal server error. Failed to retrieve progress from progress store.", body = String),
     ),
     tag = "Workflow Orchestration"
@@ -1955,10 +2002,7 @@ pub async fn get_execution_progress(
 pub async fn list_workflow_execution_progress(
     State(state): State<Arc<ApiState>>,
     Path(workflow_id): Path<String>,
-) -> Result<
-    Json<Vec<graphica_core::orchestration::workflow::progress::WorkflowProgress>>,
-    (StatusCode, String),
-> {
+) -> Result<Json<Vec<WorkflowExecutionProgressDto>>, (StatusCode, String)> {
     let progress_store = state.progress_store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1975,14 +2019,19 @@ pub async fn list_workflow_execution_progress(
             )
         })?;
 
-    Ok(Json(executions))
+    let mut responses = Vec::with_capacity(executions.len());
+    for progress in executions {
+        responses.push(build_progress_response(&state, progress).await);
+    }
+
+    Ok(Json(responses))
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/workflows/executions/active",
     responses(
-        (status = 200, description = "Successfully retrieved all active workflow executions. Returns array of progress snapshots for executions with status 'running' or 'queued', sorted by started_at timestamp (oldest first). Use this endpoint to monitor all in-flight workflow executions across all workflows.", body = Vec<graphica_core::orchestration::workflow::progress::WorkflowProgress>),
+        (status = 200, description = "Successfully retrieved all active workflow executions. Returns array of progress snapshots for executions with status 'running' or 'queued', sorted by started_at timestamp (oldest first). Use this endpoint to monitor all in-flight workflow executions across all workflows.", body = Vec<WorkflowExecutionProgressDto>),
         (status = 500, description = "Internal server error. Failed to retrieve active executions from progress store.", body = String),
     ),
     tag = "Workflow Orchestration"
@@ -1991,10 +2040,7 @@ pub async fn list_workflow_execution_progress(
 /// GET /api/v1/workflows/executions/active
 pub async fn get_active_executions(
     State(state): State<Arc<ApiState>>,
-) -> Result<
-    Json<Vec<graphica_core::orchestration::workflow::progress::WorkflowProgress>>,
-    (StatusCode, String),
-> {
+) -> Result<Json<Vec<WorkflowExecutionProgressDto>>, (StatusCode, String)> {
     let progress_store = state.progress_store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2009,7 +2055,12 @@ pub async fn get_active_executions(
         )
     })?;
 
-    Ok(Json(active))
+    let mut responses = Vec::with_capacity(active.len());
+    for progress in active {
+        responses.push(build_progress_response(&state, progress).await);
+    }
+
+    Ok(Json(responses))
 }
 
 #[utoipa::path(
@@ -2066,8 +2117,10 @@ mod tests {
     use crate::api::workflow::types::RegisterWorkflowRequest;
     use crate::api::ApiState;
     use crate::storage::LineageStorage;
-    use crate::workflows::domain::{ExecutionStatus, WorkflowExecution};
-    use crate::workflows::storage::ExecutionStore;
+    use crate::workflows::domain::{
+        ExecutionRuntimeMetricsSummary, ExecutionStatus, PersistedStepResult, WorkflowExecution,
+    };
+    use crate::workflows::storage::{ExecutionStore, ProgressStore};
     use async_trait::async_trait;
     use axum::{
         extract::{Path, Query, State},
@@ -2092,9 +2145,12 @@ mod tests {
         ConfidenceGateConfig, DbExtractConfig, DbLoaderConfig, FallbackStrategy, LoadMode,
         StepConfig, StepType,
     };
+    use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
     use graphica_core::orchestration::workflow::{
-        WorkflowDefinition, WorkflowEngine, WorkflowStep,
+        ExecutionStatus as WorkflowProgressStatus, StepProgress, WorkflowDefinition,
+        WorkflowEngine, WorkflowProgress, WorkflowStep,
     };
+    use rocksdb::DB;
     use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
 
@@ -2164,6 +2220,7 @@ mod tests {
             schedule_store: None,
             workflow_store: None,
             execution_store: Some(execution_store.clone()),
+            stream_executor: None,
             file_library: None,
             transformer_registry: None,
             kafka_producer: None,
@@ -2205,6 +2262,129 @@ mod tests {
         let mut state_value = (*state).clone();
         state_value.datasource_catalog = Some(catalog);
         (Arc::new(state_value), workflow_engine, execution_store)
+    }
+
+    fn attach_progress_store(
+        state: Arc<ApiState>,
+        progress_store: Arc<ProgressStore>,
+    ) -> Arc<ApiState> {
+        let mut state_value = (*state).clone();
+        state_value.progress_store = Some(progress_store);
+        Arc::new(state_value)
+    }
+
+    fn create_test_progress_store() -> Arc<ProgressStore> {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        std::mem::forget(temp_dir);
+
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let db = DB::open_cf(&opts, &db_path, vec!["progress"]).unwrap();
+        Arc::new(ProgressStore::new(Arc::new(db)).unwrap())
+    }
+
+    fn create_test_progress(
+        execution_id: &str,
+        workflow_id: &str,
+        status: WorkflowProgressStatus,
+        started_at: chrono::DateTime<Utc>,
+    ) -> WorkflowProgress {
+        WorkflowProgress {
+            execution_id: execution_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            status,
+            current_step: Some(StepProgress {
+                step_name: "transform_customers".to_string(),
+                step_type: "FieldTransformer".to_string(),
+                rows_processed: 42,
+                started_at,
+                completed_at: None,
+            }),
+            total_steps: 3,
+            steps_completed: 1,
+            rows_processed: 42,
+            total_rows: Some(100),
+            percent_complete: Some(42.0),
+            started_at,
+            completed_at: None,
+            last_updated: started_at,
+            error: None,
+            eta_seconds: Some(30),
+        }
+    }
+
+    async fn save_execution_with_step_runtime_metrics(
+        execution_store: &ExecutionStore,
+        execution_id: &str,
+        workflow_id: &str,
+        storage_backend: &str,
+    ) {
+        let mut execution = WorkflowExecution::new(
+            execution_id.to_string(),
+            workflow_id.to_string(),
+            format!("Workflow {}", workflow_id),
+            serde_json::json!({"type": "json", "data": {"rows": 42}}),
+            Some("tester".to_string()),
+        );
+        execution.step_results.push(PersistedStepResult {
+            step_id: "transform_customers".to_string(),
+            success: true,
+            output: serde_json::json!({"rows": 42}),
+            confidence: 0.96,
+            duration_ms: 25,
+            runtime_metrics: Some(RuntimeStepMetrics {
+                input_rows: 42,
+                output_rows: 42,
+                materialization_count: 0,
+                spill_events: 2,
+                spill_bytes: 8_192,
+                memory_high_water_mark: 16_384,
+                storage_type: Some(storage_backend.to_string()),
+                storage_operation: Some("set_rows".to_string()),
+                planned_tier: Some(storage_backend.to_string()),
+                storage_decision_reason: Some("planned".to_string()),
+                reserved_spill_bytes: 8_192,
+                execution_reserved_spill_bytes: 8_192,
+                total_reserved_spill_bytes: 8_192,
+                storage_location: Some(format!("spill/{}.{}", execution_id, storage_backend)),
+                pushdown_applied: false,
+            }),
+        });
+
+        execution_store.save(execution).await.unwrap();
+    }
+
+    async fn save_execution_with_runtime_summary(
+        execution_store: &ExecutionStore,
+        execution_id: &str,
+        workflow_id: &str,
+        storage_backend: &str,
+    ) {
+        let mut execution = WorkflowExecution::new(
+            execution_id.to_string(),
+            workflow_id.to_string(),
+            format!("Workflow {}", workflow_id),
+            serde_json::json!({"type": "json", "data": {"rows": 21}}),
+            Some("tester".to_string()),
+        );
+        execution.runtime_metrics = Some(ExecutionRuntimeMetricsSummary {
+            steps_with_runtime_metrics: 1,
+            steps_with_disk_storage: 1,
+            total_spill_events: 1,
+            total_spill_bytes: 4_096,
+            max_memory_high_water_mark: 8_192,
+            max_reserved_spill_bytes: 4_096,
+            max_execution_reserved_spill_bytes: 4_096,
+            max_total_reserved_spill_bytes: 4_096,
+            storage_backends: vec![storage_backend.to_string()],
+            planned_tiers: vec![storage_backend.to_string()],
+            storage_decision_reasons: vec!["planned".to_string()],
+        });
+
+        execution_store.save(execution).await.unwrap();
     }
 
     struct MockValidationCatalog {
@@ -3060,6 +3240,34 @@ mod tests {
         execution.updated_at = Utc.with_ymd_and_hms(2026, 3, 9, 10, 1, 0).unwrap();
         execution.completed_at = Some(Utc.with_ymd_and_hms(2026, 3, 9, 10, 1, 0).unwrap());
         execution.duration_ms = Some(60_000);
+        execution
+            .step_results
+            .push(crate::workflows::domain::PersistedStepResult {
+                step_id: "extract_1".to_string(),
+                success: true,
+                output: serde_json::json!({"rows": 3}),
+                confidence: 0.73,
+                duration_ms: 25,
+                runtime_metrics: Some(
+                    graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics {
+                        input_rows: 3,
+                        output_rows: 3,
+                        materialization_count: 0,
+                        spill_events: 1,
+                        spill_bytes: 2048,
+                        memory_high_water_mark: 4096,
+                        storage_type: Some("rocksdb".to_string()),
+                        storage_operation: Some("set_rows".to_string()),
+                        planned_tier: Some("rocksdb".to_string()),
+                        storage_decision_reason: Some("planned".to_string()),
+                        reserved_spill_bytes: 2048,
+                        execution_reserved_spill_bytes: 2048,
+                        total_reserved_spill_bytes: 2048,
+                        storage_location: Some("spill/exec_history_1.rocksdb".to_string()),
+                        pushdown_applied: false,
+                    },
+                ),
+            });
 
         execution_store.save(execution).await.unwrap();
 
@@ -3075,5 +3283,273 @@ mod tests {
         assert_eq!(summaries[0].execution_id, "exec_history_1");
         assert_eq!(summaries[0].confidence, 0.73);
         assert!(summaries[0].success);
+        assert_eq!(
+            summaries[0]
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(1)
+        );
+        assert_eq!(
+            summaries[0]
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["rocksdb".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_execution_progress_enriches_runtime_metrics() {
+        let progress_store = create_test_progress_store();
+        let (state, _, execution_store) = create_test_api_state();
+        let state = attach_progress_store(state, progress_store.clone());
+        let started_at = Utc.with_ymd_and_hms(2026, 3, 29, 9, 0, 0).unwrap();
+
+        progress_store
+            .store_progress(&create_test_progress(
+                "exec_progress_runtime",
+                "wf_progress_runtime",
+                WorkflowProgressStatus::Running,
+                started_at,
+            ))
+            .unwrap();
+        save_execution_with_step_runtime_metrics(
+            &execution_store,
+            "exec_progress_runtime",
+            "wf_progress_runtime",
+            "parquet",
+        )
+        .await;
+
+        let Json(progress) =
+            super::get_execution_progress(State(state), Path("exec_progress_runtime".to_string()))
+                .await
+                .unwrap();
+
+        assert_eq!(progress.execution_id, "exec_progress_runtime");
+        assert_eq!(progress.status, WorkflowProgressStatus::Running);
+        assert_eq!(
+            progress
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(1)
+        );
+        assert_eq!(
+            progress
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["parquet".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_workflow_execution_progress_enriches_runtime_metrics() {
+        let progress_store = create_test_progress_store();
+        let (state, _, execution_store) = create_test_api_state();
+        let state = attach_progress_store(state, progress_store.clone());
+        let started_at = Utc.with_ymd_and_hms(2026, 3, 29, 10, 0, 0).unwrap();
+
+        progress_store
+            .store_progress(&create_test_progress(
+                "exec_progress_list",
+                "wf_progress_list",
+                WorkflowProgressStatus::Completed,
+                started_at,
+            ))
+            .unwrap();
+        save_execution_with_runtime_summary(
+            &execution_store,
+            "exec_progress_list",
+            "wf_progress_list",
+            "rocksdb",
+        )
+        .await;
+
+        let Json(progress_entries) = super::list_workflow_execution_progress(
+            State(state),
+            Path("wf_progress_list".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(progress_entries.len(), 1);
+        assert_eq!(progress_entries[0].execution_id, "exec_progress_list");
+        assert_eq!(
+            progress_entries[0]
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["rocksdb".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_active_executions_enriches_runtime_metrics() {
+        let progress_store = create_test_progress_store();
+        let (state, _, execution_store) = create_test_api_state();
+        let state = attach_progress_store(state, progress_store.clone());
+        let older_started_at = Utc.with_ymd_and_hms(2026, 3, 29, 8, 0, 0).unwrap();
+        let newer_started_at = Utc.with_ymd_and_hms(2026, 3, 29, 8, 5, 0).unwrap();
+
+        progress_store
+            .store_progress(&create_test_progress(
+                "exec_active_oldest",
+                "wf_active",
+                WorkflowProgressStatus::Running,
+                older_started_at,
+            ))
+            .unwrap();
+        progress_store
+            .store_progress(&create_test_progress(
+                "exec_active_newer",
+                "wf_active",
+                WorkflowProgressStatus::Queued,
+                newer_started_at,
+            ))
+            .unwrap();
+
+        save_execution_with_runtime_summary(
+            &execution_store,
+            "exec_active_oldest",
+            "wf_active",
+            "rocksdb",
+        )
+        .await;
+        save_execution_with_step_runtime_metrics(
+            &execution_store,
+            "exec_active_newer",
+            "wf_active",
+            "parquet",
+        )
+        .await;
+
+        let Json(active) = super::get_active_executions(State(state)).await.unwrap();
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].execution_id, "exec_active_oldest");
+        assert_eq!(active[1].execution_id, "exec_active_newer");
+        assert_eq!(
+            active[0]
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["rocksdb".to_string()])
+        );
+        assert_eq!(
+            active[1]
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["parquet".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_record_execution_runtime_metrics_updates_workflow_metrics() {
+        use chrono::Utc;
+        use graphica_core::orchestration::workflow::executor::{
+            FinalDecision, StepResult, WorkflowResult,
+        };
+        use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
+        use prometheus::Registry;
+        use std::collections::HashMap;
+
+        let registry = Registry::new();
+        let metrics = crate::observability::metrics::WorkflowMetrics::new(&registry).unwrap();
+        let now = Utc::now();
+
+        let mut step_results = HashMap::new();
+        step_results.insert(
+            "step_1".to_string(),
+            StepResult {
+                step_id: "step_1".to_string(),
+                success: true,
+                output: serde_json::json!({"rows": 3}),
+                confidence: 0.97,
+                started_at: now,
+                completed_at: now,
+                batch_metadata: None,
+                runtime_metrics: Some(RuntimeStepMetrics {
+                    input_rows: 3,
+                    output_rows: 3,
+                    materialization_count: 0,
+                    spill_events: 2,
+                    spill_bytes: 4096,
+                    memory_high_water_mark: 8192,
+                    storage_type: Some("parquet".to_string()),
+                    storage_operation: Some("set_rows".to_string()),
+                    planned_tier: Some("parquet".to_string()),
+                    storage_decision_reason: Some("planned".to_string()),
+                    reserved_spill_bytes: 4096,
+                    execution_reserved_spill_bytes: 4096,
+                    total_reserved_spill_bytes: 4096,
+                    storage_location: Some("spill/step_1.parquet".to_string()),
+                    pushdown_applied: false,
+                }),
+                batch_frame: None,
+            },
+        );
+
+        let result = WorkflowResult {
+            execution_id: "exec_metrics".to_string(),
+            success: true,
+            final_decision: FinalDecision::Accept,
+            confidence: 0.97,
+            step_results,
+            started_at: now,
+            completed_at: now,
+            error: None,
+            final_output: serde_json::json!({"rows": 3}),
+            output_rows: None,
+        };
+
+        super::record_execution_runtime_metrics(Some(&metrics), "wf_runtime", &result);
+
+        let gathered = registry.gather();
+        let find_counter = |name: &str, labels: &[(&str, &str)]| -> Option<f64> {
+            gathered
+                .iter()
+                .find(|family| family.get_name() == name)
+                .and_then(|family| {
+                    family.get_metric().iter().find_map(|metric| {
+                        let matches_labels = labels.iter().all(|(label_name, label_value)| {
+                            metric.get_label().iter().any(|label| {
+                                label.name() == *label_name && label.value() == *label_value
+                            })
+                        });
+                        matches_labels
+                            .then(|| metric.get_counter().as_ref().map(|counter| counter.value()))
+                            .flatten()
+                    })
+                })
+        };
+
+        assert_eq!(
+            find_counter(
+                "graphica_workflow_execution_runtime_summaries_total",
+                &[("workflow_id", "wf_runtime")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            find_counter(
+                "graphica_workflow_execution_runtime_storage_backend_total",
+                &[
+                    ("workflow_id", "wf_runtime"),
+                    ("storage_backend", "parquet")
+                ]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            find_counter(
+                "graphica_workflow_execution_runtime_spill_events_total",
+                &[("workflow_id", "wf_runtime")]
+            ),
+            Some(2.0)
+        );
     }
 }

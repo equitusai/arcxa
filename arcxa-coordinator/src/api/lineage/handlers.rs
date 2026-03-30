@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use graphica_core::core::lineage::{DataRef, LineageEvent, LineageSink, ModelRef, TransformRef};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -368,14 +369,10 @@ pub async fn get_run_lineage(
 ) -> Result<Json<RunLineageResponse>, LineageApiError> {
     info!("Querying lineage for run: {}", run_id);
 
-    let rdf_store = state
-        .rdf_store
-        .as_ref()
-        .ok_or_else(|| LineageApiError::InternalError("RDF store not available".to_string()))?;
-
-    // SPARQL query for run lineage
-    let query = format!(
-        r#"
+    if let Some(rdf_store) = state.rdf_store.as_ref() {
+        // SPARQL query for run lineage
+        let query = format!(
+            r#"
 PREFIX gph: <http://graphica.io/ontology#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 
@@ -403,25 +400,53 @@ WHERE {{
 }}
 ORDER BY ?ts
 "#,
-        run_id
-    );
+            run_id
+        );
 
-    let results = rdf_store
-        .query(&query)
-        .map_err(|e| LineageApiError::QueryFailed(format!("SPARQL query failed: {}", e)))?;
+        match rdf_store.query(&query) {
+            Ok(results) if !results.is_empty() => {
+                let run_response = parse_run_lineage(&run_id, results)?;
 
-    if results.is_empty() {
+                info!(
+                    "Found {} records for run: {} from RDF lineage",
+                    run_response.total_records, run_id
+                );
+
+                return Ok(Json(run_response));
+            }
+            Ok(_) => {
+                warn!(
+                    "No RDF lineage found for run {}; falling back to durable lineage storage",
+                    run_id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "RDF run lineage query failed for {}; falling back to durable lineage storage: {}",
+                    run_id, e
+                );
+            }
+        }
+    }
+
+    let events = state
+        .lineage_storage
+        .get_run_lineage(&run_id)
+        .map_err(|e| {
+            LineageApiError::InternalError(format!("Failed to query run lineage: {}", e))
+        })?;
+
+    if events.is_empty() {
         return Err(LineageApiError::NotFound(format!(
             "No lineage found for run: {}",
             run_id
         )));
     }
 
-    // Parse results into run lineage response
-    let run_response = parse_run_lineage(&run_id, results)?;
+    let run_response = parse_run_lineage_events(&run_id, events)?;
 
     info!(
-        "Found {} records for run: {}",
+        "Found {} records for run: {} from durable lineage storage",
         run_response.total_records, run_id
     );
 
@@ -868,6 +893,103 @@ fn parse_run_lineage(
     })
 }
 
+fn parse_run_lineage_events(
+    run_id: &str,
+    events: Vec<LineageEvent>,
+) -> Result<RunLineageResponse, LineageApiError> {
+    let mut datasets = HashSet::new();
+    let mut start_time: Option<DateTime<Utc>> = None;
+    let mut end_time: Option<DateTime<Utc>> = None;
+
+    let records = events
+        .into_iter()
+        .map(|event| {
+            datasets.insert(event.dataset.clone());
+
+            if start_time.is_none() || Some(event.ts) < start_time {
+                start_time = Some(event.ts);
+            }
+            if end_time.is_none() || Some(event.ts) > end_time {
+                end_time = Some(event.ts);
+            }
+
+            LineageRecordResponse {
+                record_id: event.record_id,
+                dataset: event.dataset,
+                run_id: event.run_id,
+                tenant_id: event.tenant_id,
+                timestamp: event.ts,
+                sources: event.source_refs.iter().map(data_ref_to_dto).collect(),
+                transforms: event.transforms.iter().map(transform_to_dto).collect(),
+                models: event.model_refs.iter().map(model_to_dto).collect(),
+                output: data_ref_to_dto(&event.output_ref),
+                metadata: event.metadata,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RunLineageResponse {
+        run_id: run_id.to_string(),
+        total_records: records.len(),
+        events: records,
+        datasets: datasets.into_iter().collect(),
+        start_time,
+        end_time,
+    })
+}
+
+fn data_ref_to_dto(data_ref: &DataRef) -> DataRefDto {
+    DataRefDto {
+        system: data_ref.system.clone(),
+        path: data_ref.path.clone(),
+        version: data_ref.version.clone(),
+        extracted_at: data_ref.extracted_at,
+        cdc_position: data_ref
+            .cdc_position
+            .as_ref()
+            .map(|position| CdcPositionDto {
+                topic: position.topic.clone(),
+                partition: position.partition,
+                offset: position.offset,
+                lsn: position.lsn.clone(),
+            }),
+    }
+}
+
+fn transform_to_dto(transform: &TransformRef) -> TransformDto {
+    TransformDto {
+        id: transform.id.to_string(),
+        transform_type: transform.transform_type.clone(),
+        rule_id: transform.rule_id.clone(),
+        version: transform.version.clone(),
+        parameters: transform.parameters.clone(),
+        applied_at: transform.applied_at,
+        fields_modified: transform.fields_modified.clone(),
+    }
+}
+
+fn model_to_dto(model: &ModelRef) -> ModelDto {
+    ModelDto {
+        model_id: model.model_id.clone(),
+        version: model.version.clone(),
+        model_type: model.model_type.clone(),
+        params_hash: model.params_hash.clone(),
+        training_data: model.training_data.iter().map(data_ref_to_dto).collect(),
+        metrics: ModelMetricsDto {
+            accuracy: model.metrics.accuracy,
+            precision: model.metrics.precision,
+            recall: model.metrics.recall,
+            f1_score: model.metrics.f1_score,
+            rmse: model.metrics.rmse,
+            custom_metrics: model.metrics.custom_metrics.clone(),
+        },
+        registry_uri: model.registry_uri.clone(),
+        inference_at: model.inference_at,
+        features_used: model.features_used.clone(),
+        outputs: model.outputs.clone(),
+    }
+}
+
 fn parse_time_range_lineage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -891,4 +1013,60 @@ fn parse_time_range_lineage(
         events,
         datasets: datasets.into_iter().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use graphica_core::core::lineage::{DataRef, LineageEvent};
+    use uuid::Uuid;
+
+    #[test]
+    fn test_parse_run_lineage_events_builds_response_from_storage_events() {
+        let now = Utc::now();
+        let event = LineageEvent {
+            id: Uuid::new_v4(),
+            dataset: "customer_dim".to_string(),
+            record_id: "customer_dim:customer_id=C001".to_string(),
+            source_refs: vec![DataRef {
+                system: "postgres".to_string(),
+                path: "public.arcxa_mcp_source:customer_id=C001".to_string(),
+                version: None,
+                extracted_at: now,
+                cdc_position: None,
+            }],
+            transforms: Vec::new(),
+            model_refs: Vec::new(),
+            output_ref: DataRef {
+                system: "postgresql".to_string(),
+                path: "public.arcxa_mcp_unified_target".to_string(),
+                version: None,
+                extracted_at: now,
+                cdc_position: None,
+            },
+            ts: now,
+            run_id: "unified_load_loadjob_123".to_string(),
+            tenant_id: "default".to_string(),
+            correlation_id: None,
+            metadata: HashMap::from([("session_id".to_string(), "unified_123".to_string())]),
+        };
+
+        let response =
+            parse_run_lineage_events("unified_load_loadjob_123", vec![event]).expect("response");
+
+        assert_eq!(response.run_id, "unified_load_loadjob_123");
+        assert_eq!(response.total_records, 1);
+        assert_eq!(
+            response.events[0].record_id,
+            "customer_dim:customer_id=C001"
+        );
+        assert_eq!(
+            response.events[0].output.path,
+            "public.arcxa_mcp_unified_target"
+        );
+        assert_eq!(response.datasets, vec!["customer_dim".to_string()]);
+        assert!(response.start_time.is_some());
+        assert!(response.end_time.is_some());
+    }
 }

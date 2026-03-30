@@ -139,3 +139,10 @@ lto = "off"
 codegen-units = 64
 debug = 1
 strip = "none"
+
+[profile.e2e]
+inherits = "dev"
+opt-level = 1
+debug = 1
+incremental = true
+codegen-units = 256

@@ -8,6 +8,7 @@ from graphica.errors import (
     AuthError,
     NotFoundError,
     ValidationError,
+    ConflictError,
     ServerError,
     ConnectionError,
 )
@@ -38,6 +39,8 @@ class Client:
         from graphica.api.lineage import LineageAPI
         from graphica.api.loader import LoaderAPI
         from graphica.api.workflows import WorkflowsAPI
+        from graphica.api.datasources import DatasourcesAPI
+        from graphica.api.datasets import DatasetsAPI
         from graphica.api.gdpr import GdprAPI
         from graphica.api.r2rml import R2rmlAPI
 
@@ -46,6 +49,8 @@ class Client:
         self.lineage = LineageAPI(self)
         self.loader = LoaderAPI(self)
         self.workflows = WorkflowsAPI(self)
+        self.datasources = DatasourcesAPI(self)
+        self.datasets = DatasetsAPI(self)
         self.gdpr = GdprAPI(self)
         self.r2rml = R2rmlAPI(self)
 
@@ -97,6 +102,8 @@ class Client:
             raise NotFoundError(self._error_message(resp))
         if resp.status_code == 400:
             raise ValidationError(self._error_message(resp))
+        if resp.status_code == 409:
+            raise ConflictError(self._error_message(resp))
         if resp.status_code == 422:
             raise ValidationError(self._error_message(resp))
         if resp.status_code >= 500:
@@ -131,5 +138,5 @@ class Client:
         return self._request("DELETE", path, **kwargs)
 
     def health(self) -> Dict[str, Any]:
-        """Check server health."""
-        return self.get("/api/v1/loader/health")
+        """Check coordinator health."""
+        return self.get("/health")

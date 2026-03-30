@@ -127,7 +127,7 @@ impl WorkflowExecutor {
             tracing::info!(
                 "TRACE: Semantic mapper has transformer callback available, invoking..."
             );
-            let result = callback("ontology_map", &transformer_config, &mut data).await;
+            let result = callback("ontology_map", &transformer_config, &mut data, context).await;
 
             match result {
                 Ok(()) => {

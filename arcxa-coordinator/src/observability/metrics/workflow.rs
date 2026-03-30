@@ -6,6 +6,8 @@
 //! - Workflow execution counts and duration
 //! - Integration-specific metrics (Kafka, HTTP, Lineage)
 
+use crate::workflows::domain::ExecutionRuntimeMetricsSummary;
+use crate::workflows::engine::{StreamRuntimeSummary, StreamStats};
 use anyhow::Result;
 use prometheus::{
     exponential_buckets, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
@@ -50,6 +52,29 @@ pub struct WorkflowMetrics {
     execution_rows_processed: HistogramVec,
     execution_progress_percent: GaugeVec,
     execution_cancellations_total: IntCounterVec,
+
+    // Runtime storage telemetry (Phase 2)
+    execution_runtime_summaries_total: IntCounterVec,
+    execution_runtime_storage_backend_total: IntCounterVec,
+    execution_runtime_planned_tier_total: IntCounterVec,
+    execution_runtime_storage_decision_total: IntCounterVec,
+    execution_runtime_spill_events_total: IntCounterVec,
+    execution_runtime_spill_bytes_total: IntCounterVec,
+    execution_runtime_steps_with_metrics: HistogramVec,
+    execution_runtime_steps_with_disk_storage: HistogramVec,
+    execution_runtime_memory_high_water_mark_bytes: HistogramVec,
+    execution_runtime_reserved_spill_bytes: HistogramVec,
+
+    // Streaming control-plane/runtime telemetry
+    streams_active: IntGaugeVec,
+    stream_runtime_summaries_total: IntCounterVec,
+    stream_runtime_storage_backend_total: IntCounterVec,
+    stream_runtime_checkpoint_interval_records: HistogramVec,
+    stream_runtime_records_processed: GaugeVec,
+    stream_runtime_throughput: GaugeVec,
+    stream_runtime_avg_latency_ms: GaugeVec,
+    stream_runtime_lag: GaugeVec,
+    stream_runtime_active_workers: GaugeVec,
 }
 
 impl WorkflowMetrics {
@@ -253,6 +278,178 @@ impl WorkflowMetrics {
             &["workflow_id", "reason"],
         )?;
 
+        // Runtime storage telemetry (Phase 2)
+        let execution_runtime_summaries_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_execution_runtime_summaries_total",
+                "Total workflow executions that reported runtime storage telemetry",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let execution_runtime_storage_backend_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_execution_runtime_storage_backend_total",
+                "Total workflow executions by observed runtime storage backend",
+            ),
+            &["workflow_id", "storage_backend"],
+        )?;
+
+        let execution_runtime_planned_tier_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_execution_runtime_planned_tier_total",
+                "Total workflow executions by observed planned storage tier",
+            ),
+            &["workflow_id", "planned_tier"],
+        )?;
+
+        let execution_runtime_storage_decision_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_execution_runtime_storage_decision_total",
+                "Total workflow executions by runtime storage decision reason",
+            ),
+            &["workflow_id", "reason"],
+        )?;
+
+        let execution_runtime_spill_events_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_execution_runtime_spill_events_total",
+                "Total spill events observed across workflow executions",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let execution_runtime_spill_bytes_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_execution_runtime_spill_bytes_total",
+                "Total spill bytes observed across workflow executions",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let execution_runtime_steps_with_metrics = HistogramVec::new(
+            HistogramOpts::new(
+                "graphica_workflow_execution_runtime_steps_with_metrics",
+                "Distribution of steps per execution that reported runtime metrics",
+            )
+            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]),
+            &["workflow_id"],
+        )?;
+
+        let execution_runtime_steps_with_disk_storage = HistogramVec::new(
+            HistogramOpts::new(
+                "graphica_workflow_execution_runtime_steps_with_disk_storage",
+                "Distribution of steps per execution that used on-disk storage",
+            )
+            .buckets(vec![0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
+            &["workflow_id"],
+        )?;
+
+        let execution_runtime_memory_high_water_mark_bytes = HistogramVec::new(
+            HistogramOpts::new(
+                "graphica_workflow_execution_runtime_memory_high_water_mark_bytes",
+                "Runtime memory high-water mark per workflow execution in bytes",
+            )
+            .buckets(vec![
+                1_000_000.0,
+                10_000_000.0,
+                100_000_000.0,
+                500_000_000.0,
+                1_000_000_000.0,
+                5_000_000_000.0,
+            ]),
+            &["workflow_id"],
+        )?;
+
+        let execution_runtime_reserved_spill_bytes = HistogramVec::new(
+            HistogramOpts::new(
+                "graphica_workflow_execution_runtime_reserved_spill_bytes",
+                "Reserved spill bytes high-water mark per workflow execution",
+            )
+            .buckets(vec![
+                1_000_000.0,
+                10_000_000.0,
+                100_000_000.0,
+                500_000_000.0,
+                1_000_000_000.0,
+                5_000_000_000.0,
+            ]),
+            &["workflow_id"],
+        )?;
+
+        let streams_active = IntGaugeVec::new(
+            Opts::new(
+                "graphica_workflow_streams_active",
+                "Current number of active streaming workflows by workflow and storage backend",
+            ),
+            &["workflow_id", "storage_backend"],
+        )?;
+
+        let stream_runtime_summaries_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_summaries_total",
+                "Total streaming workflow runtime summaries recorded",
+            ),
+            &["workflow_id", "execution_engine"],
+        )?;
+
+        let stream_runtime_storage_backend_total = IntCounterVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_storage_backend_total",
+                "Total streaming workflows started by storage backend",
+            ),
+            &["workflow_id", "storage_backend"],
+        )?;
+
+        let stream_runtime_checkpoint_interval_records = HistogramVec::new(
+            HistogramOpts::new(
+                "graphica_workflow_stream_runtime_checkpoint_interval_records",
+                "Checkpoint interval in records for streaming workflow executions",
+            )
+            .buckets(vec![10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]),
+            &["workflow_id"],
+        )?;
+
+        let stream_runtime_records_processed = GaugeVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_records_processed",
+                "Current number of processed records for active streaming workflows",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let stream_runtime_throughput = GaugeVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_throughput",
+                "Current throughput in records/sec for active streaming workflows",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let stream_runtime_avg_latency_ms = GaugeVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_avg_latency_ms",
+                "Current average latency in milliseconds for active streaming workflows",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let stream_runtime_lag = GaugeVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_lag",
+                "Current consumer lag for active streaming workflows",
+            ),
+            &["workflow_id"],
+        )?;
+
+        let stream_runtime_active_workers = GaugeVec::new(
+            Opts::new(
+                "graphica_workflow_stream_runtime_active_workers",
+                "Current active workers for streaming workflows",
+            ),
+            &["workflow_id"],
+        )?;
+
         // Register all metrics
         registry.register(Box::new(actions_executed_total.clone()))?;
         registry.register(Box::new(action_duration_seconds.clone()))?;
@@ -284,6 +481,27 @@ impl WorkflowMetrics {
         registry.register(Box::new(execution_rows_processed.clone()))?;
         registry.register(Box::new(execution_progress_percent.clone()))?;
         registry.register(Box::new(execution_cancellations_total.clone()))?;
+        registry.register(Box::new(execution_runtime_summaries_total.clone()))?;
+        registry.register(Box::new(execution_runtime_storage_backend_total.clone()))?;
+        registry.register(Box::new(execution_runtime_planned_tier_total.clone()))?;
+        registry.register(Box::new(execution_runtime_storage_decision_total.clone()))?;
+        registry.register(Box::new(execution_runtime_spill_events_total.clone()))?;
+        registry.register(Box::new(execution_runtime_spill_bytes_total.clone()))?;
+        registry.register(Box::new(execution_runtime_steps_with_metrics.clone()))?;
+        registry.register(Box::new(execution_runtime_steps_with_disk_storage.clone()))?;
+        registry.register(Box::new(
+            execution_runtime_memory_high_water_mark_bytes.clone(),
+        ))?;
+        registry.register(Box::new(execution_runtime_reserved_spill_bytes.clone()))?;
+        registry.register(Box::new(streams_active.clone()))?;
+        registry.register(Box::new(stream_runtime_summaries_total.clone()))?;
+        registry.register(Box::new(stream_runtime_storage_backend_total.clone()))?;
+        registry.register(Box::new(stream_runtime_checkpoint_interval_records.clone()))?;
+        registry.register(Box::new(stream_runtime_records_processed.clone()))?;
+        registry.register(Box::new(stream_runtime_throughput.clone()))?;
+        registry.register(Box::new(stream_runtime_avg_latency_ms.clone()))?;
+        registry.register(Box::new(stream_runtime_lag.clone()))?;
+        registry.register(Box::new(stream_runtime_active_workers.clone()))?;
 
         Ok(Self {
             actions_executed_total,
@@ -309,6 +527,25 @@ impl WorkflowMetrics {
             execution_rows_processed,
             execution_progress_percent,
             execution_cancellations_total,
+            execution_runtime_summaries_total,
+            execution_runtime_storage_backend_total,
+            execution_runtime_planned_tier_total,
+            execution_runtime_storage_decision_total,
+            execution_runtime_spill_events_total,
+            execution_runtime_spill_bytes_total,
+            execution_runtime_steps_with_metrics,
+            execution_runtime_steps_with_disk_storage,
+            execution_runtime_memory_high_water_mark_bytes,
+            execution_runtime_reserved_spill_bytes,
+            streams_active,
+            stream_runtime_summaries_total,
+            stream_runtime_storage_backend_total,
+            stream_runtime_checkpoint_interval_records,
+            stream_runtime_records_processed,
+            stream_runtime_throughput,
+            stream_runtime_avg_latency_ms,
+            stream_runtime_lag,
+            stream_runtime_active_workers,
         })
     }
 
@@ -496,6 +733,107 @@ impl WorkflowMetrics {
             .with_label_values(&[workflow_id, reason])
             .inc();
     }
+
+    /// Record execution-level runtime storage telemetry for a completed workflow run.
+    pub fn record_execution_runtime_summary(
+        &self,
+        workflow_id: &str,
+        summary: &ExecutionRuntimeMetricsSummary,
+    ) {
+        self.execution_runtime_summaries_total
+            .with_label_values(&[workflow_id])
+            .inc();
+
+        for backend in &summary.storage_backends {
+            self.execution_runtime_storage_backend_total
+                .with_label_values(&[workflow_id, backend])
+                .inc();
+        }
+
+        for planned_tier in &summary.planned_tiers {
+            self.execution_runtime_planned_tier_total
+                .with_label_values(&[workflow_id, planned_tier])
+                .inc();
+        }
+
+        for reason in &summary.storage_decision_reasons {
+            self.execution_runtime_storage_decision_total
+                .with_label_values(&[workflow_id, reason])
+                .inc();
+        }
+
+        self.execution_runtime_spill_events_total
+            .with_label_values(&[workflow_id])
+            .inc_by(summary.total_spill_events as u64);
+        self.execution_runtime_spill_bytes_total
+            .with_label_values(&[workflow_id])
+            .inc_by(summary.total_spill_bytes as u64);
+        self.execution_runtime_steps_with_metrics
+            .with_label_values(&[workflow_id])
+            .observe(summary.steps_with_runtime_metrics as f64);
+        self.execution_runtime_steps_with_disk_storage
+            .with_label_values(&[workflow_id])
+            .observe(summary.steps_with_disk_storage as f64);
+        self.execution_runtime_memory_high_water_mark_bytes
+            .with_label_values(&[workflow_id])
+            .observe(summary.max_memory_high_water_mark as f64);
+        self.execution_runtime_reserved_spill_bytes
+            .with_label_values(&[workflow_id])
+            .observe(summary.max_reserved_spill_bytes as f64);
+
+        self.set_workflow_memory_bytes(summary.max_memory_high_water_mark as f64);
+    }
+
+    /// Record that a streaming workflow has started with a given runtime/storage profile.
+    pub fn stream_started(&self, workflow_id: &str, runtime: &StreamRuntimeSummary) {
+        self.streams_active
+            .with_label_values(&[workflow_id, &runtime.storage_backend])
+            .inc();
+        self.stream_runtime_summaries_total
+            .with_label_values(&[workflow_id, &runtime.execution_engine])
+            .inc();
+        self.stream_runtime_storage_backend_total
+            .with_label_values(&[workflow_id, &runtime.storage_backend])
+            .inc();
+        self.stream_runtime_checkpoint_interval_records
+            .with_label_values(&[workflow_id])
+            .observe(runtime.checkpoint_interval_records as f64);
+    }
+
+    /// Record that a streaming workflow has stopped.
+    pub fn stream_stopped(&self, workflow_id: &str, runtime: &StreamRuntimeSummary) {
+        self.streams_active
+            .with_label_values(&[workflow_id, &runtime.storage_backend])
+            .dec();
+        self.stream_runtime_throughput
+            .with_label_values(&[workflow_id])
+            .set(0.0);
+        self.stream_runtime_lag
+            .with_label_values(&[workflow_id])
+            .set(0.0);
+        self.stream_runtime_active_workers
+            .with_label_values(&[workflow_id])
+            .set(0.0);
+    }
+
+    /// Update the latest runtime/control-plane stats for an active streaming workflow.
+    pub fn record_stream_runtime_stats(&self, workflow_id: &str, stats: &StreamStats) {
+        self.stream_runtime_records_processed
+            .with_label_values(&[workflow_id])
+            .set(stats.records_processed as f64);
+        self.stream_runtime_throughput
+            .with_label_values(&[workflow_id])
+            .set(stats.throughput);
+        self.stream_runtime_avg_latency_ms
+            .with_label_values(&[workflow_id])
+            .set(stats.avg_latency_ms as f64);
+        self.stream_runtime_lag
+            .with_label_values(&[workflow_id])
+            .set(stats.lag as f64);
+        self.stream_runtime_active_workers
+            .with_label_values(&[workflow_id])
+            .set(stats.active_workers as f64);
+    }
 }
 
 #[cfg(test)]
@@ -541,5 +879,156 @@ mod tests {
         metrics.record_http_failure("timeout");
 
         // Metrics should be recorded without panics
+    }
+
+    #[test]
+    fn test_execution_runtime_summary_metrics() {
+        let registry = Registry::new();
+        let metrics = WorkflowMetrics::new(&registry).unwrap();
+        let summary = ExecutionRuntimeMetricsSummary {
+            steps_with_runtime_metrics: 3,
+            steps_with_disk_storage: 2,
+            total_spill_events: 4,
+            total_spill_bytes: 8192,
+            max_memory_high_water_mark: 16_384,
+            max_reserved_spill_bytes: 8_192,
+            max_execution_reserved_spill_bytes: 8_192,
+            max_total_reserved_spill_bytes: 16_384,
+            storage_backends: vec!["parquet".to_string(), "rocksdb".to_string()],
+            planned_tiers: vec!["parquet".to_string()],
+            storage_decision_reasons: vec!["planned".to_string(), "spill_required".to_string()],
+        };
+
+        metrics.record_execution_runtime_summary("wf_runtime", &summary);
+
+        assert_eq!(
+            metrics
+                .execution_runtime_summaries_total
+                .with_label_values(&["wf_runtime"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_storage_backend_total
+                .with_label_values(&["wf_runtime", "parquet"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_planned_tier_total
+                .with_label_values(&["wf_runtime", "parquet"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_storage_decision_total
+                .with_label_values(&["wf_runtime", "spill_required"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_spill_events_total
+                .with_label_values(&["wf_runtime"])
+                .get(),
+            4
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_spill_bytes_total
+                .with_label_values(&["wf_runtime"])
+                .get(),
+            8192
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_steps_with_metrics
+                .with_label_values(&["wf_runtime"])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .execution_runtime_memory_high_water_mark_bytes
+                .with_label_values(&["wf_runtime"])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(metrics.workflow_memory_bytes.get(), 16_384.0);
+    }
+
+    #[test]
+    fn test_stream_runtime_metrics() {
+        let registry = Registry::new();
+        let metrics = WorkflowMetrics::new(&registry).unwrap();
+        let runtime = StreamRuntimeSummary {
+            execution_engine: StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_ENGINE.to_string(),
+            storage_backend: "rocksdb".to_string(),
+            persistent_state: true,
+            state_location: Some("/tmp/stream-state".to_string()),
+            checkpoint_interval_records:
+                StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS,
+            configured_checkpoint_interval_ms: 60_000,
+        };
+        let stats = StreamStats {
+            records_processed: 125,
+            throughput: 42.5,
+            avg_latency_ms: 18,
+            lag: 7,
+            watermark: None,
+            active_workers: 1,
+            runtime: runtime.clone(),
+        };
+
+        metrics.stream_started("wf_stream", &runtime);
+        metrics.record_stream_runtime_stats("wf_stream", &stats);
+
+        assert_eq!(
+            metrics
+                .streams_active
+                .with_label_values(&["wf_stream", "rocksdb"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .stream_runtime_summaries_total
+                .with_label_values(&["wf_stream", "simple_kafka_loop"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .stream_runtime_storage_backend_total
+                .with_label_values(&["wf_stream", "rocksdb"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .stream_runtime_records_processed
+                .with_label_values(&["wf_stream"])
+                .get(),
+            125.0
+        );
+        assert_eq!(
+            metrics
+                .stream_runtime_lag
+                .with_label_values(&["wf_stream"])
+                .get(),
+            7.0
+        );
+
+        metrics.stream_stopped("wf_stream", &runtime);
+        assert_eq!(
+            metrics
+                .streams_active
+                .with_label_values(&["wf_stream", "rocksdb"])
+                .get(),
+            0
+        );
     }
 }

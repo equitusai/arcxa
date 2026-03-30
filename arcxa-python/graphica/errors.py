@@ -21,6 +21,11 @@ class ValidationError(GraphicaError):
     pass
 
 
+class ConflictError(GraphicaError):
+    """Request conflicted with current resource state (409)."""
+    pass
+
+
 class ServerError(GraphicaError):
     """Server-side error (5xx)."""
     pass

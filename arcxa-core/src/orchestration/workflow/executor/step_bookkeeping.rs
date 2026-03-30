@@ -4,6 +4,7 @@ use super::{
     BatchFrame, BatchFrameMetadata, BatchStepExecutionResult, ExecutionContext, StepResult,
     StepType, WorkflowExecutor, WorkflowStep,
 };
+use crate::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
 
 impl WorkflowExecutor {
     pub(super) fn prepare_step_execution_state(
@@ -55,6 +56,12 @@ impl WorkflowExecutor {
         mut batch_result: BatchStepExecutionResult,
     ) -> StepResult {
         self.stamp_step_batch_metadata(step, batch_result.batch_frame.as_mut());
+        let batch_metadata = batch_result
+            .batch_frame
+            .as_ref()
+            .map(|frame| frame.metadata().clone());
+        let runtime_metrics =
+            self.extract_runtime_metrics(batch_result.batch_frame.as_ref(), &batch_result.output);
 
         // NOTE: We return the full output including _rows here.
         // The execute loop will strip _rows AFTER updating working_data so downstream
@@ -66,10 +73,8 @@ impl WorkflowExecutor {
             confidence: batch_result.confidence,
             started_at,
             completed_at,
-            batch_metadata: batch_result
-                .batch_frame
-                .as_ref()
-                .map(|frame| frame.metadata().clone()),
+            batch_metadata,
+            runtime_metrics,
             batch_frame: batch_result.batch_frame,
         }
     }
@@ -93,5 +98,16 @@ impl WorkflowExecutor {
                 source_id: None,
             });
         }
+    }
+
+    pub(super) fn extract_runtime_metrics(
+        &self,
+        _batch_frame: Option<&BatchFrame>,
+        output: &serde_json::Value,
+    ) -> Option<RuntimeStepMetrics> {
+        output
+            .get("_runtime_metrics")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
     }
 }

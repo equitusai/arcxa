@@ -480,8 +480,10 @@ impl Transformer for OntologyMapperTransformer {
                             field.name.clone(),
                             json!({
                                 "ontology_field": target_field,
+                                "ontology_uri": manual_mapping.target_field_uri.clone(),
                                 "confidence": manual_mapping.confidence,
                                 "source": "manual",
+                                "status": "manual",
                                 "mapping_id": manual_mapping.id,
                                 "explanation": format!("Manual mapping by {}", manual_mapping.created_by),
                             }),
@@ -519,6 +521,7 @@ impl Transformer for OntologyMapperTransformer {
                         field.name.clone(),
                         json!({
                             "ontology_field": target_field,
+                            "ontology_uri": ontology_uri,
                             "confidence": confidence,
                             "source": "session",
                             "status": approval_status.to_lowercase(),

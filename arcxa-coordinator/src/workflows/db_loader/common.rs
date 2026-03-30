@@ -6,6 +6,11 @@ const WORKFLOW_ROW_METADATA_KEYS: &[&str] = &[
     "_row_index",
     "unmapped._row_id",
     "_modifications",
+    "_errors",
+    "_warnings",
+    "_error_count",
+    "_warning_count",
+    "_runtime_metrics",
 ];
 
 pub fn map_load_mode(mode: &str) -> EtlLoadMode {
@@ -61,6 +66,20 @@ mod tests {
                 "_modifications".to_string(),
                 serde_json::json!([{ "field": "name" }]),
             ),
+            (
+                "_errors".to_string(),
+                serde_json::json!([{ "field": "email", "row": 0 }]),
+            ),
+            (
+                "_warnings".to_string(),
+                serde_json::json!([{ "field": "status", "row": 0 }]),
+            ),
+            ("_error_count".to_string(), serde_json::json!(1)),
+            ("_warning_count".to_string(), serde_json::json!(1)),
+            (
+                "_runtime_metrics".to_string(),
+                serde_json::json!({ "storage_backend": "memory" }),
+            ),
         ])];
 
         let sanitized = sanitize_rows_for_database_load(rows);
@@ -71,5 +90,10 @@ mod tests {
         assert!(!row.contains_key("_row_index"));
         assert!(!row.contains_key("unmapped._row_id"));
         assert!(!row.contains_key("_modifications"));
+        assert!(!row.contains_key("_errors"));
+        assert!(!row.contains_key("_warnings"));
+        assert!(!row.contains_key("_error_count"));
+        assert!(!row.contains_key("_warning_count"));
+        assert!(!row.contains_key("_runtime_metrics"));
     }
 }

@@ -414,6 +414,25 @@ impl ActionExecutor {
                         delivery_result.latency_ms
                     );
 
+                    if let (Some(lineage_gen), Some(execution_id)) =
+                        (&context.lineage_generator, context.execution_id.as_deref())
+                    {
+                        if let Err(err) = lineage_gen.record_kafka_delivery(
+                            execution_id,
+                            &context.workflow_id,
+                            &context.route_id,
+                            &delivery_result.topic,
+                            delivery_result.partition,
+                            delivery_result.offset,
+                            delivery_result.latency_ms,
+                        ) {
+                            warn!(
+                                "Failed to record Kafka delivery lineage for execution {}: {}",
+                                execution_id, err
+                            );
+                        }
+                    }
+
                     (
                         ActionStatus::Success,
                         None,

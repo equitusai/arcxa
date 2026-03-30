@@ -109,6 +109,8 @@ pub struct ApiState {
     pub workflow_store: Option<Arc<crate::workflows::storage::WorkflowStore>>,
     // Execution store for workflow execution tracking
     pub execution_store: Option<Arc<crate::workflows::storage::ExecutionStore>>,
+    // Shared stream executor for route-based streaming workflows
+    pub stream_executor: Option<Arc<crate::workflows::engine::StreamExecutor>>,
     // File Library storage for enterprise file management (supports multiple backends via trait)
     pub file_library: Option<Arc<dyn file_library::storage_trait::FileLibraryStore>>,
     // Transformer registry for workflow Transform actions (CSV parser, DB2 migrator, deduplicator, etc.)

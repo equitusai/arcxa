@@ -121,6 +121,62 @@ impl Db2Destination {
         }
     }
 
+    fn normalized_table_reference(table_name: &str) -> (Option<String>, String) {
+        let trimmed = table_name.trim();
+        match trimmed.split_once('.') {
+            Some((schema, table)) => (
+                Some(schema.trim_matches('"').trim().to_uppercase()),
+                table.trim_matches('"').trim().to_uppercase(),
+            ),
+            None => (None, trimmed.trim_matches('"').trim().to_uppercase()),
+        }
+    }
+
+    fn check_table_exists_sql(table_name: &str) -> String {
+        let (schema, table) = Self::normalized_table_reference(table_name);
+        match schema {
+            Some(schema_name) => format!(
+                "SELECT 1 FROM SYSCAT.TABLES WHERE TABNAME = '{}' AND TABSCHEMA = '{}'",
+                table, schema_name
+            ),
+            None => format!(
+                "SELECT 1 FROM SYSCAT.TABLES WHERE TABNAME = '{}' AND TABSCHEMA = CURRENT SCHEMA",
+                table
+            ),
+        }
+    }
+
+    fn create_table_statements(
+        table_name: &str,
+        schema: &RecordSchema,
+        config: &LoadConfig,
+    ) -> EtlResult<Vec<String>> {
+        let (schema_name, table_only) = Self::normalized_table_reference(table_name);
+        let table_def = Self::schema_to_table_definition_static(&table_only, schema, config)?;
+        let ddl = Db2Dialect.create_table(&table_def);
+        let qualified_table_name = match schema_name {
+            Some(schema_name) => format!("{}.{}", schema_name, table_only),
+            None => table_only.clone(),
+        };
+        let create_prefix = format!("CREATE TABLE {}", table_only);
+        let comment_prefix = format!("COMMENT ON TABLE {}", table_only);
+
+        Ok(ddl
+            .split(';')
+            .map(str::trim)
+            .filter(|stmt| !stmt.is_empty())
+            .map(|stmt| {
+                if let Some(rest) = stmt.strip_prefix(&create_prefix) {
+                    format!("CREATE TABLE {}{}", qualified_table_name, rest)
+                } else if let Some(rest) = stmt.strip_prefix(&comment_prefix) {
+                    format!("COMMENT ON TABLE {}{}", qualified_table_name, rest)
+                } else {
+                    stmt.to_string()
+                }
+            })
+            .collect())
+    }
+
     /// Ensure table exists (create if necessary based on config)
     async fn ensure_table_exists(
         &mut self,
@@ -145,30 +201,39 @@ impl Db2Destination {
         })?;
 
         // Check if table exists
-        let check_sql = self.dialect.check_table_exists(&self.table_name);
+        let check_sql = Self::check_table_exists_sql(&self.table_name);
         match conn.query(&check_sql, &[]) {
-            Ok(_) => {
+            Ok(rows) if !rows.is_empty() => {
                 debug!("Table {} already exists", self.table_name);
                 return Ok(());
             }
-            Err(_) => {
-                // Table doesn't exist, create it
+            Ok(_) => {
                 info!("Creating table {}", self.table_name);
+            }
+            Err(error) => {
+                return Err(EtlError::SqlError {
+                    message: format!(
+                        "Failed to determine whether DB2 table '{}' exists: {:?}",
+                        self.table_name, error
+                    ),
+                    query: Some(check_sql),
+                });
             }
         }
 
-        // Generate table definition from schema
-        let table_def = Self::schema_to_table_definition_static(&self.table_name, schema, config)?;
+        let statements = Self::create_table_statements(&self.table_name, schema, config)?;
+        debug!(
+            "Executing DB2 DDL statements for {}: {:?}",
+            self.table_name, statements
+        );
 
-        // Generate CREATE TABLE DDL
-        let ddl = Db2Dialect.create_table(&table_def);
-        debug!("Executing DDL: {}", ddl);
-
-        // Execute CREATE TABLE
-        conn.execute(&ddl, &[]).map_err(|e| EtlError::SqlError {
-            message: format!("Failed to create table: {:?}", e),
-            query: Some(ddl),
-        })?;
+        for statement in statements {
+            conn.execute(&statement, &[])
+                .map_err(|e| EtlError::SqlError {
+                    message: format!("Failed to execute DB2 DDL statement: {:?}", e),
+                    query: Some(statement.clone()),
+                })?;
+        }
 
         info!("Table {} created successfully", self.table_name);
         Ok(())
@@ -1134,6 +1199,54 @@ mod tests {
                 metadata: HashMap::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn test_check_table_exists_sql_for_unqualified_table() {
+        let sql = Db2Destination::check_table_exists_sql("customers");
+        assert_eq!(
+            sql,
+            "SELECT 1 FROM SYSCAT.TABLES WHERE TABNAME = 'CUSTOMERS' AND TABSCHEMA = CURRENT SCHEMA"
+        );
+    }
+
+    #[test]
+    fn test_check_table_exists_sql_for_qualified_table() {
+        let sql = Db2Destination::check_table_exists_sql("db2inst1.customers");
+        assert_eq!(
+            sql,
+            "SELECT 1 FROM SYSCAT.TABLES WHERE TABNAME = 'CUSTOMERS' AND TABSCHEMA = 'DB2INST1'"
+        );
+    }
+
+    #[test]
+    fn test_create_table_statements_preserve_qualified_table_name() {
+        let mut schema = create_test_schema();
+        schema
+            .metadata
+            .insert("create_table_if_not_exists".to_string(), json!(true));
+        let config = LoadConfig {
+            mode: LoadMode::Insert,
+            key_fields: vec!["id".to_string()],
+            ..Default::default()
+        };
+
+        let statements =
+            Db2Destination::create_table_statements("db2inst1.customers", &schema, &config)
+                .unwrap();
+
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.starts_with("CREATE TABLE DB2INST1.CUSTOMERS")),
+            "expected qualified CREATE TABLE statement, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.starts_with("COMMENT ON TABLE DB2INST1.CUSTOMERS")),
+            "expected qualified COMMENT statement, got {statements:?}"
+        );
     }
 
     fn db2_tests_enabled() -> bool {

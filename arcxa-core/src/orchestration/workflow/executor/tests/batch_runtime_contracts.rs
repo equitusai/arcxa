@@ -291,6 +291,7 @@ fn test_build_step_output_for_storage_strips_large_rows_only() {
 #[test]
 fn test_merge_and_store_step_result_preserves_metadata_and_drops_frame() {
     use crate::orchestration::workflow::runtime::frame::{BatchFrame, BatchFrameMetadata};
+    use crate::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
 
     let workflow = create_test_workflow();
     let registry = Arc::new(ModelRegistry::new());
@@ -325,6 +326,23 @@ fn test_merge_and_store_step_result_preserves_metadata_and_drops_frame() {
         started_at: chrono::Utc::now(),
         completed_at: chrono::Utc::now(),
         batch_metadata: Some(frame.metadata().clone()),
+        runtime_metrics: Some(RuntimeStepMetrics {
+            input_rows: 2,
+            output_rows: 2,
+            materialization_count: 1,
+            spill_events: 1,
+            spill_bytes: 2048,
+            memory_high_water_mark: 4096,
+            storage_type: Some("parquet".to_string()),
+            storage_operation: Some("set_rows".to_string()),
+            planned_tier: Some("parquet".to_string()),
+            storage_decision_reason: Some("planned".to_string()),
+            reserved_spill_bytes: 2048,
+            execution_reserved_spill_bytes: 2048,
+            total_reserved_spill_bytes: 2048,
+            storage_location: Some("spill/transform_step.parquet".to_string()),
+            pushdown_applied: false,
+        }),
         batch_frame: Some(frame),
     };
 
@@ -348,6 +366,20 @@ fn test_merge_and_store_step_result_preserves_metadata_and_drops_frame() {
         Some("extract_step")
     );
     assert_eq!(stored.output["_status"], "ok");
+    assert_eq!(
+        stored
+            .runtime_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.storage_type.as_deref()),
+        Some("parquet")
+    );
+    assert_eq!(
+        stored
+            .runtime_metrics
+            .as_ref()
+            .map(|metrics| metrics.reserved_spill_bytes),
+        Some(2048)
+    );
 }
 
 #[test]
@@ -500,10 +532,10 @@ fn test_aggregator_batch_path_preserves_legacy_output_shape() {
     let output_rows = result.output["_rows"].as_array().unwrap();
     assert_eq!(output_rows.len(), 2);
     assert!(output_rows.iter().any(|row| {
-        row["region"] == "\"east\"" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
+        row["region"] == "east" && row["total_amount"] == 25.0 && row["order_count"] == 2.0
     }));
     assert!(output_rows.iter().any(|row| {
-        row["region"] == "\"west\"" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
+        row["region"] == "west" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
     }));
 }
 

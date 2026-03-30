@@ -332,6 +332,7 @@ impl MappingSessionStatus {
         matches!(
             (self, new_status),
             (Draft, PendingReview)
+                | (Draft, Approved)
                 | (Draft, Cancelled)
                 | (PendingReview, Approved)
                 | (PendingReview, Draft)

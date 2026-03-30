@@ -7,13 +7,16 @@ use super::error::{Result, WorkflowError};
 use super::row_lineage_context::RowLineageContext;
 #[cfg(feature = "workflow-storage")]
 use super::row_storage::StorageManager;
-use super::row_storage::{
-    estimate_memory_size, RowAccessor, RowReference, RowStorage, StorageType,
-};
+use super::row_storage::{estimate_memory_size, RowAccessor, RowStorage, StorageType};
 use super::runtime::frame::BatchFrame;
+use super::runtime::metrics::{RuntimeStepMetrics, StorageDecisionMetric, StorageDecisionReason};
+use super::runtime::spill::StorageTieringPlan;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "workflow-storage")]
 use std::sync::Arc;
+
+const MAX_RECENT_STORAGE_DECISIONS: usize = 32;
 
 /// Resource limits for workflow execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +95,14 @@ pub struct ExecutionMetrics {
     pub storage_operations: HashMap<String, usize>,
     pub memory_high_water_mark: usize,
     pub storage_type_usage: HashMap<StorageType, usize>,
+    pub tiering_plan_usage: HashMap<StorageTieringPlan, usize>,
+    pub storage_decision_reasons: HashMap<StorageDecisionReason, usize>,
+    pub spill_events: usize,
+    pub spill_bytes: usize,
+    pub spill_reserved_bytes_high_water_mark: usize,
+    pub execution_spill_reserved_bytes_current: usize,
+    pub total_spill_reserved_bytes_current: usize,
+    pub recent_storage_decisions: Vec<StorageDecisionMetric>,
 }
 
 impl ExecutionContextV2 {
@@ -151,10 +162,7 @@ impl ExecutionContextV2 {
     /// Get rows with automatic backend selection
     pub fn get_rows(&self) -> Result<RowAccessor> {
         match &self.row_storage {
-            Some(storage) => {
-                self.record_storage_operation("get_rows", storage.storage_type());
-                Ok(RowAccessor::new(storage.clone()))
-            }
+            Some(storage) => Ok(RowAccessor::new(storage.clone())),
             None => {
                 // Fallback to working_data for backwards compatibility
                 if let Some(rows) = self.working_data.get("_rows") {
@@ -190,6 +198,8 @@ impl ExecutionContextV2 {
     ) -> Result<()> {
         let row_count = rows.len();
         let estimated_size = estimate_memory_size(&rows);
+        let planned_tier =
+            super::runtime::spill::StorageTieringPolicy::default().plan(row_count, estimated_size);
 
         // Check resource limits
         if row_count > self.resource_limits.max_row_count {
@@ -206,29 +216,84 @@ impl ExecutionContextV2 {
 
         // Choose storage backend
         #[cfg(feature = "workflow-storage")]
-        let storage = if let Some(ref manager) = self.storage_manager {
+        let (
+            storage,
+            storage_reason,
+            reserved_spill_bytes,
+            execution_reserved_spill_bytes,
+            total_reserved_spill_bytes,
+            storage_location,
+        ) = if let Some(ref manager) = self.storage_manager {
             // Use storage manager for optimal tiering
             let step_id = self.current_step_id.as_deref().unwrap_or("unknown");
-            let storage = manager.store_rows(&self.execution_id, step_id, rows)?;
-            self.record_storage_operation("set_rows", storage.storage_type());
-            storage
+            let outcome = manager.store_rows_with_details(&self.execution_id, step_id, rows)?;
+            let reason = if matches!(planned_tier, StorageTieringPlan::Parquet)
+                && matches!(outcome.storage.storage_type(), StorageType::RocksDB)
+            {
+                StorageDecisionReason::ParquetFallbackToRocksDb
+            } else {
+                StorageDecisionReason::Planned
+            };
+            (
+                outcome.storage,
+                reason,
+                outcome.reserved_spill_bytes,
+                outcome.execution_reserved_spill_bytes,
+                outcome.total_reserved_spill_bytes,
+                outcome.storage_location,
+            )
         } else {
             // Fallback to automatic tiering without manager
             let storage = RowStorage::from_rows(rows)?;
-            self.record_storage_operation("set_rows", storage.storage_type());
-            storage
+            let reason = match planned_tier {
+                StorageTieringPlan::InMemory | StorageTieringPlan::Shared => {
+                    StorageDecisionReason::Planned
+                }
+                StorageTieringPlan::RocksDb | StorageTieringPlan::Parquet => {
+                    StorageDecisionReason::StorageManagerUnavailable
+                }
+            };
+            (storage, reason, 0, 0, 0, None)
         };
 
         #[cfg(not(feature = "workflow-storage"))]
-        let storage = {
+        let (
+            storage,
+            storage_reason,
+            reserved_spill_bytes,
+            execution_reserved_spill_bytes,
+            total_reserved_spill_bytes,
+            storage_location,
+        ) = {
             // Automatic tiering without manager
             let storage = RowStorage::from_rows(rows)?;
-            self.record_storage_operation("set_rows", storage.storage_type());
-            storage
+            let reason = match planned_tier {
+                StorageTieringPlan::InMemory | StorageTieringPlan::Shared => {
+                    StorageDecisionReason::Planned
+                }
+                StorageTieringPlan::RocksDb | StorageTieringPlan::Parquet => {
+                    StorageDecisionReason::StorageManagerUnavailable
+                }
+            };
+            (storage, reason, 0, 0, 0, None)
         };
 
+        let storage_type = storage.storage_type();
         self.row_storage = Some(storage);
         self.batch_frame = batch_frame;
+        self.record_storage_operation("set_rows", storage_type);
+        self.record_storage_decision(
+            "set_rows",
+            planned_tier,
+            storage_type,
+            row_count,
+            estimated_size,
+            storage_reason,
+            reserved_spill_bytes,
+            execution_reserved_spill_bytes,
+            total_reserved_spill_bytes,
+            storage_location,
+        );
 
         // Update working_data metadata
         if let serde_json::Value::Object(ref mut obj) = self.working_data {
@@ -257,27 +322,92 @@ impl ExecutionContextV2 {
 
     /// Store intermediate results for a step
     pub fn store_step_rows(&mut self, step_id: String, rows: Vec<serde_json::Value>) -> Result<()> {
+        let row_count = rows.len();
+        let estimated_size = estimate_memory_size(&rows);
+        let planned_tier =
+            super::runtime::spill::StorageTieringPolicy::default().plan(row_count, estimated_size);
+
         #[cfg(feature = "workflow-storage")]
-        let storage = if let Some(ref manager) = self.storage_manager {
-            manager.store_rows(&self.execution_id, &step_id, rows)?
+        let (
+            storage,
+            storage_reason,
+            reserved_spill_bytes,
+            execution_reserved_spill_bytes,
+            total_reserved_spill_bytes,
+            storage_location,
+        ) = if let Some(ref manager) = self.storage_manager {
+            let outcome = manager.store_rows_with_details(&self.execution_id, &step_id, rows)?;
+            let reason = if matches!(planned_tier, StorageTieringPlan::Parquet)
+                && matches!(outcome.storage.storage_type(), StorageType::RocksDB)
+            {
+                StorageDecisionReason::ParquetFallbackToRocksDb
+            } else {
+                StorageDecisionReason::Planned
+            };
+            (
+                outcome.storage,
+                reason,
+                outcome.reserved_spill_bytes,
+                outcome.execution_reserved_spill_bytes,
+                outcome.total_reserved_spill_bytes,
+                outcome.storage_location,
+            )
         } else {
-            RowStorage::from_rows(rows)?
+            let storage = RowStorage::from_rows(rows)?;
+            let reason = match planned_tier {
+                StorageTieringPlan::InMemory | StorageTieringPlan::Shared => {
+                    StorageDecisionReason::Planned
+                }
+                StorageTieringPlan::RocksDb | StorageTieringPlan::Parquet => {
+                    StorageDecisionReason::StorageManagerUnavailable
+                }
+            };
+            (storage, reason, 0, 0, 0, None)
         };
 
         #[cfg(not(feature = "workflow-storage"))]
-        let storage = RowStorage::from_rows(rows)?;
+        let (
+            storage,
+            storage_reason,
+            reserved_spill_bytes,
+            execution_reserved_spill_bytes,
+            total_reserved_spill_bytes,
+            storage_location,
+        ) = {
+            let storage = RowStorage::from_rows(rows)?;
+            let reason = match planned_tier {
+                StorageTieringPlan::InMemory | StorageTieringPlan::Shared => {
+                    StorageDecisionReason::Planned
+                }
+                StorageTieringPlan::RocksDb | StorageTieringPlan::Parquet => {
+                    StorageDecisionReason::StorageManagerUnavailable
+                }
+            };
+            (storage, reason, 0, 0, 0, None)
+        };
 
         self.record_storage_operation("store_step", storage.storage_type());
+        self.record_storage_decision(
+            "store_step",
+            planned_tier,
+            storage.storage_type(),
+            row_count,
+            estimated_size,
+            storage_reason,
+            reserved_spill_bytes,
+            execution_reserved_spill_bytes,
+            total_reserved_spill_bytes,
+            storage_location,
+        );
         self.step_row_storage.insert(step_id, storage);
         Ok(())
     }
 
     /// Get rows from a specific step
     pub fn get_step_rows(&self, step_id: &str) -> Option<RowAccessor> {
-        self.step_row_storage.get(step_id).map(|storage| {
-            self.record_storage_operation("get_step", storage.storage_type());
-            RowAccessor::new(storage.clone())
-        })
+        self.step_row_storage
+            .get(step_id)
+            .map(|storage| RowAccessor::new(storage.clone()))
     }
 
     /// Merge step output into working data (optimized version)
@@ -347,14 +477,31 @@ impl ExecutionContextV2 {
                         // Get current rows
                         let accessor = RowAccessor::new(storage.clone());
                         let rows = accessor.to_vec()?;
+                        let spill_row_count = storage.len();
+                        let spill_bytes = storage.memory_usage();
 
                         // Store in RocksDB
                         let step_id = self.current_step_id.as_deref().unwrap_or("spilled");
-                        let disk_storage =
-                            manager.create_rocks_storage(&self.execution_id, step_id, rows)?;
+                        let placement = manager.create_rocks_storage_with_details(
+                            &self.execution_id,
+                            step_id,
+                            rows,
+                        )?;
 
-                        self.row_storage = Some(disk_storage);
+                        self.row_storage = Some(placement.storage);
                         self.record_storage_operation("spill_to_disk", StorageType::RocksDB);
+                        self.record_storage_decision(
+                            "spill_to_disk",
+                            StorageTieringPlan::RocksDb,
+                            StorageType::RocksDB,
+                            spill_row_count,
+                            spill_bytes,
+                            StorageDecisionReason::MemoryPressureSpill,
+                            placement.reserved_spill_bytes,
+                            placement.execution_reserved_spill_bytes,
+                            placement.total_reserved_spill_bytes,
+                            placement.storage_location,
+                        );
                     }
                 }
             }
@@ -377,15 +524,161 @@ impl ExecutionContextV2 {
     }
 
     /// Record storage operation for metrics
-    fn record_storage_operation(&self, operation: &str, storage_type: StorageType) {
-        // Note: Using interior mutability pattern would be better here
-        // For now, this is a no-op in the const context
-        // In production, use Arc<Mutex<ExecutionMetrics>> or similar
+    fn record_storage_operation(&mut self, operation: &str, storage_type: StorageType) {
+        *self
+            .metrics
+            .storage_operations
+            .entry(operation.to_string())
+            .or_insert(0) += 1;
+        *self
+            .metrics
+            .storage_type_usage
+            .entry(storage_type)
+            .or_insert(0) += 1;
+    }
+
+    fn record_storage_decision(
+        &mut self,
+        operation: &str,
+        planned_tier: StorageTieringPlan,
+        actual_storage_type: StorageType,
+        row_count: usize,
+        estimated_bytes: usize,
+        reason: StorageDecisionReason,
+        reserved_spill_bytes: usize,
+        execution_reserved_spill_bytes: usize,
+        total_reserved_spill_bytes: usize,
+        storage_location: Option<String>,
+    ) {
+        *self
+            .metrics
+            .tiering_plan_usage
+            .entry(planned_tier)
+            .or_insert(0) += 1;
+        *self
+            .metrics
+            .storage_decision_reasons
+            .entry(reason)
+            .or_insert(0) += 1;
+
+        if matches!(reason, StorageDecisionReason::MemoryPressureSpill) {
+            self.metrics.spill_events += 1;
+            self.metrics.spill_bytes += estimated_bytes;
+        }
+        self.metrics.execution_spill_reserved_bytes_current = execution_reserved_spill_bytes;
+        self.metrics.total_spill_reserved_bytes_current = total_reserved_spill_bytes;
+        self.metrics.spill_reserved_bytes_high_water_mark = self
+            .metrics
+            .spill_reserved_bytes_high_water_mark
+            .max(total_reserved_spill_bytes);
+
+        if self.metrics.recent_storage_decisions.len() >= MAX_RECENT_STORAGE_DECISIONS {
+            self.metrics.recent_storage_decisions.remove(0);
+        }
+
+        self.metrics
+            .recent_storage_decisions
+            .push(StorageDecisionMetric {
+                operation: operation.to_string(),
+                planned_tier,
+                actual_storage_type,
+                row_count,
+                estimated_bytes,
+                reason,
+                reserved_spill_bytes,
+                execution_reserved_spill_bytes,
+                total_reserved_spill_bytes,
+                storage_location: storage_location.clone(),
+            });
+
+        match reason {
+            StorageDecisionReason::Planned => {
+                tracing::debug!(
+                    operation,
+                    ?planned_tier,
+                    actual_storage_type = %actual_storage_type,
+                    row_count,
+                    estimated_bytes,
+                    reserved_spill_bytes,
+                    execution_reserved_spill_bytes,
+                    total_reserved_spill_bytes,
+                    storage_location = storage_location.as_deref().unwrap_or(""),
+                    "Recorded storage placement decision"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    operation,
+                    ?planned_tier,
+                    actual_storage_type = %actual_storage_type,
+                    row_count,
+                    estimated_bytes,
+                    reserved_spill_bytes,
+                    execution_reserved_spill_bytes,
+                    total_reserved_spill_bytes,
+                    storage_location = storage_location.as_deref().unwrap_or(""),
+                    ?reason,
+                    "Recorded storage fallback or spill decision"
+                );
+            }
+        }
     }
 
     /// Get execution metrics
     pub fn get_metrics(&self) -> &ExecutionMetrics {
         &self.metrics
+    }
+
+    /// Build a serializable runtime telemetry snapshot for a single step.
+    ///
+    /// This surfaces the current storage decision and spill state beyond the
+    /// execution context so operator/reporting layers can emit the same storage
+    /// signals that the context records internally.
+    pub fn build_runtime_step_metrics(
+        &self,
+        input_rows: usize,
+        output_rows: usize,
+        materialization_count: usize,
+    ) -> RuntimeStepMetrics {
+        let latest_decision = self.metrics.recent_storage_decisions.last();
+
+        RuntimeStepMetrics {
+            input_rows,
+            output_rows,
+            materialization_count,
+            spill_events: self.metrics.spill_events,
+            spill_bytes: self.metrics.spill_bytes,
+            memory_high_water_mark: self.metrics.memory_high_water_mark,
+            storage_type: self
+                .row_storage
+                .as_ref()
+                .map(|storage| storage.storage_type().to_string()),
+            storage_operation: latest_decision.map(|decision| decision.operation.clone()),
+            planned_tier: latest_decision.map(|decision| match decision.planned_tier {
+                StorageTieringPlan::InMemory => "in_memory".to_string(),
+                StorageTieringPlan::Shared => "shared".to_string(),
+                StorageTieringPlan::RocksDb => "rocksdb".to_string(),
+                StorageTieringPlan::Parquet => "parquet".to_string(),
+            }),
+            storage_decision_reason: latest_decision.map(|decision| match decision.reason {
+                StorageDecisionReason::Planned => "planned".to_string(),
+                StorageDecisionReason::StorageManagerUnavailable => {
+                    "storage_manager_unavailable".to_string()
+                }
+                StorageDecisionReason::ParquetFallbackToRocksDb => {
+                    "parquet_fallback_to_rocks_db".to_string()
+                }
+                StorageDecisionReason::MemoryPressureSpill => "memory_pressure_spill".to_string(),
+            }),
+            reserved_spill_bytes: latest_decision
+                .map(|decision| decision.reserved_spill_bytes)
+                .unwrap_or(0),
+            execution_reserved_spill_bytes: self.metrics.execution_spill_reserved_bytes_current,
+            total_reserved_spill_bytes: self.metrics.total_spill_reserved_bytes_current,
+            storage_location: latest_decision
+                .and_then(|decision| decision.storage_location.clone()),
+            pushdown_applied: false,
+        }
     }
 
     /// Cleanup resources
@@ -546,5 +839,191 @@ mod tests {
         // Should be able to iterate
         let collected: Vec<_> = accessor.iter().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn test_set_rows_records_in_memory_storage_decision_metrics() {
+        let mut ctx = ExecutionContextV2::new(json!({}));
+
+        ctx.set_rows(vec![json!({"id": 1}); 100]).unwrap();
+
+        assert_eq!(ctx.metrics.storage_operations.get("set_rows"), Some(&1));
+        assert_eq!(
+            ctx.metrics.storage_type_usage.get(&StorageType::InMemory),
+            Some(&1)
+        );
+        assert_eq!(
+            ctx.metrics
+                .tiering_plan_usage
+                .get(&StorageTieringPlan::InMemory),
+            Some(&1)
+        );
+        assert_eq!(
+            ctx.metrics
+                .storage_decision_reasons
+                .get(&StorageDecisionReason::Planned),
+            Some(&1)
+        );
+
+        let decision = ctx
+            .metrics
+            .recent_storage_decisions
+            .last()
+            .expect("storage decision to be recorded");
+        assert_eq!(decision.operation, "set_rows");
+        assert_eq!(decision.planned_tier, StorageTieringPlan::InMemory);
+        assert_eq!(decision.actual_storage_type, StorageType::InMemory);
+        assert_eq!(decision.reason, StorageDecisionReason::Planned);
+    }
+
+    #[test]
+    fn test_set_rows_records_storage_manager_unavailable_fallback_metrics() {
+        let mut ctx = ExecutionContextV2::new(json!({}));
+
+        ctx.set_rows(vec![json!({"id": 1}); 150_000]).unwrap();
+
+        assert_eq!(
+            ctx.row_storage.as_ref().unwrap().storage_type(),
+            StorageType::Shared
+        );
+        assert_eq!(
+            ctx.metrics
+                .tiering_plan_usage
+                .get(&StorageTieringPlan::RocksDb),
+            Some(&1)
+        );
+        assert_eq!(
+            ctx.metrics.storage_type_usage.get(&StorageType::Shared),
+            Some(&1)
+        );
+        assert_eq!(
+            ctx.metrics
+                .storage_decision_reasons
+                .get(&StorageDecisionReason::StorageManagerUnavailable),
+            Some(&1)
+        );
+
+        let decision = ctx
+            .metrics
+            .recent_storage_decisions
+            .last()
+            .expect("fallback decision to be recorded");
+        assert_eq!(decision.operation, "set_rows");
+        assert_eq!(decision.planned_tier, StorageTieringPlan::RocksDb);
+        assert_eq!(decision.actual_storage_type, StorageType::Shared);
+        assert_eq!(
+            decision.reason,
+            StorageDecisionReason::StorageManagerUnavailable
+        );
+    }
+
+    #[cfg(feature = "workflow-storage")]
+    #[test]
+    fn test_set_rows_with_storage_manager_records_spill_reservation_metrics() {
+        use tempfile::tempdir;
+
+        let rocks_dir = tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let manager = Arc::new(
+            StorageManager::new(rocks_dir.path(), temp_dir.path()).expect("storage manager"),
+        );
+
+        let mut ctx = ExecutionContextV2::with_storage_manager(json!({}), manager);
+        ctx.set_current_step("storage_metrics".to_string());
+        ctx.set_rows(vec![json!({"id": 1}); 150_000])
+            .expect("rows to be stored");
+
+        assert_eq!(
+            ctx.row_storage.as_ref().unwrap().storage_type(),
+            StorageType::RocksDB
+        );
+        assert!(ctx.metrics.execution_spill_reserved_bytes_current > 0);
+        assert!(ctx.metrics.total_spill_reserved_bytes_current > 0);
+        assert!(ctx.metrics.spill_reserved_bytes_high_water_mark > 0);
+
+        let decision = ctx
+            .metrics
+            .recent_storage_decisions
+            .last()
+            .expect("storage decision to be recorded");
+        assert!(decision.reserved_spill_bytes > 0);
+        assert!(decision.execution_reserved_spill_bytes > 0);
+        assert!(decision.total_reserved_spill_bytes > 0);
+        assert!(decision.storage_location.is_some());
+    }
+
+    #[cfg(feature = "workflow-storage")]
+    #[test]
+    fn test_spill_to_disk_records_spill_metrics() {
+        use tempfile::tempdir;
+
+        let rocks_dir = tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let manager = Arc::new(
+            StorageManager::new(rocks_dir.path(), temp_dir.path()).expect("storage manager"),
+        );
+
+        let mut ctx = ExecutionContextV2::with_storage_manager(json!({}), manager);
+        ctx.resource_limits.max_memory_bytes = 1;
+        ctx.resource_limits.enable_disk_spill = true;
+        ctx.set_current_step("spill_test".to_string());
+        ctx.set_rows(vec![json!({"id": 1, "value": "abc"})])
+            .expect("rows to be stored");
+
+        ctx.check_memory_pressure().expect("spill to succeed");
+
+        assert_eq!(
+            ctx.row_storage.as_ref().unwrap().storage_type(),
+            StorageType::RocksDB
+        );
+        assert_eq!(ctx.metrics.spill_events, 1);
+        assert!(ctx.metrics.spill_bytes > 0);
+        assert_eq!(
+            ctx.metrics
+                .storage_decision_reasons
+                .get(&StorageDecisionReason::MemoryPressureSpill),
+            Some(&1)
+        );
+
+        let decision = ctx
+            .metrics
+            .recent_storage_decisions
+            .last()
+            .expect("spill decision to be recorded");
+        assert_eq!(decision.operation, "spill_to_disk");
+        assert_eq!(decision.planned_tier, StorageTieringPlan::RocksDb);
+        assert_eq!(decision.actual_storage_type, StorageType::RocksDB);
+        assert_eq!(decision.reason, StorageDecisionReason::MemoryPressureSpill);
+    }
+
+    #[cfg(feature = "workflow-storage")]
+    #[test]
+    fn test_build_runtime_step_metrics_surfaces_latest_storage_decision() {
+        use tempfile::tempdir;
+
+        let rocks_dir = tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let manager = Arc::new(
+            StorageManager::new(rocks_dir.path(), temp_dir.path()).expect("storage manager"),
+        );
+
+        let mut ctx = ExecutionContextV2::with_storage_manager(json!({}), manager);
+        ctx.set_current_step("runtime_metrics".to_string());
+        ctx.set_rows(vec![json!({"id": 1}); 150_000])
+            .expect("rows to be stored");
+
+        let runtime_metrics = ctx.build_runtime_step_metrics(150_000, 150_000, 0);
+        assert_eq!(runtime_metrics.input_rows, 150_000);
+        assert_eq!(runtime_metrics.output_rows, 150_000);
+        assert_eq!(runtime_metrics.storage_type.as_deref(), Some("rocksdb"));
+        assert_eq!(runtime_metrics.planned_tier.as_deref(), Some("rocksdb"));
+        assert_eq!(
+            runtime_metrics.storage_decision_reason.as_deref(),
+            Some("planned")
+        );
+        assert!(runtime_metrics.reserved_spill_bytes > 0);
+        assert!(runtime_metrics.execution_reserved_spill_bytes > 0);
+        assert!(runtime_metrics.total_reserved_spill_bytes > 0);
+        assert!(runtime_metrics.storage_location.is_some());
     }
 }

@@ -131,6 +131,9 @@ pub async fn create_workflow(
     let mut workflow = Workflow::new(workflow_id.clone(), req.name.clone(), routes);
     workflow.description = req.description;
     workflow.tags = req.tags;
+    if let Some(execution_mode) = req.execution_mode {
+        workflow.execution_mode = execution_mode;
+    }
 
     if let Some(default_route) = req.default_route {
         workflow.default_route = Some(default_route);
@@ -187,6 +190,10 @@ pub async fn update_workflow(
 
     if let Some(routes_dto) = req.routes {
         workflow.routes = Box::new(routes_dto.into_iter().map(Route::from).collect());
+    }
+
+    if let Some(execution_mode) = req.execution_mode {
+        workflow.execution_mode = execution_mode;
     }
 
     if let Some(default_route) = req.default_route {
@@ -1790,6 +1797,7 @@ mod tests {
             schedule_store: Some(Arc::new(crate::workflows::storage::ScheduleStore::new())),
             workflow_store: None,
             execution_store: Some(Arc::new(crate::workflows::storage::ExecutionStore::new())),
+            stream_executor: None,
             file_library: None,
             kafka_producer: None,
             http_client: None,
@@ -1886,6 +1894,7 @@ mod tests {
             schedule_store: None,
             workflow_store: None,
             execution_store: None,
+            stream_executor: None,
             file_library: None,
             kafka_producer: None,
             http_client: None,
@@ -1938,6 +1947,7 @@ mod tests {
             name: "test_workflow".to_string(),
             description: "Test description".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec!["test".to_string()],
         };
@@ -1958,6 +1968,7 @@ mod tests {
             name: "test_workflow".to_string(),
             description: "Test".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2002,6 +2013,7 @@ mod tests {
                 ],
                 priority: 10,
             }],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2040,6 +2052,7 @@ mod tests {
             name: "test_workflow".to_string(),
             description: "Test".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2073,6 +2086,7 @@ mod tests {
                 name: format!("workflow_{}", i),
                 description: String::new(),
                 routes: vec![create_test_route_dto()],
+                execution_mode: None,
                 default_route: None,
                 tags: vec![],
             };
@@ -2116,6 +2130,7 @@ mod tests {
                 }],
                 priority: 10,
             }],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2175,6 +2190,7 @@ mod tests {
             name: "dry_run_reject".to_string(),
             description: String::new(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2209,6 +2225,7 @@ mod tests {
             name: "dry_run_async_reject".to_string(),
             description: String::new(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2257,6 +2274,7 @@ mod tests {
                 }],
                 priority: 1,
             }],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2314,6 +2332,25 @@ mod tests {
             output: json!({"records": 3}),
             confidence: 0.91,
             duration_ms: 42,
+            runtime_metrics: Some(
+                graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics {
+                    input_rows: 3,
+                    output_rows: 3,
+                    materialization_count: 0,
+                    spill_events: 1,
+                    spill_bytes: 2048,
+                    memory_high_water_mark: 4096,
+                    storage_type: Some("rocksdb".to_string()),
+                    storage_operation: Some("set_rows".to_string()),
+                    planned_tier: Some("rocksdb".to_string()),
+                    storage_decision_reason: Some("planned".to_string()),
+                    reserved_spill_bytes: 2048,
+                    execution_reserved_spill_bytes: 2048,
+                    total_reserved_spill_bytes: 2048,
+                    storage_location: Some("spill/step_1.rocksdb".to_string()),
+                    pushdown_applied: false,
+                },
+            ),
         }];
         state.execution_store.save(execution.clone()).await.unwrap();
 
@@ -2337,6 +2374,22 @@ mod tests {
         assert_eq!(response.0.step_results.len(), 1);
         assert_eq!(response.0.step_results[0].step_id, "step_1");
         assert_eq!(response.0.step_results[0].duration_ms, 42);
+        assert_eq!(
+            response
+                .0
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(1)
+        );
+        assert_eq!(
+            response
+                .0
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["rocksdb".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -2405,13 +2458,41 @@ mod tests {
 
         // Create multiple executions
         for i in 0..5 {
-            let execution = WorkflowExecution::new(
+            let mut execution = WorkflowExecution::new(
                 format!("exec_{:03}", i),
                 "wf_001".to_string(),
                 "Test Workflow".to_string(),
                 json!({}),
                 None,
             );
+            if i == 0 {
+                execution.step_results = vec![PersistedStepResult {
+                    step_id: "step_1".to_string(),
+                    success: true,
+                    output: json!({"rows": 3}),
+                    confidence: 0.93,
+                    duration_ms: 18,
+                    runtime_metrics: Some(
+                        graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics {
+                            input_rows: 3,
+                            output_rows: 3,
+                            materialization_count: 0,
+                            spill_events: 1,
+                            spill_bytes: 1024,
+                            memory_high_water_mark: 2048,
+                            storage_type: Some("rocksdb".to_string()),
+                            storage_operation: Some("set_rows".to_string()),
+                            planned_tier: Some("rocksdb".to_string()),
+                            storage_decision_reason: Some("planned".to_string()),
+                            reserved_spill_bytes: 1024,
+                            execution_reserved_spill_bytes: 1024,
+                            total_reserved_spill_bytes: 1024,
+                            storage_location: Some("spill/exec_000.rocksdb".to_string()),
+                            pushdown_applied: false,
+                        },
+                    ),
+                }];
+            }
             state.execution_store.save(execution).await.unwrap();
         }
 
@@ -2432,6 +2513,20 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.0.executions.len(), 5);
         assert_eq!(response.0.total, 5);
+        let runtime_summary = response
+            .0
+            .executions
+            .iter()
+            .find(|execution| execution.execution_id == "exec_000")
+            .and_then(|execution| execution.runtime_metrics.as_ref());
+        assert_eq!(
+            runtime_summary.map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(1)
+        );
+        assert_eq!(
+            runtime_summary.map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["rocksdb".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -2894,6 +2989,7 @@ mod tests {
             name: "scheduled_workflow".to_string(),
             description: "Test".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2933,6 +3029,7 @@ mod tests {
             name: "scheduled_workflow".to_string(),
             description: "Test".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -2986,6 +3083,7 @@ mod tests {
             name: "scheduled_workflow".to_string(),
             description: "Test".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -3020,6 +3118,7 @@ mod tests {
             name: "scheduled_workflow".to_string(),
             description: "Test".to_string(),
             routes: vec![create_test_route_dto()],
+            execution_mode: None,
             default_route: None,
             tags: vec![],
         };
@@ -3466,9 +3565,11 @@ mod tests {
                 output: json!({"value": 10}),
                 confidence: 0.95,
                 duration_ms: 50,
+                runtime_metrics: None,
             }],
             final_output: json!({"value": 10}),
             confidence: 0.95,
+            runtime_metrics: None,
             materialized_dataset: None,
         };
 

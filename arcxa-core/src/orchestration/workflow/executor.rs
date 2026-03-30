@@ -90,6 +90,7 @@ use self::utilities::parse_row_id_key;
 /// * `name` - Transformer name (e.g., "ontology_map")
 /// * `config` - Transformer configuration as JSON
 /// * `data` - Mutable data to transform (input/output)
+/// * `context` - Workflow execution context for lineage and dependency access
 ///
 /// # Returns
 /// A pinned boxed future that resolves to a Result
@@ -98,6 +99,7 @@ pub type TransformerCallback = Box<
             &str,
             &serde_json::Value,
             &mut serde_json::Value,
+            &ExecutionContext,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
         + Send
         + Sync,
@@ -116,7 +118,7 @@ pub type TransformerCallback = Box<
 /// * `key_fields` - Key fields for upsert-capable targets
 ///
 /// # Returns
-/// A pinned boxed future that resolves to Result<u64> (rows loaded)
+/// A pinned boxed future that resolves to Result<DbLoadResult>.
 pub type DbLoaderCallback = Box<
     dyn Fn(
             &str,
@@ -124,10 +126,17 @@ pub type DbLoaderCallback = Box<
             Vec<serde_json::Map<String, serde_json::Value>>,
             &str,
             Option<Vec<String>>,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<u64>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<DbLoadResult>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Result of a DB load callback.
+#[derive(Debug, Clone)]
+pub struct DbLoadResult {
+    pub rows_loaded: u64,
+    pub output_row_ids: Vec<Option<crate::core::lineage::row_level::RowId>>,
+}
 
 /// Result of a DB extract callback.
 #[derive(Debug, Clone)]
@@ -161,6 +170,7 @@ use super::lineage_tracker::StepExecutionRecord;
 use super::lineage_tracker::{FieldModificationRecord, LineageTracker, WorkflowExecutionRecord};
 use super::row_lineage_context::RowLineageContext;
 use super::runtime::frame::{BatchFrame, BatchFrameMetadata};
+use super::runtime::metrics::RuntimeStepMetrics;
 use crate::orchestration::ml::ModelInvoker;
 use crate::orchestration::rules::RuleExecutor;
 
@@ -572,6 +582,8 @@ pub struct StepResult {
     pub completed_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_metadata: Option<BatchFrameMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<RuntimeStepMetrics>,
     #[serde(skip)]
     pub batch_frame: Option<BatchFrame>,
 }

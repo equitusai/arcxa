@@ -173,6 +173,33 @@ impl UnifiedMappingStorage {
         Ok(())
     }
 
+    /// Replace a stored session while keeping indexes consistent.
+    ///
+    /// This is used when conflict resolution or field mappings change and the
+    /// full session document needs to be persisted, not just the status field.
+    pub fn update_session(&self, session: &UnifiedMappingSession) -> Result<()> {
+        let existing = self
+            .get_session(&session.id)?
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session.id))?;
+
+        if existing.status != session.status {
+            let old_status_key = format!("{}:{}", format!("{:?}", existing.status), existing.id);
+            let cf_status_index = self
+                .db
+                .cf_handle(CF_STATUS_INDEX)
+                .context("Status index CF not found")?;
+            self.db
+                .delete_cf(cf_status_index, old_status_key.as_bytes())
+                .context("Failed to delete old status index entry")?;
+        }
+
+        self.store_session(session)?;
+
+        debug!("Updated unified session: {}", session.id);
+
+        Ok(())
+    }
+
     /// List all unified sessions
     ///
     /// Returns sessions ordered by creation time (newest first).
@@ -496,7 +523,7 @@ impl UnifiedMappingStorage {
 mod tests {
     use super::*;
     use crate::mapping::multi_source::types::{
-        ConflictResolution, SourceFieldRef, TargetColumnRef, TargetDatabaseConfig,
+        ConflictResolution, MappingConflict, SourceFieldRef, TargetColumnRef, TargetDatabaseConfig,
         UnifiedFieldMapping, UnifiedLoadJob, UnifiedLoadJobStatus, UnifiedLoadProgress,
     };
     use std::collections::HashMap;
@@ -607,6 +634,47 @@ mod tests {
             UnifiedSessionStatus::ReadyToLoad
         ));
         assert!(retrieved.updated_at > session.updated_at);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_session_persists_conflicts_and_status() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let storage = UnifiedMappingStorage::new(temp_dir.path())?;
+
+        let mut session =
+            create_test_session("unified_001", UnifiedSessionStatus::ConflictsDetected);
+        session.conflicts = vec![MappingConflict {
+            id: "conflict_001".to_string(),
+            ontology_term_uri: "http://example.org/customerEmail".to_string(),
+            conflicting_sources: vec![],
+            target_column: TargetColumnRef {
+                table_name: "customers".to_string(),
+                column_name: "email".to_string(),
+                data_type: "VARCHAR(255)".to_string(),
+            },
+            suggested_resolution: ConflictResolution::NoConflict,
+            resolved: false,
+        }];
+        storage.store_session(&session)?;
+
+        session.conflicts[0].resolved = true;
+        session.status = UnifiedSessionStatus::ReadyToLoad;
+        session.updated_at += 1;
+
+        storage.update_session(&session)?;
+
+        let stored = storage.get_session("unified_001")?.expect("stored session");
+        assert!(matches!(stored.status, UnifiedSessionStatus::ReadyToLoad));
+        assert_eq!(stored.conflicts.len(), 1);
+        assert!(stored.conflicts[0].resolved);
+
+        let ready = storage.list_sessions_by_status(&UnifiedSessionStatus::ReadyToLoad)?;
+        assert_eq!(ready.len(), 1);
+        let conflicts =
+            storage.list_sessions_by_status(&UnifiedSessionStatus::ConflictsDetected)?;
+        assert!(conflicts.is_empty());
 
         Ok(())
     }

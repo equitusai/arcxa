@@ -194,6 +194,7 @@ mod tests {
             schedule_store: None,
             workflow_store: None,
             execution_store: None,
+            stream_executor: None,
             file_library: None,
             kafka_producer: None,
             http_client: None,

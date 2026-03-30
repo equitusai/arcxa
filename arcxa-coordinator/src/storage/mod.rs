@@ -376,7 +376,45 @@ impl LineageStorage {
 
         // Write to storage tiers
         for event in events {
-            self.write_all_internal(event)?;
+            self.write_all_internal_async(event).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Async internal write path used by async callers to avoid blocking within a Tokio runtime.
+    async fn write_all_internal_async(&self, event: LineageEvent) -> Result<()> {
+        match &self.kafka_sink {
+            KafkaSinkType::Legacy(sink) => {
+                sink.write(event.clone())?;
+            }
+            KafkaSinkType::Durable(sink) => {
+                sink.send_with_durability(event.clone()).await?;
+            }
+            KafkaSinkType::Hybrid { legacy, durable } => {
+                let use_durable = if let Some(ref flags) = self.feature_flags {
+                    flags.is_durable_writes_enabled_for_event(
+                        &event.tenant_id,
+                        &event.dataset,
+                        &event.id.to_string(),
+                    )
+                } else {
+                    false
+                };
+
+                if use_durable {
+                    durable.send_with_durability(event.clone()).await?;
+                } else {
+                    legacy.write(event.clone())?;
+                }
+            }
+        }
+
+        self.hot_tier.write(event.clone())?;
+
+        let age_days = (Utc::now() - event.ts).num_days();
+        if age_days > 30 {
+            self.warm_tier.write(event)?;
         }
 
         Ok(())

@@ -20,6 +20,7 @@ use crate::mapping::loader::{DB2Connection, SqlParam, SqlParamType};
 use crate::workflows::db_loader;
 use anyhow::{anyhow, Context, Result};
 use graphica_core::catalog::{types::SourceConfig, Credentials, DataSourceCatalog};
+use graphica_core::core::lineage::row_level::{DatabaseType, RowId};
 use graphica_core::secrets::providers::SecretStoreRegistry;
 use graphica_core::secrets::SecretValue;
 use serde_json;
@@ -566,7 +567,7 @@ fn credentials_from_map(map: &HashMap<String, String>, context: &str) -> Result<
 /// 2. Check for entity_uri in workflow context or row metadata
 /// 3. If entity_uri present and rdf_store available: use OntologyDrivenLoader
 /// 4. Otherwise: use legacy direct loading
-/// 5. Return the number of rows loaded
+/// 5. Return the load result, including best-effort output row identifiers
 pub fn create_db_loader_callback(
     catalog: Arc<dyn DataSourceCatalog>,
     rdf_store: Option<Arc<GraphicaRdfStore>>,
@@ -629,7 +630,7 @@ pub fn create_db_loader_callback(
                             }
                         };
 
-                        return use_ontology_driven_loader(
+                        let rows_loaded = use_ontology_driven_loader(
                             &uri,
                             store,
                             &datasource_id,
@@ -642,7 +643,14 @@ pub fn create_db_loader_callback(
                         .await
                         .with_context(|| {
                             format!("Ontology-driven loading failed for entity: {}", uri)
-                        });
+                        })?;
+
+                        return Ok(
+                            graphica_core::orchestration::workflow::executor::DbLoadResult {
+                                rows_loaded,
+                                output_row_ids: Vec::new(),
+                            },
+                        );
                     } else {
                         tracing::warn!(
                         "Entity URI detected ({}) but no RDF store available, falling back to legacy loading",
@@ -659,12 +667,13 @@ pub fn create_db_loader_callback(
                 );
 
                 let rows = db_loader::common::sanitize_rows_for_database_load(rows);
+                let lineage_rows = rows.clone();
 
                 // Extract connection config
                 let connection_config = &datasource_response.source.connection.config;
 
                 // Match on datasource type and load data
-                match connection_config {
+                let load_result = match connection_config {
                     SourceConfig::DB2(config) => {
                         load_to_db2(config, &credentials, &table_name, rows, &mode).await
                     }
@@ -708,10 +717,156 @@ pub fn create_db_loader_callback(
                         "Unsupported datasource type for DB loading: {:?}",
                         datasource_response.source.source_type
                     )),
-                }
-            }) as Pin<Box<dyn Future<Output = Result<u64>> + Send>>
+                };
+
+                let rows_loaded = load_result.map_err(|error| {
+                    tracing::error!(
+                        "DB Loader Callback failed for datasource={} table={} mode={}: {:#}",
+                        datasource_id,
+                        table_name,
+                        mode,
+                        error
+                    );
+                    error
+                })?;
+
+                let output_row_ids = build_output_row_ids_for_loaded_rows(
+                    &datasource_response.source,
+                    connection_config,
+                    &table_name,
+                    &lineage_rows,
+                    key_fields.as_deref(),
+                    &credentials,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        "Failed to derive DB load output row ids for {}.{}: {}",
+                        datasource_id,
+                        table_name,
+                        error
+                    );
+                    Vec::new()
+                });
+
+                Ok(
+                    graphica_core::orchestration::workflow::executor::DbLoadResult {
+                        rows_loaded,
+                        output_row_ids,
+                    },
+                )
+            })
+                as Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    graphica_core::orchestration::workflow::executor::DbLoadResult,
+                                >,
+                            > + Send,
+                    >,
+                >
         },
     ))
+}
+
+async fn build_output_row_ids_for_loaded_rows(
+    source: &graphica_core::catalog::types::DataSource,
+    connection_config: &SourceConfig,
+    table_name: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    key_fields: Option<&[String]>,
+    credentials: &Credentials,
+) -> Result<Vec<Option<RowId>>> {
+    let database_type = match database_type_for_source_config(connection_config) {
+        Some(database_type) => database_type,
+        None => return Ok(Vec::new()),
+    };
+
+    let effective_key_fields =
+        if let Some(key_fields) = key_fields.filter(|fields| !fields.is_empty()) {
+            key_fields.to_vec()
+        } else if matches!(connection_config, SourceConfig::Oracle(_)) {
+            crate::etl::loaders::database::oracle::query_primary_key_columns(
+                source,
+                table_name,
+                credentials,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
+    if effective_key_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if matches!(connection_config, SourceConfig::Oracle(_)) {
+        return Ok(crate::etl::loaders::database::oracle::build_output_row_ids(
+            table_name,
+            rows,
+            &effective_key_fields,
+        ));
+    }
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            build_database_row_id(
+                database_type.clone(),
+                table_name,
+                row,
+                &effective_key_fields,
+            )
+        })
+        .collect())
+}
+
+fn database_type_for_source_config(connection_config: &SourceConfig) -> Option<DatabaseType> {
+    match connection_config {
+        SourceConfig::DB2(_) => Some(DatabaseType::DB2),
+        SourceConfig::PostgreSQL(_) => Some(DatabaseType::Postgres),
+        SourceConfig::Oracle(_) => Some(DatabaseType::Oracle),
+        SourceConfig::Databricks(_) => Some(DatabaseType::Databricks),
+        SourceConfig::SAPHANA(_) => Some(DatabaseType::SAPHANA),
+        _ => None,
+    }
+}
+
+fn build_database_row_id(
+    database_type: DatabaseType,
+    table_name: &str,
+    row: &serde_json::Map<String, serde_json::Value>,
+    key_fields: &[String],
+) -> Option<RowId> {
+    let mut primary_key = std::collections::BTreeMap::new();
+
+    for key_field in key_fields {
+        let value = row.get(key_field)?;
+        if value.is_null() {
+            return None;
+        }
+        primary_key.insert(key_field.clone(), row_value_to_string(value));
+    }
+
+    if primary_key.is_empty() {
+        return None;
+    }
+
+    Some(RowId::database(
+        database_type,
+        table_name.to_string(),
+        primary_key,
+    ))
+}
+
+fn row_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => value.to_string(),
+    }
 }
 
 /// Convert catalog DB2Config to coordinator DB2Config using resolved credentials.

@@ -47,6 +47,8 @@ pub struct RowLineageStore {
 }
 
 impl RowLineageStore {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
     /// Create a new row lineage store
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let mut opts = Options::default();
@@ -92,9 +94,155 @@ impl RowLineageStore {
             .ok_or_else(|| anyhow::anyhow!("Column family {} not found", name))
     }
 
+    fn new_job_statistics(job_id: &str, start_time: DateTime<Utc>) -> JobStatistics {
+        JobStatistics {
+            job_id: job_id.to_string(),
+            total_rows: 0,
+            success_count: 0,
+            filtered_count: 0,
+            failed_count: 0,
+            filter_reasons: HashMap::new(),
+            avg_processing_time_ms: 0.0,
+            start_time,
+            end_time: None,
+        }
+    }
+
+    fn load_job_statistics(
+        &self,
+        cf_stats: &Arc<BoundColumnFamily<'_>>,
+        job_id: &str,
+        start_time: DateTime<Utc>,
+    ) -> Result<JobStatistics> {
+        let existing = self
+            .db
+            .get_cf(cf_stats, job_id.as_bytes())
+            .context("Failed to read existing job statistics")?;
+
+        if let Some(data) = existing {
+            let mut stats: JobStatistics = bincode::deserialize(&data)?;
+            if start_time < stats.start_time {
+                stats.start_time = start_time;
+            }
+            Ok(stats)
+        } else {
+            Ok(Self::new_job_statistics(job_id, start_time))
+        }
+    }
+
     /// Encode row ID to bytes
     fn encode_row_id(row_id: &RowId) -> Vec<u8> {
         row_id.to_key().into_bytes()
+    }
+
+    fn looks_like_zstd(bytes: &[u8]) -> bool {
+        bytes.starts_with(&Self::ZSTD_MAGIC)
+    }
+
+    fn debug_prefix(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn serialize_row_events(row_events: Vec<RowLineageEvent>) -> Result<Vec<u8>> {
+        let versioned = VersionedData::wrap_vec(row_events);
+        let serialized =
+            serde_json::to_vec(&versioned).context("Failed to serialize row lineage JSON")?;
+
+        if serialized.len() > 1024 {
+            Ok(zstd::encode_all(&serialized[..], 3)?)
+        } else {
+            Ok(serialized)
+        }
+    }
+
+    fn deserialize_row_events_payload(bytes: &[u8]) -> Result<Vec<RowLineageEvent>> {
+        let json_versioned_error =
+            match serde_json::from_slice::<VersionedData<Vec<RowLineageEvent>>>(bytes) {
+                Ok(versioned) => return versioned.unwrap_vec(),
+                Err(error) => error,
+            };
+
+        let json_legacy_error = match serde_json::from_slice::<Vec<RowLineageEvent>>(bytes) {
+            Ok(events) => {
+                tracing::warn!("Deserializing legacy unversioned JSON row lineage data");
+                return Ok(events);
+            }
+            Err(error) => error,
+        };
+
+        let versioned_error = match VersionedData::<Vec<RowLineageEvent>>::deserialize(bytes) {
+            Ok(versioned) => return versioned.unwrap_vec(),
+            Err(error) => error,
+        };
+
+        let legacy_error = match bincode::deserialize(bytes) {
+            Ok(events) => {
+                tracing::warn!("Deserializing legacy unversioned row lineage data");
+                return Ok(events);
+            }
+            Err(error) => error,
+        };
+
+        anyhow::bail!(
+            "Unable to deserialize row lineage payload (len={}, zstd_magic=false, prefix={}, json_versioned_error={}, json_legacy_error={}, versioned_error={}, legacy_error={})",
+            bytes.len(),
+            Self::debug_prefix(bytes),
+            json_versioned_error,
+            json_legacy_error,
+            versioned_error,
+            legacy_error
+        );
+    }
+
+    fn deserialize_row_events(bytes: &[u8]) -> Result<Vec<RowLineageEvent>> {
+        if Self::looks_like_zstd(bytes) {
+            let decompressed =
+                zstd::decode_all(bytes).context("Failed to decompress row lineage payload")?;
+
+            return Self::deserialize_row_events_payload(&decompressed).map_err(|error| {
+                anyhow::anyhow!(
+                    "Unable to deserialize compressed row lineage payload (len={}, decompressed_len={}, prefix={}, error={})",
+                    bytes.len(),
+                    decompressed.len(),
+                    Self::debug_prefix(&decompressed),
+                    error
+                )
+            });
+        }
+
+        Self::deserialize_row_events_payload(bytes)
+    }
+
+    fn append_event_to_row_index(
+        &self,
+        batch: &mut WriteBatch,
+        row_id: &RowId,
+        event: &RowLineageEvent,
+    ) -> Result<()> {
+        let row_key = Self::encode_row_id(row_id);
+        let cf_by_row = self.cf(cf::BY_ROW)?;
+        let existing = self
+            .db
+            .get_cf(&cf_by_row, &row_key)
+            .context("Failed to read existing events")?;
+
+        let mut row_events: Vec<RowLineageEvent> = if let Some(data) = existing {
+            Self::deserialize_row_events(&data).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        row_events.push(event.clone());
+
+        let data = Self::serialize_row_events(row_events)?;
+        batch.put_cf(&cf_by_row, row_key, data);
+
+        Ok(())
     }
 
     /// Decode row ID from bytes
@@ -123,44 +271,13 @@ impl RowLineageStore {
         let mut by_tenant: HashMap<String, Vec<RowId>> = HashMap::new();
         let mut filtered_rows: Vec<(String, RowId, String)> = Vec::new();
 
+        let cf_stats = self.cf(cf::STATS)?;
+
         for event in &events {
-            let row_key = Self::encode_row_id(&event.row_id);
-
-            // Store event by row ID
-            let cf_by_row = self.cf(cf::BY_ROW)?;
-            let existing = self
-                .db
-                .get_cf(&cf_by_row, &row_key)
-                .context("Failed to read existing events")?;
-
-            let mut row_events: Vec<RowLineageEvent> = if let Some(data) = existing {
-                // Try versioned format first, fall back to legacy format for backward compatibility
-                VersionedData::<Vec<RowLineageEvent>>::deserialize(&data)
-                    .and_then(|v| v.unwrap_vec())
-                    .or_else(|_| {
-                        //tracing::warn!("Deserializing legacy unversioned data, migrating to versioned format");
-                        bincode::deserialize(&data)
-                            .map_err(|e| anyhow::anyhow!("Failed to deserialize: {}", e))
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            row_events.push(event.clone());
-
-            // Serialize with version envelope
-            let versioned = VersionedData::wrap_vec(row_events);
-            let serialized = versioned.serialize()?;
-
-            // Compress if large
-            let data = if serialized.len() > 1024 {
-                zstd::encode_all(&serialized[..], 3)?
-            } else {
-                serialized
-            };
-
-            batch.put_cf(&cf_by_row, row_key, data);
+            self.append_event_to_row_index(&mut batch, &event.row_id, event)?;
+            if let Some(output_row_id) = &event.output_row_id {
+                self.append_event_to_row_index(&mut batch, output_row_id, event)?;
+            }
 
             // Index by batch
             by_batch
@@ -190,21 +307,19 @@ impl RowLineageStore {
             }
 
             // Update job statistics
+            if !job_stats.contains_key(&event.job_id) {
+                let stats = self.load_job_statistics(&cf_stats, &event.job_id, event.timestamp)?;
+                job_stats.insert(event.job_id.clone(), stats);
+            }
+
             let stats = job_stats
-                .entry(event.job_id.clone())
-                .or_insert_with(|| JobStatistics {
-                    job_id: event.job_id.clone(),
-                    total_rows: 0,
-                    success_count: 0,
-                    filtered_count: 0,
-                    failed_count: 0,
-                    filter_reasons: HashMap::new(),
-                    avg_processing_time_ms: 0.0,
-                    start_time: event.timestamp,
-                    end_time: None,
-                });
+                .get_mut(&event.job_id)
+                .expect("job statistics should exist after initialization");
 
             stats.total_rows += 1;
+            if event.timestamp < stats.start_time {
+                stats.start_time = event.timestamp;
+            }
             match &event.outcome {
                 ProcessingOutcome::Processed { .. } => stats.success_count += 1,
                 ProcessingOutcome::Filtered { reason, .. } => {
@@ -247,7 +362,6 @@ impl RowLineageStore {
         }
 
         // Write job statistics
-        let cf_stats = self.cf(cf::STATS)?;
         for (job_id, stats) in job_stats {
             batch.put_cf(&cf_stats, job_id.as_bytes(), bincode::serialize(&stats)?);
         }
@@ -303,22 +417,14 @@ impl RowLevelLineageSink for RowLineageStore {
     }
 
     async fn write_rows_batch(&self, events: Vec<RowLineageEvent>) -> Result<()> {
-        // For large batches, write directly
-        if events.len() > 100 {
-            return self.write_events_internal(events).await;
+        if events.is_empty() {
+            return Ok(());
         }
 
-        // For small batches, use buffer
-        let mut buffer = self.write_buffer.lock().await;
-        buffer.extend(events);
-
-        if buffer.len() >= self.max_buffer_size {
-            let events = std::mem::take(&mut *buffer);
-            drop(buffer);
-            self.write_events_internal(events).await?;
-        }
-
-        Ok(())
+        // Batch callers expect the events they just recorded to be queryable
+        // when the workflow step completes, so persist them immediately.
+        self.flush_buffer().await?;
+        self.write_events_internal(events).await
     }
 
     async fn get_row_lineage(&self, row_id: &RowId) -> Result<Vec<RowLineageEvent>> {
@@ -339,19 +445,7 @@ impl RowLevelLineageSink for RowLineageStore {
         tracing::info!("get_row_lineage: data found={}", data.is_some());
 
         if let Some(data) = data {
-            // Try decompression first
-            let decompressed = zstd::decode_all(&data[..]).unwrap_or(data);
-
-            // Try versioned format first, fall back to legacy format for backward compatibility
-            let events = VersionedData::<Vec<RowLineageEvent>>::deserialize(&decompressed)
-                .and_then(|v| v.unwrap_vec())
-                .or_else(|_| {
-                    tracing::warn!("Deserializing legacy unversioned row lineage data");
-                    bincode::deserialize(&decompressed)
-                        .map_err(|e| anyhow::anyhow!("Bincode deserialization failed: {}", e))
-                })?;
-
-            Ok(events)
+            Self::deserialize_row_events(&data)
         } else {
             Ok(Vec::new())
         }
@@ -540,14 +634,7 @@ impl RowLineageStore {
 
         for item in iter {
             let (_key, value) = item.context("Failed to read row lineage iterator item")?;
-            let decompressed = zstd::decode_all(&value[..]).unwrap_or_else(|_| value.to_vec());
-
-            let events = VersionedData::<Vec<RowLineageEvent>>::deserialize(&decompressed)
-                .and_then(|v| v.unwrap_vec())
-                .or_else(|_| {
-                    bincode::deserialize(&decompressed)
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize row lineage: {}", e))
-                })?;
+            let events = Self::deserialize_row_events(&value)?;
 
             count += events
                 .iter()
@@ -577,14 +664,7 @@ impl RowLineageStore {
 
         for item in iter {
             let (key, value) = item.context("Failed to read row lineage iterator item")?;
-            let decompressed = zstd::decode_all(&value[..]).unwrap_or_else(|_| value.to_vec());
-
-            let events = VersionedData::<Vec<RowLineageEvent>>::deserialize(&decompressed)
-                .and_then(|v| v.unwrap_vec())
-                .or_else(|_| {
-                    bincode::deserialize(&decompressed)
-                        .map_err(|e| anyhow::anyhow!("Failed to deserialize row lineage: {}", e))
-                })?;
+            let events = Self::deserialize_row_events(&value)?;
 
             let mut kept_events = Vec::with_capacity(events.len());
             let mut removed_events = Vec::new();
@@ -621,13 +701,7 @@ impl RowLineageStore {
                     }
                 }
             } else {
-                let versioned = VersionedData::wrap_vec(kept_events);
-                let serialized = versioned.serialize()?;
-                let data = if serialized.len() > 1024 {
-                    zstd::encode_all(&serialized[..], 3)?
-                } else {
-                    serialized
-                };
+                let data = Self::serialize_row_events(kept_events)?;
                 batch.put_cf(&cf_by_row, &key, data);
             }
         }
@@ -825,7 +899,39 @@ impl Drop for RowLineageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graphica_core::core::lineage::row_level::DatabaseType;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
+
+    fn build_csv_export_lineage_event() -> (RowId, RowLineageEvent) {
+        let mut primary_key = BTreeMap::new();
+        primary_key.insert("CUSTOMER_ID".to_string(), "CUST001".to_string());
+        let source_row_id = RowId::database(DatabaseType::Oracle, "CUSTOMERS", primary_key);
+
+        let mut event = RowLineageEvent::success_with_step(
+            source_row_id.clone(),
+            "batch-export".to_string(),
+            "job-export".to_string(),
+            Some("export_customers".to_string()),
+            "/app/data/e2e-output/customers_export.csv".to_string(),
+            "tenant-export".to_string(),
+        );
+        event.output_row_id = Some(RowId::csv("/app/data/e2e-output/customers_export.csv", 2));
+
+        let mut transformation =
+            RowTransformation::new("csv_export".to_string(), vec!["_row".to_string()]);
+        let mut after_values = HashMap::new();
+        after_values.insert(
+            "output_path".to_string(),
+            json!("/app/data/e2e-output/customers_export.csv"),
+        );
+        after_values.insert("output_line".to_string(), json!(1));
+        transformation.after_values = Some(after_values);
+        event.add_transformation(transformation);
+
+        (source_row_id, event)
+    }
 
     #[tokio::test]
     async fn test_row_lineage_store() -> Result<()> {
@@ -864,6 +970,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_rows_batch_is_immediately_queryable() -> Result<()> {
+        let dir = tempdir()?;
+        let store = RowLineageStore::new(dir.path())?;
+
+        let row_id = RowId::csv("batch.csv", 1);
+        let event = RowLineageEvent::success(
+            row_id.clone(),
+            "batch-visible".to_string(),
+            "job-visible".to_string(),
+            "/output/batch.csv".to_string(),
+            "tenant-visible".to_string(),
+        );
+
+        store.write_rows_batch(vec![event]).await?;
+
+        let events = store.get_row_lineage(&row_id).await?;
+        assert_eq!(events.len(), 1);
+
+        let stats = store.get_job_stats("job-visible").await?;
+        assert_eq!(stats.total_rows, 1);
+        assert_eq!(stats.success_count, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_rows_batch_with_csv_export_lineage_payload_is_queryable() -> Result<()> {
+        let dir = tempdir()?;
+        let store = RowLineageStore::new(dir.path())?;
+
+        let (source_row_id, event) = build_csv_export_lineage_event();
+
+        store.write_rows_batch(vec![event]).await?;
+
+        let events = store.get_row_lineage(&source_row_id).await?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].step_id.as_deref(), Some("export_customers"));
+        assert!(events[0].output_row_id.is_some());
+        assert_eq!(events[0].transformations.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_rows_batch_is_queryable_by_output_row_id() -> Result<()> {
+        let dir = tempdir()?;
+        let store = RowLineageStore::new(dir.path())?;
+
+        let (source_row_id, event) = build_csv_export_lineage_event();
+        let output_row_id = event
+            .output_row_id
+            .clone()
+            .expect("csv export test event should have output row id");
+
+        store.write_rows_batch(vec![event]).await?;
+
+        let source_events = store.get_row_lineage(&source_row_id).await?;
+        assert_eq!(source_events.len(), 1);
+
+        let output_events = store.get_row_lineage(&output_row_id).await?;
+        assert_eq!(output_events.len(), 1);
+        assert_eq!(
+            output_events[0].step_id.as_deref(),
+            Some("export_customers")
+        );
+        assert_eq!(output_events[0].row_id, source_row_id);
+        assert_eq!(
+            output_events[0].output_row_id.as_ref().map(RowId::to_key),
+            Some(output_row_id.to_key())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialize_row_events_roundtrip_with_csv_export_lineage_payload() -> Result<()> {
+        let (_source_row_id, event) = build_csv_export_lineage_event();
+        let bytes = RowLineageStore::serialize_row_events(vec![event])?;
+        let events = RowLineageStore::deserialize_row_events(&bytes)?;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].step_id.as_deref(), Some("export_customers"));
+        assert!(events[0].output_row_id.is_some());
+        assert_eq!(events[0].transformations.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_rows_batch_stores_expected_raw_bytes_for_csv_export_payload() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let store = RowLineageStore::new(dir.path())?;
+        let (source_row_id, event) = build_csv_export_lineage_event();
+        let expected = RowLineageStore::serialize_row_events(vec![event.clone()])?;
+
+        store.write_rows_batch(vec![event]).await?;
+
+        let cf_by_row = store.cf(cf::BY_ROW)?;
+        let stored = store
+            .db
+            .get_cf(&cf_by_row, RowLineageStore::encode_row_id(&source_row_id))?
+            .expect("row lineage bytes should exist");
+
+        assert_eq!(stored, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_filtered_rows() -> Result<()> {
         let dir = tempdir()?;
         let store = RowLineageStore::new(dir.path())?;
@@ -890,6 +1106,46 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, row_id);
         assert_eq!(filtered[0].1, "Status is inactive");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_job_stats_accumulate_across_multiple_writes() -> Result<()> {
+        let dir = tempdir()?;
+        let store = RowLineageStore::new(dir.path())?;
+
+        let success_event = RowLineageEvent::success(
+            RowId::csv("customers.csv", 1),
+            "batch-success".to_string(),
+            "job-accumulate".to_string(),
+            "/output/customers.csv".to_string(),
+            "tenant-a".to_string(),
+        );
+        store.write_rows_batch(vec![success_event]).await?;
+
+        let filtered_event = RowLineageEvent::filtered(
+            RowId::csv("customers.csv", 2),
+            "batch-filtered".to_string(),
+            "job-accumulate".to_string(),
+            "Duplicate removed using First strategy".to_string(),
+            "deduplication".to_string(),
+            "tenant-a".to_string(),
+        );
+        store.write_row(filtered_event).await?;
+        store.flush_buffer().await?;
+
+        let stats = store.get_job_stats("job-accumulate").await?;
+        assert_eq!(stats.total_rows, 2);
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.filtered_count, 1);
+        assert_eq!(stats.failed_count, 0);
+        assert_eq!(
+            stats
+                .filter_reasons
+                .get("Duplicate removed using First strategy"),
+            Some(&1),
+        );
 
         Ok(())
     }

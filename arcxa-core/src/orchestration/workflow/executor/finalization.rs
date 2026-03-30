@@ -96,6 +96,7 @@ impl WorkflowExecutor {
             started_at: step_result.started_at,
             completed_at: step_result.completed_at,
             batch_metadata: step_result.batch_metadata.clone(),
+            runtime_metrics: step_result.runtime_metrics.clone(),
             batch_frame: None,
         }
     }

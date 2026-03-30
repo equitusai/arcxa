@@ -6,17 +6,18 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(feature = "workflow-storage")]
-use rocksdb::{IteratorMode, WriteBatch, DB};
+use rocksdb::DB;
 
 use super::error::{Result, WorkflowError};
-use super::runtime::spill::{StorageTieringPlan, StorageTieringPolicy};
-use arrow2::datatypes::Schema;
+#[cfg(feature = "workflow-storage")]
+pub use super::runtime::spill::StorageManager;
+use super::runtime::spill::{parquet as parquet_backend, store_inline_rows, StorageTieringPolicy};
 
 /// Row storage abstraction with automatic tiering
 #[derive(Debug, Clone)]
@@ -112,57 +113,13 @@ pub struct FieldSchema {
 }
 
 impl RowStorage {
-    fn inline_storage_from_plan(
-        rows: Vec<serde_json::Value>,
-        plan: StorageTieringPlan,
-        row_count: usize,
-        estimated_size: usize,
-    ) -> Self {
-        match plan {
-            StorageTieringPlan::InMemory => {
-                tracing::debug!("Using InMemory storage for {} rows", row_count);
-                RowStorage::InMemory {
-                    rows: Arc::new(rows),
-                }
-            }
-            StorageTieringPlan::Shared => {
-                tracing::debug!(
-                    "Using Shared storage for {} rows ({} bytes)",
-                    row_count,
-                    estimated_size
-                );
-                RowStorage::Shared {
-                    rows: Arc::new(RwLock::new(rows)),
-                    version: 0,
-                }
-            }
-            StorageTieringPlan::RocksDb | StorageTieringPlan::Parquet => {
-                tracing::warn!(
-                    "Dataset planned for {:?} storage ({} rows, {} bytes) is using Shared storage because StorageManager is not available.",
-                    plan,
-                    row_count,
-                    estimated_size
-                );
-                RowStorage::Shared {
-                    rows: Arc::new(RwLock::new(rows)),
-                    version: 0,
-                }
-            }
-        }
-    }
-
     /// Create storage from rows with automatic tiering
     pub fn from_rows(rows: Vec<serde_json::Value>) -> Result<Self> {
         let row_count = rows.len();
         let estimated_size = estimate_memory_size(&rows);
         let plan = StorageTieringPolicy::default().plan(row_count, estimated_size);
 
-        Ok(Self::inline_storage_from_plan(
-            rows,
-            plan,
-            row_count,
-            estimated_size,
-        ))
+        Ok(store_inline_rows(rows, plan, row_count, estimated_size))
     }
 
     /// Get the number of rows
@@ -288,9 +245,24 @@ impl Iterator for RowIterator {
                 }
                 self.buffer.pop().map(Ok)
             }
-            RowStorage::Parquet { .. } => {
-                // TODO: Implement Parquet streaming
-                None
+            RowStorage::Parquet {
+                path,
+                index,
+                row_count,
+                ..
+            } => {
+                if self.buffer.is_empty() && self.current < *row_count {
+                    let end = std::cmp::min(self.current + self.batch_size, *row_count);
+                    match parquet_backend::read_parquet_range(path, index, self.current, end) {
+                        Ok(mut rows) => {
+                            rows.reverse();
+                            self.buffer = rows;
+                            self.current = end;
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                self.buffer.pop().map(Ok)
             }
         }
     }
@@ -388,12 +360,7 @@ impl RowAccessor {
                 }
                 Ok(result)
             }
-            RowStorage::Parquet { .. } => {
-                // TODO: Implement Parquet reading
-                Err(WorkflowError::NotImplemented(
-                    "Parquet reading not yet implemented".into(),
-                ))
-            }
+            RowStorage::Parquet { path, .. } => parquet_backend::read_parquet_rows(path),
         }
     }
 
@@ -413,9 +380,11 @@ impl RowAccessor {
                     .transpose()
                     .map_err(|e| WorkflowError::Serialization(e.to_string()))
             }
-            RowStorage::Parquet { .. } => Err(WorkflowError::NotImplemented(
-                "Parquet random access not yet implemented".into(),
-            )),
+            RowStorage::Parquet {
+                path,
+                index: parquet_index,
+                ..
+            } => parquet_backend::read_parquet_row(path, parquet_index, index),
         }
     }
 
@@ -427,172 +396,6 @@ impl RowAccessor {
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.storage.is_empty()
-    }
-}
-
-/// Storage manager for lifecycle management
-#[cfg(feature = "workflow-storage")]
-pub struct StorageManager {
-    /// RocksDB instance (shared across workflows)
-    rocks_db: Arc<DB>,
-
-    /// Temporary directory for Parquet files
-    pub temp_dir: PathBuf,
-
-    /// Active storage handles for cleanup
-    active_storage: Arc<RwLock<HashMap<String, StorageEntry>>>,
-}
-
-#[cfg(feature = "workflow-storage")]
-enum StorageEntry {
-    RocksDB(Arc<RowStorageHandle>),
-    Parquet(PathBuf),
-}
-
-#[cfg(feature = "workflow-storage")]
-impl StorageManager {
-    pub fn new(rocks_path: &Path, temp_dir: &Path) -> Result<Self> {
-        let rocks_db = Arc::new(
-            DB::open_default(rocks_path).map_err(|e| WorkflowError::Storage(e.to_string()))?,
-        );
-
-        Ok(Self {
-            rocks_db,
-            temp_dir: temp_dir.to_path_buf(),
-            active_storage: Arc::new(RwLock::new(HashMap::new())),
-        })
-    }
-
-    /// Get RocksDB handle for external use (e.g., streaming deduplicator)
-    pub fn rocks_db(&self) -> Arc<DB> {
-        self.rocks_db.clone()
-    }
-
-    /// Create RocksDB storage for a step
-    #[cfg(feature = "workflow-storage")]
-    pub fn create_rocks_storage(
-        &self,
-        execution_id: &str,
-        step_id: &str,
-        rows: Vec<serde_json::Value>,
-    ) -> Result<RowStorage> {
-        let prefix = format!("{}/{}", execution_id, step_id);
-        let row_count = rows.len();
-
-        // Write rows to RocksDB
-        let mut batch = WriteBatch::default();
-        for (i, row) in rows.iter().enumerate() {
-            let key = format!("{}/{}", prefix, i);
-            let value =
-                serde_json::to_vec(row).map_err(|e| WorkflowError::Serialization(e.to_string()))?;
-            batch.put(key.as_bytes(), &value);
-        }
-
-        self.rocks_db
-            .write(batch)
-            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-
-        let handle = Arc::new(RowStorageHandle {
-            db: self.rocks_db.clone(),
-            execution_id: execution_id.to_string(),
-            step_id: step_id.to_string(),
-            created_at: Instant::now(),
-        });
-
-        // Track for cleanup
-        self.active_storage
-            .write()
-            .insert(prefix.clone(), StorageEntry::RocksDB(handle.clone()));
-
-        Ok(RowStorage::RocksDB {
-            handle,
-            prefix,
-            row_count,
-        })
-    }
-
-    /// Store rows with automatic tiering
-    pub fn store_rows(
-        &self,
-        execution_id: &str,
-        step_id: &str,
-        rows: Vec<serde_json::Value>,
-    ) -> Result<RowStorage> {
-        let row_count = rows.len();
-        let estimated_size = estimate_memory_size(&rows);
-        let plan = StorageTieringPolicy::default().plan(row_count, estimated_size);
-
-        match plan {
-            StorageTieringPlan::InMemory | StorageTieringPlan::Shared => Ok(
-                RowStorage::inline_storage_from_plan(rows, plan, row_count, estimated_size),
-            ),
-            StorageTieringPlan::RocksDb => self.create_rocks_storage(execution_id, step_id, rows),
-            StorageTieringPlan::Parquet => {
-                // TODO: Implement Parquet storage
-                tracing::warn!(
-                    "Dataset planned for Parquet storage ({} rows, {} bytes) is falling back to RocksDB until Parquet spill is implemented.",
-                    row_count,
-                    estimated_size
-                );
-                self.create_rocks_storage(execution_id, step_id, rows)
-            }
-        }
-    }
-
-    /// Cleanup storage for an execution
-    pub fn cleanup_execution(&self, execution_id: &str) -> Result<()> {
-        let mut storage = self.active_storage.write();
-        let prefix = format!("{}/", execution_id);
-
-        // Find all entries for this execution
-        let keys_to_remove: Vec<String> = storage
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .cloned()
-            .collect();
-
-        for key in keys_to_remove {
-            if let Some(entry) = storage.remove(&key) {
-                match entry {
-                    StorageEntry::RocksDB(_) => {
-                        // Delete all keys with this prefix from RocksDB
-                        self.delete_rocks_prefix(&key)?;
-                    }
-                    StorageEntry::Parquet(path) => {
-                        // Delete Parquet file
-                        if path.exists() {
-                            std::fs::remove_file(path)
-                                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn delete_rocks_prefix(&self, prefix: &str) -> Result<()> {
-        let prefix_bytes = prefix.as_bytes();
-        let iter = self.rocks_db.iterator(IteratorMode::From(
-            prefix_bytes,
-            rocksdb::Direction::Forward,
-        ));
-
-        let mut batch = WriteBatch::default();
-        for item in iter {
-            let (key, _) = item.map_err(|e| WorkflowError::Storage(e.to_string()))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            batch.delete(&key);
-        }
-
-        self.rocks_db
-            .write(batch)
-            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-
-        Ok(())
     }
 }
 

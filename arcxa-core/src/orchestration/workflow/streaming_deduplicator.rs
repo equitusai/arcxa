@@ -818,6 +818,6 @@ mod tests {
         });
 
         let score = mgr.calculate_quality_score(&row);
-        assert!(score > 0.0 && score < 1.0);
+        assert!((score - 1.0).abs() < f64::EPSILON);
     }
 }

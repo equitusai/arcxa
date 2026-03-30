@@ -1,10 +1,10 @@
-"""Unified mapping API for consolidating multiple data sources."""
+"""Mapping APIs for source analysis and unified consolidation."""
 
 from typing import Any, Dict, List, Optional
 
 
 class MappingAPI:
-    """Manage unified field mappings across multiple CSV sources."""
+    """Manage source mapping sessions and unified multi-source mappings."""
 
     def __init__(self, client: Any):
         self._client = client
@@ -114,7 +114,7 @@ class MappingAPI:
         self,
         session_id: str,
         database_type: str,
-        connection_config: Dict[str, Any],
+        connection_config: Optional[Dict[str, Any]] = None,
         create_tables: bool = True,
         validate_data: bool = True,
         batch_size: int = 1000,
@@ -124,18 +124,19 @@ class MappingAPI:
         Args:
             session_id: Session to load
             database_type: "postgre_s_q_l", "d_b2", or "oracle"
-            connection_config: Database connection details
+            connection_config: Database connection details when required by the target backend
             create_tables: Create tables if they don't exist
             validate_data: Validate data before loading
             batch_size: Batch size for bulk loading
         """
         data = {
             "database_type": database_type,
-            "connection_config": connection_config,
             "create_tables": create_tables,
             "validate_data": validate_data,
             "batch_size": batch_size,
         }
+        if connection_config is not None:
+            data["connection_config"] = connection_config
         return self._client.post(
             f"{self._base}/unified-sessions/{session_id}/load",
             json=data,
@@ -148,3 +149,125 @@ class MappingAPI:
     def statistics(self) -> Dict[str, Any]:
         """Get global statistics for all unified sessions."""
         return self._client.get(f"{self._base}/unified-sessions/statistics")
+
+    def analyze_datasource_for_mapping(
+        self,
+        source_id: str,
+        *,
+        user_id: str,
+        tables: Optional[List[str]] = None,
+        sample_size: Optional[int] = None,
+        auto_approve_threshold: Optional[float] = None,
+        min_confidence: Optional[float] = None,
+        max_candidates: Optional[int] = None,
+        ontology_namespaces: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Analyze one datasource and create a source mapping session."""
+        data: Dict[str, Any] = {"user_id": user_id}
+        if tables is not None:
+            data["tables"] = tables
+        if sample_size is not None:
+            data["sample_size"] = sample_size
+        if auto_approve_threshold is not None:
+            data["auto_approve_threshold"] = auto_approve_threshold
+        if min_confidence is not None:
+            data["min_confidence"] = min_confidence
+        if max_candidates is not None:
+            data["max_candidates"] = max_candidates
+        if ontology_namespaces is not None:
+            data["ontology_namespaces"] = ontology_namespaces
+        return self._client.post(
+            f"/api/v1/datasources/{source_id}/analyze-for-mapping",
+            json=data,
+        )
+
+    def analyze_dataset_for_mapping(
+        self,
+        dataset_id: str,
+        *,
+        user_id: str,
+        tables: Optional[List[str]] = None,
+        sample_size: Optional[int] = None,
+        auto_approve_threshold: Optional[float] = None,
+        min_confidence: Optional[float] = None,
+        max_candidates: Optional[int] = None,
+        ontology_namespaces: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Analyze one managed dataset and create a source mapping session."""
+        data: Dict[str, Any] = {"user_id": user_id}
+        if tables is not None:
+            data["tables"] = tables
+        if sample_size is not None:
+            data["sample_size"] = sample_size
+        if auto_approve_threshold is not None:
+            data["auto_approve_threshold"] = auto_approve_threshold
+        if min_confidence is not None:
+            data["min_confidence"] = min_confidence
+        if max_candidates is not None:
+            data["max_candidates"] = max_candidates
+        if ontology_namespaces is not None:
+            data["ontology_namespaces"] = ontology_namespaces
+        return self._client.post(
+            f"/api/v1/datasets/{dataset_id}/analyze-for-mapping",
+            json=data,
+        )
+
+    def get_source_session(self, session_id: str) -> Dict[str, Any]:
+        """Get a datasource-backed source mapping session by ID."""
+        return self._client.get(f"{self._base}/sessions/{session_id}")
+
+    def review_source_session(
+        self,
+        session_id: str,
+        *,
+        field_mappings: List[Dict[str, Any]],
+        reviewed_by: str,
+        finalize: bool = False,
+    ) -> Dict[str, Any]:
+        """Review field mappings for a source mapping session."""
+        return self._client.post(
+            f"{self._base}/sessions/{session_id}/review",
+            json={
+                "field_mappings": field_mappings,
+                "reviewed_by": reviewed_by,
+                "finalize": finalize,
+            },
+        )
+
+    def apply_source_session(
+        self,
+        session_id: str,
+        *,
+        create_default_import: bool = False,
+    ) -> Dict[str, Any]:
+        """Apply an approved source mapping session to the RDF/governance store."""
+        return self._client.post(
+            f"{self._base}/sessions/{session_id}/apply",
+            json={"create_default_import": create_default_import},
+        )
+
+    def import_source_session(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        batch_size: int = 1000,
+        target_graph: Optional[str] = None,
+        tables: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Import data using an applied source mapping session."""
+        data: Dict[str, Any] = {
+            "user_id": user_id,
+            "batch_size": batch_size,
+        }
+        if target_graph is not None:
+            data["target_graph"] = target_graph
+        if tables is not None:
+            data["tables"] = tables
+        if limit is not None:
+            data["limit"] = limit
+        return self._client.post(
+            f"{self._base}/sessions/{session_id}/import",
+            json=data,
+        )

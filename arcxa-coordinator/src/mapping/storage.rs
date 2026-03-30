@@ -955,6 +955,7 @@ mod tests {
 
         // Valid transitions
         assert!(Draft.can_transition_to(PendingReview));
+        assert!(Draft.can_transition_to(Approved));
         assert!(Draft.can_transition_to(Cancelled));
         assert!(PendingReview.can_transition_to(Approved));
         assert!(PendingReview.can_transition_to(Draft));

@@ -285,12 +285,7 @@ impl OracleLoader {
                     {
                         if let Some(value) = row.values.get(&source_ref.field_name) {
                             return Some(SourceValue {
-                                source_id: format!(
-                                    "{}.{}.{}",
-                                    source_ref.datasource_id,
-                                    source_ref.table_name,
-                                    source_ref.field_name
-                                ),
+                                source_id: source_ref.canonical_source_id(),
                                 value: value.clone(),
                                 confidence: Some(mapping.confidence),
                             });

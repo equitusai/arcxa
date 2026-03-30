@@ -30,8 +30,8 @@ pub use data_source_reader::{
     S3ObjectReader, SourceMetadata,
 };
 pub use execution::{
-    ExecutionFilters, ExecutionLog, ExecutionStatus, LogLevel, PersistedStepResult,
-    WorkflowExecution,
+    ExecutionFilters, ExecutionLog, ExecutionRuntimeMetricsSummary, ExecutionStatus, LogLevel,
+    PersistedStepResult, WorkflowExecution,
 };
 pub use execution_mode::{
     AutoScalingConfig, ExecutionMode, MicroBatchConfig, ResourceEstimate, StateBackendConfig,

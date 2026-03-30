@@ -292,6 +292,28 @@ pub struct SourceFieldRef {
     pub source_data_type: String,
 }
 
+impl SourceFieldRef {
+    /// Canonical identifier for this source field.
+    ///
+    /// This is the identifier format used during runtime conflict resolution.
+    pub fn canonical_source_id(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            self.datasource_id, self.table_name, self.field_name
+        )
+    }
+
+    /// Legacy and shorthand identifiers accepted for backward compatibility.
+    pub fn source_id_aliases(&self) -> Vec<String> {
+        vec![
+            self.canonical_source_id(),
+            format!("{}.{}", self.datasource_id, self.field_name),
+            format!("{}.{}", self.session_id, self.field_name),
+            self.field_name.clone(),
+        ]
+    }
+}
+
 /// Reference to a target database column
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct TargetColumnRef {

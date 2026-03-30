@@ -114,7 +114,7 @@ impl DurableKafkaLineageSink {
     }
 
     /// Send event with durability guarantee
-    async fn send_with_durability(&self, event: LineageEvent) -> Result<()> {
+    pub(crate) async fn send_with_durability(&self, event: LineageEvent) -> Result<()> {
         // Step 1: Generate unique event ID for idempotency
         let event_id = Uuid::new_v4();
 

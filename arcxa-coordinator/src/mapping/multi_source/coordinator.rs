@@ -305,15 +305,13 @@ impl UnifiedMappingCoordinator {
         target_database: &TargetDatabaseConfig,
         field_infos: &[(String, FieldInfo)],
     ) -> Result<TargetColumnRef> {
-        // Extract local name from ontology URI
-        let column_name = self.extract_local_name_from_uri(ontology_term_uri);
-
-        // Determine table name (use first field's table name as default)
-        let table_name = if let Some((_, field_info)) = field_infos.first() {
-            field_info.table_name.clone()
-        } else {
-            "default_table".to_string()
-        };
+        // Extract local name from ontology URI and build matching candidates.
+        let ontology_local_name = self.extract_local_name_from_uri(ontology_term_uri);
+        let mut column_candidates = Vec::new();
+        self.push_identifier_candidate(&mut column_candidates, &ontology_local_name);
+        for (_, field_info) in field_infos {
+            self.push_identifier_candidate(&mut column_candidates, &field_info.field_name);
+        }
 
         // Determine data type (use first field's data type)
         let data_type = if let Some((_, field_info)) = field_infos.first() {
@@ -322,19 +320,18 @@ impl UnifiedMappingCoordinator {
             "VARCHAR(255)".to_string()
         };
 
-        // Check if target table exists in configuration
-        if let Some(table_config) = target_database.tables.get(&table_name) {
-            // Check if column exists in table configuration
-            if let Some(column_config) = table_config.columns.get(&column_name) {
-                return Ok(TargetColumnRef {
-                    table_name,
-                    column_name,
-                    data_type: column_config.data_type.clone(),
-                });
-            }
+        if let Some(target_column) =
+            self.find_target_column_match(target_database, &column_candidates)
+        {
+            return Ok(target_column);
         }
 
-        // Default: create column reference based on inference
+        let table_name = self.preferred_target_table_name(target_database, field_infos);
+        let column_name = column_candidates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default_column".to_string());
+
         Ok(TargetColumnRef {
             table_name,
             column_name,
@@ -349,6 +346,100 @@ impl UnifiedMappingCoordinator {
     /// - http://example.com/ontology#name -> name
     fn extract_local_name_from_uri(&self, uri: &str) -> String {
         crate::mapping::uri_utils::extract_local_name(uri).unwrap_or_else(|| uri.to_string())
+    }
+
+    fn push_identifier_candidate(&self, candidates: &mut Vec<String>, raw: &str) {
+        for candidate in [raw.trim().to_string(), self.to_snake_case(raw)] {
+            if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    fn preferred_target_table_name(
+        &self,
+        target_database: &TargetDatabaseConfig,
+        field_infos: &[(String, FieldInfo)],
+    ) -> String {
+        if target_database.tables.len() == 1 {
+            return target_database
+                .tables
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "default_table".to_string());
+        }
+
+        field_infos
+            .first()
+            .map(|(_, field_info)| field_info.table_name.clone())
+            .unwrap_or_else(|| "default_table".to_string())
+    }
+
+    fn find_target_column_match(
+        &self,
+        target_database: &TargetDatabaseConfig,
+        column_candidates: &[String],
+    ) -> Option<TargetColumnRef> {
+        for (table_name, table_config) in &target_database.tables {
+            for candidate in column_candidates {
+                if let Some(column_config) = table_config.columns.get(candidate) {
+                    return Some(TargetColumnRef {
+                        table_name: table_name.clone(),
+                        column_name: column_config.name.clone(),
+                        data_type: column_config.data_type.clone(),
+                    });
+                }
+            }
+
+            for (configured_name, column_config) in &table_config.columns {
+                let configured_key = self.normalize_identifier_key(configured_name);
+                if column_candidates
+                    .iter()
+                    .any(|candidate| self.normalize_identifier_key(candidate) == configured_key)
+                {
+                    return Some(TargetColumnRef {
+                        table_name: table_name.clone(),
+                        column_name: column_config.name.clone(),
+                        data_type: column_config.data_type.clone(),
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    fn normalize_identifier_key(&self, value: &str) -> String {
+        value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+
+    fn to_snake_case(&self, value: &str) -> String {
+        let mut result = String::new();
+        let mut previous_was_separator = false;
+
+        for (index, ch) in value.trim().chars().enumerate() {
+            if ch.is_ascii_alphanumeric() {
+                if ch.is_ascii_uppercase() {
+                    if index > 0 && !previous_was_separator && !result.ends_with('_') {
+                        result.push('_');
+                    }
+                    result.push(ch.to_ascii_lowercase());
+                } else {
+                    result.push(ch.to_ascii_lowercase());
+                }
+                previous_was_separator = false;
+            } else if !result.is_empty() && !result.ends_with('_') {
+                result.push('_');
+                previous_was_separator = true;
+            }
+        }
+
+        result.trim_matches('_').to_string()
     }
 
     /// Normalize data type to SQL standard
@@ -392,7 +483,12 @@ impl UnifiedMappingCoordinator {
         let primary_source = field_infos
             .iter()
             .max_by(|(_, a), (_, b)| a.confidence.partial_cmp(&b.confidence).unwrap())
-            .map(|(_, info)| format!("{}.{}", info.datasource_id, info.field_name))
+            .map(|(_, info)| {
+                format!(
+                    "{}.{}.{}",
+                    info.datasource_id, info.table_name, info.field_name
+                )
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         Ok(MappingConflict {
@@ -438,7 +534,12 @@ impl UnifiedMappingCoordinator {
         let primary_source = field_infos
             .iter()
             .max_by(|(_, a), (_, b)| a.confidence.partial_cmp(&b.confidence).unwrap())
-            .map(|(_, info)| format!("{}.{}", info.datasource_id, info.field_name))
+            .map(|(_, info)| {
+                format!(
+                    "{}.{}.{}",
+                    info.datasource_id, info.table_name, info.field_name
+                )
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         Ok(UnifiedFieldMapping {
@@ -473,6 +574,11 @@ impl UnifiedMappingCoordinator {
     ) -> Result<()> {
         self.unified_storage
             .update_session_status(session_id, status)
+    }
+
+    /// Persist a fully updated unified session.
+    pub fn update_unified_session(&self, session: &UnifiedMappingSession) -> Result<()> {
+        self.unified_storage.update_session(session)
     }
 
     /// Create and persist a load job for a unified session.
@@ -946,6 +1052,73 @@ mod tests {
         assert_eq!(coordinator.normalize_data_type("BOOL"), "BOOLEAN");
         assert_eq!(coordinator.normalize_data_type("DATE"), "DATE");
         assert_eq!(coordinator.normalize_data_type("TIMESTAMP"), "TIMESTAMP");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_unified_session_prefers_configured_target_table_and_column() -> Result<()>
+    {
+        let (coordinator, _source_dir, _unified_dir) = create_test_coordinator()?;
+
+        let source_session = create_test_mapping_session(
+            "session_001",
+            "csv_001",
+            "customer_id",
+            "http://example.org/ontology#customerId",
+            0.95,
+        );
+        coordinator.source_storage.store_session(&source_session)?;
+
+        let mut target_columns = HashMap::new();
+        target_columns.insert(
+            "customer_id".to_string(),
+            TargetColumnConfig {
+                name: "customer_id".to_string(),
+                data_type: "TEXT".to_string(),
+                nullable: false,
+                is_primary_key: true,
+                default_value: None,
+            },
+        );
+
+        let mut target_tables = HashMap::new();
+        target_tables.insert(
+            "arcxa_mcp_unified_target".to_string(),
+            TargetTableConfig {
+                name: "arcxa_mcp_unified_target".to_string(),
+                columns: target_columns,
+                primary_keys: vec!["customer_id".to_string()],
+                foreign_keys: vec![],
+            },
+        );
+
+        let target_database = TargetDatabaseConfig {
+            datasource_id: "target_postgres".to_string(),
+            schema: "public".to_string(),
+            tables: target_tables,
+        };
+
+        let request = CreateUnifiedSessionRequest {
+            source_session_ids: vec!["session_001".to_string()],
+            target_database,
+            created_by: "test_user".to_string(),
+        };
+
+        let response = coordinator.create_unified_session(request).await?;
+        let unified_session = coordinator
+            .get_unified_session(&response.session_id)?
+            .expect("stored unified session");
+
+        assert_eq!(unified_session.field_mappings.len(), 1);
+        assert_eq!(
+            unified_session.field_mappings[0].target_column.table_name,
+            "arcxa_mcp_unified_target"
+        );
+        assert_eq!(
+            unified_session.field_mappings[0].target_column.column_name,
+            "customer_id"
+        );
 
         Ok(())
     }

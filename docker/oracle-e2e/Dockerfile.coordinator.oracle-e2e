@@ -1,0 +1,113 @@
+# syntax=docker/dockerfile:1.7
+
+FROM icr.io/db2_community/db2:11.5.9.0 AS rust-builder
+
+ARG CARGO_PROFILE=e2e
+ARG PROTOC_VERSION=29.3
+ARG RUST_VERSION=1.91.1
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN yum --disablerepo='*' --enablerepo=ubi-8-baseos-rpms --enablerepo=ubi-8-appstream-rpms --enablerepo=ubi-8-codeready-builder-rpms install -y \
+      clang \
+      cmake \
+      curl \
+      cyrus-sasl-devel \
+      findutils \
+      gcc \
+      gcc-c++ \
+      make \
+      openssl-devel \
+      pkgconf-pkg-config \
+      tar \
+      unixODBC-devel \
+      unzip \
+      which \
+    && curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local \
+    && rm -f /tmp/rustup-init.sh /tmp/protoc.zip \
+    && yum clean all
+
+WORKDIR /build
+
+COPY Cargo.toml ./Cargo.toml
+COPY proto ./proto
+COPY arcxa-core ./arcxa-core
+COPY arcxa-coordinator ./arcxa-coordinator
+COPY arcxa-migrations ./arcxa-migrations
+COPY arcxa-cli ./arcxa-cli
+COPY arcxa-model-service ./arcxa-model-service
+
+WORKDIR /build/arcxa-coordinator
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --profile "${CARGO_PROFILE}" --bin arcxa-coordinator --features odbc \
+    && cp "/build/target/${CARGO_PROFILE}/arcxa-coordinator" /tmp/arcxa-coordinator
+
+FROM icr.io/db2_community/db2:11.5.9.0
+
+ARG ORACLE_IC_BASE_URL=https://yum.oracle.com/repo/OracleLinux/OL8/oracle/instantclient/x86_64/getPackage
+ARG ORACLE_IC_BASICLITE_RPM=oracle-instantclient19.30-basiclite-19.30.0.0.0-1.el8.x86_64.rpm
+ARG ORACLE_IC_ODBC_RPM=oracle-instantclient19.30-odbc-19.30.0.0.0-1.el8.x86_64.rpm
+ARG ORACLE_LIBNSL_URL=https://yum.oracle.com/repo/OracleLinux/OL8/baseos/developer/x86_64/getPackage/libnsl-2.28-225.0.2.el8.x86_64.rpm
+
+RUN yum --disablerepo='*' --enablerepo=ubi-8-baseos-rpms --enablerepo=ubi-8-appstream-rpms install -y \
+      unixODBC \
+    && curl -fsSL "${ORACLE_LIBNSL_URL}" -o /tmp/libnsl.el8.x86_64.rpm \
+    && curl -fsSL "${ORACLE_IC_BASE_URL}/${ORACLE_IC_BASICLITE_RPM}" -o "/tmp/${ORACLE_IC_BASICLITE_RPM}" \
+    && curl -fsSL "${ORACLE_IC_BASE_URL}/${ORACLE_IC_ODBC_RPM}" -o "/tmp/${ORACLE_IC_ODBC_RPM}" \
+    && rpm -Uvh --nodeps /tmp/libnsl.el8.x86_64.rpm "/tmp/${ORACLE_IC_BASICLITE_RPM}" "/tmp/${ORACLE_IC_ODBC_RPM}" \
+    && ORACLE_LIB_DIR="$(find /usr/lib/oracle -type d -path '*/client64/lib' | sort | tail -n 1)" \
+    && SQORA_LIB="$(find "${ORACLE_LIB_DIR}" -maxdepth 1 -name 'libsqora*.so*' | sort | tail -n 1)" \
+    && mkdir -p /opt/oracle \
+    && ln -s "${ORACLE_LIB_DIR}" /opt/oracle/instantclient \
+    && printf '[Oracle in OraClient19Home1]\nDescription=Oracle Instant Client ODBC\nDriver=%s\nFileUsage=1\n\n[Oracle Instant Client ODBC]\nDescription=Oracle Instant Client ODBC\nDriver=%s\nFileUsage=1\n' "${SQORA_LIB}" "${SQORA_LIB}" > /etc/odbcinst.ini \
+    && printf '%s\n' "${ORACLE_LIB_DIR}" > /etc/ld.so.conf.d/oracle-instantclient.conf \
+    && rm -f /tmp/libnsl.el8.x86_64.rpm "/tmp/${ORACLE_IC_BASICLITE_RPM}" "/tmp/${ORACLE_IC_ODBC_RPM}" \
+    && rm -rf /var/cache/yum
+
+RUN printf '\n[IBM DB2 ODBC DRIVER]\nDescription=IBM DB2 ODBC Driver\nDriver=/opt/ibm/db2/V11.5/lib64/libdb2o.so\ndontdlclose=1\nFileUsage=1\n' >> /etc/odbcinst.ini \
+    && printf '%s\n' "/opt/ibm/db2/V11.5/lib64" > /etc/ld.so.conf.d/db2client.conf \
+    && ldconfig \
+    && ODBCINI=/etc/odbc.ini ODBCSYSINI=/etc odbcinst -q -d
+
+RUN grep -q '^db2c_db2inst1[[:space:]]\+50000/tcp' /etc/services || cat >> /etc/services <<'EOF'
+db2c_db2inst1      50000/tcp
+db2c_db2inst1_ssl  50001/tcp
+db2j_db2inst1      55000/tcp
+DB2_db2inst1       60000/tcp
+DB2_db2inst1_1     60001/tcp
+DB2_db2inst1_2     60002/tcp
+DB2_db2inst1_3     60003/tcp
+DB2_db2inst1_4     60004/tcp
+DB2_db2inst1_END   60005/tcp
+EOF
+
+RUN getent group db2iadm1 >/dev/null 2>&1 || groupadd -o -g 1000 db2iadm1 \
+    && id db2inst1 >/dev/null 2>&1 || useradd -o -u 1000 -g 1000 -M -N -d /database/config/db2inst1 db2inst1 \
+    && mkdir -p /app/data /database/config/db2inst1 \
+    && chown -R db2inst1:db2iadm1 /app /database
+
+WORKDIR /app
+
+COPY docker/oracle-e2e/start-arcxa-coordinator-db2.sh /usr/local/bin/start-arcxa-coordinator-db2.sh
+RUN chmod 0755 /usr/local/bin/start-arcxa-coordinator-db2.sh
+
+COPY --from=rust-builder /tmp/arcxa-coordinator /app/arcxa-coordinator
+
+ENV GRAPHICA_ORACLE_ODBC_DRIVER="Oracle in OraClient19Home1"
+ENV ODBCSYSINI="/etc"
+ENV ODBCINI="/etc/odbc.ini"
+ENV LD_LIBRARY_PATH="/opt/oracle/instantclient:/opt/ibm/db2/V11.5/lib64"
+ENV PATH="/opt/ibm/db2/V11.5/bin:${PATH}"
+
+USER db2inst1
+
+EXPOSE 8080 9090 9091
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=12 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/start-arcxa-coordinator-db2.sh"]

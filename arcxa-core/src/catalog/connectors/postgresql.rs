@@ -4,7 +4,7 @@
 //! V2 interface adds unified profiling and streaming capabilities.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use tokio::time::{timeout, Duration};
@@ -175,6 +175,26 @@ impl PostgreSQLConnector {
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null);
         }
+        if let Ok(value) = row.try_get::<_, Option<NaiveDate>>(idx) {
+            return value
+                .map(|v| serde_json::Value::String(v.format("%Y-%m-%d").to_string()))
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if let Ok(value) = row.try_get::<_, Option<NaiveDateTime>>(idx) {
+            return value
+                .map(|v| serde_json::Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string()))
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if let Ok(value) = row.try_get::<_, Option<DateTime<Utc>>>(idx) {
+            return value
+                .map(|v| serde_json::Value::String(v.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if let Ok(value) = row.try_get::<_, Option<DateTime<FixedOffset>>>(idx) {
+            return value
+                .map(|v| serde_json::Value::String(v.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null);
+        }
         if let Ok(value) = row.try_get::<_, Option<String>>(idx) {
             return value
                 .map(serde_json::Value::String)
@@ -192,8 +212,8 @@ impl PostgreSQLConnector {
         serde_json::Value::Object(obj)
     }
 
-    fn column_definitions(row: &tokio_postgres::Row) -> Vec<ColumnDefinition> {
-        row.columns()
+    fn column_definitions(columns: &[tokio_postgres::Column]) -> Vec<ColumnDefinition> {
+        columns
             .iter()
             .map(|column| ColumnDefinition {
                 name: column.name().to_string(),
@@ -629,6 +649,12 @@ impl DataSourceConnector for PostgreSQLConnector {
             .iter()
             .map(|value| value.as_tosql())
             .collect();
+        let statement = client.prepare(&bound_query).await.map_err(|e| {
+            GraphicaError::Internal(format!("PostgreSQL query prepare failed: {}", e))
+        })?;
+        let wrapped_query = format!(
+            "SELECT to_jsonb(graphica_row) AS graphica_row FROM ({bound_query}) AS graphica_row"
+        );
 
         tracing::info!(
             "PostgreSQL query execution: {} (limit: {:?}, params={})",
@@ -639,7 +665,7 @@ impl DataSourceConnector for PostgreSQLConnector {
 
         let rows = timeout(
             Duration::from_secs(timeout_secs),
-            client.query(&bound_query, &parameter_refs),
+            client.query(&wrapped_query, &parameter_refs),
         )
         .await
         .map_err(|_| {
@@ -653,8 +679,19 @@ impl DataSourceConnector for PostgreSQLConnector {
         let execution_time_ms = start.elapsed().as_millis() as u64;
         let row_count = rows.len();
         let truncated = limit.map(|value| row_count >= value).unwrap_or(false);
-        let columns = rows.first().map(Self::column_definitions);
-        let rows = rows.iter().map(Self::row_to_json).collect();
+        let columns = Some(Self::column_definitions(statement.columns()));
+        let rows = rows
+            .iter()
+            .map(|row| {
+                row.try_get::<_, serde_json::Value>("graphica_row")
+                    .map_err(|e| {
+                        GraphicaError::Internal(format!(
+                            "PostgreSQL query JSON materialization failed: {}",
+                            e
+                        ))
+                    })
+            })
+            .collect::<ConnectorResult<Vec<_>>>()?;
 
         Ok(QueryResult {
             rows,

@@ -14,6 +14,7 @@ use tracing::{error, info};
 
 use crate::api::ApiState;
 use crate::mapping::types::*;
+use crate::workflows::dataset_input::resolve_materialized_dataset_path;
 
 /// POST /api/v1/mapping/analyze
 ///
@@ -213,6 +214,47 @@ pub async fn analyze_for_mapping(
         }
         Err(e) => {
             error!("Failed to analyze for mapping: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
+/// POST /api/v1/datasets/:dataset_id/analyze-for-mapping
+///
+/// Analyze a managed Parquet-backed dataset for mapping and create a mapping session.
+pub async fn analyze_dataset_for_mapping(
+    State(state): State<Arc<ApiState>>,
+    Path(dataset_id): Path<String>,
+    Json(request): Json<AnalyzeForMappingRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    info!(
+        "Starting mapping analysis for dataset: {}, user: {}",
+        dataset_id, request.user_id
+    );
+
+    let mapping_engine = state.mapping_engine.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Mapping engine not initialized".to_string(),
+        )
+    })?;
+
+    let parquet_path = resolve_materialized_dataset_path(&state, &dataset_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    match mapping_engine
+        .analyze_dataset_for_mapping(&dataset_id, &parquet_path, request)
+        .await
+    {
+        Ok(response) => {
+            info!(
+                "✓ Dataset mapping analysis complete: session={}, {} fields, {} auto-approved",
+                response.session_id, response.summary.total_fields, response.summary.auto_approved
+            );
+            Ok((StatusCode::CREATED, Json(response)))
+        }
+        Err(e) => {
+            error!("Failed to analyze dataset for mapping: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         }
     }

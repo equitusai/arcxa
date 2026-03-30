@@ -26,7 +26,7 @@ pub use preflight_validator::{
 };
 pub use production_executor::ProductionWorkflowExecutor;
 pub use router::{RouteMatch, RouteStats, WorkflowRouter};
-pub use stream_executor::{StreamExecutor, StreamHandle, StreamStats};
+pub use stream_executor::{StreamExecutor, StreamHandle, StreamRuntimeSummary, StreamStats};
 pub use transaction_coordinator::{
     TransactionCoordinator, TransactionInfo, TransactionState, TransactionSummary,
 };

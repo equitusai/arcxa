@@ -35,10 +35,12 @@
 //! ```
 
 use crate::workflows::domain::{
-    Action, ActionResult, ExecutionMode, ExecutionStatus, StateBackendConfig, StreamingConfig,
-    WatermarkStrategy, Workflow, WorkflowExecution,
+    Action, ActionResult, ExecutionLog, ExecutionMode, ExecutionStatus, StateBackendConfig,
+    StreamingConfig, WatermarkStrategy, Workflow, WorkflowExecution,
 };
+use crate::workflows::engine::transformers::TransformerRegistry;
 use crate::workflows::engine::{ActionExecutor, ExecutionContext, KafkaSource, WorkflowRouter};
+use crate::workflows::lineage::WorkflowLineageGenerator;
 use crate::workflows::storage::{ExecutionStore, WorkflowStore};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -46,6 +48,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::BorrowedMessage;
 use rocksdb::DB;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -71,6 +74,22 @@ pub struct StreamExecutor {
 
     /// Optional production rule executor for real rule execution
     rule_executor: Option<Arc<graphica_core::orchestration::rules::RuleExecutor>>,
+
+    /// Transformer registry for Transform actions in streaming workflows
+    transformer_registry: Option<Arc<TransformerRegistry>>,
+
+    /// Workflow RDF lineage generator for streaming lineage events
+    lineage_generator: Option<Arc<WorkflowLineageGenerator>>,
+
+    /// Manual mapping store for semantic/field mapping transforms
+    manual_mapping_store: Option<Arc<crate::mapping::manual::ManualMappingStore>>,
+
+    /// Column lineage sink for streaming transform actions
+    column_lineage_store:
+        Option<Arc<dyn graphica_core::core::lineage::column_level::ColumnLineageSink>>,
+
+    /// Shared workflow metrics registry for streaming control-plane/runtime reporting
+    workflow_metrics: Option<Arc<crate::observability::metrics::WorkflowMetrics>>,
 }
 
 /// Metrics for a streaming workflow
@@ -161,6 +180,15 @@ impl StreamMetrics {
             lag: self.lag.load(Ordering::Relaxed),
             watermark,
             active_workers: 0, // Set by caller
+            runtime: StreamRuntimeSummary {
+                execution_engine: StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_ENGINE.to_string(),
+                storage_backend: "memory".to_string(),
+                persistent_state: false,
+                state_location: None,
+                checkpoint_interval_records:
+                    StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS,
+                configured_checkpoint_interval_ms: 0,
+            },
         }
     }
 }
@@ -184,6 +212,9 @@ pub struct StreamHandle {
 
     /// Metrics tracker (shared across workers)
     pub metrics: Arc<StreamMetrics>,
+
+    /// Runtime/storage summary for this active stream
+    pub runtime: StreamRuntimeSummary,
 }
 
 impl std::fmt::Debug for StreamHandle {
@@ -217,6 +248,57 @@ pub struct StreamStats {
 
     /// Active workers
     pub active_workers: usize,
+
+    /// Runtime/storage summary for this stream
+    pub runtime: StreamRuntimeSummary,
+}
+
+/// Runtime/storage summary for streaming execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamRuntimeSummary {
+    /// Streaming engine currently executing the workflow
+    pub execution_engine: String,
+
+    /// Stateful storage backend in use
+    pub storage_backend: String,
+
+    /// Whether state is persisted on disk
+    pub persistent_state: bool,
+
+    /// Filesystem location for persistent state, when applicable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
+
+    /// Record-based checkpoint cadence used by the simple stream loop
+    pub checkpoint_interval_records: u64,
+
+    /// Time-based checkpoint cadence configured on the workflow definition
+    pub configured_checkpoint_interval_ms: u64,
+}
+
+impl StreamRuntimeSummary {
+    pub const SIMPLE_KAFKA_LOOP_ENGINE: &'static str = "simple_kafka_loop";
+    pub const SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS: u64 = 100;
+
+    fn from_streaming_config(
+        config: &StreamingConfig,
+        state_path: Option<&PathBuf>,
+        execution_engine: &str,
+    ) -> Self {
+        let (storage_backend, persistent_state) = match &config.state_backend {
+            StateBackendConfig::Memory => ("memory".to_string(), false),
+            StateBackendConfig::RocksDB { .. } => ("rocksdb".to_string(), true),
+        };
+
+        Self {
+            execution_engine: execution_engine.to_string(),
+            storage_backend,
+            persistent_state,
+            state_location: state_path.map(|path| path.display().to_string()),
+            checkpoint_interval_records: Self::SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS,
+            configured_checkpoint_interval_ms: config.checkpoint_interval_ms,
+        }
+    }
 }
 
 impl StreamExecutor {
@@ -227,6 +309,11 @@ impl StreamExecutor {
             execution_store,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             rule_executor: None,
+            transformer_registry: None,
+            lineage_generator: None,
+            manual_mapping_store: None,
+            column_lineage_store: None,
+            workflow_metrics: None,
         }
     }
 
@@ -241,7 +328,85 @@ impl StreamExecutor {
             execution_store,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             rule_executor: Some(rule_executor),
+            transformer_registry: None,
+            lineage_generator: None,
+            manual_mapping_store: None,
+            column_lineage_store: None,
+            workflow_metrics: None,
         }
+    }
+
+    /// Add a transformer registry for streaming Transform actions.
+    pub fn with_transformer_registry(mut self, registry: Arc<TransformerRegistry>) -> Self {
+        self.transformer_registry = Some(registry);
+        self
+    }
+
+    /// Add a lineage generator for streaming workflow and action lineage.
+    pub fn with_lineage_generator(
+        mut self,
+        lineage_generator: Arc<WorkflowLineageGenerator>,
+    ) -> Self {
+        self.lineage_generator = Some(lineage_generator);
+        self
+    }
+
+    /// Add a manual mapping store for streaming semantic transforms.
+    pub fn with_manual_mapping_store(
+        mut self,
+        store: Arc<crate::mapping::manual::ManualMappingStore>,
+    ) -> Self {
+        self.manual_mapping_store = Some(store);
+        self
+    }
+
+    /// Add a column lineage sink for streaming transform actions.
+    pub fn with_column_lineage_store(
+        mut self,
+        store: Arc<dyn graphica_core::core::lineage::column_level::ColumnLineageSink>,
+    ) -> Self {
+        self.column_lineage_store = Some(store);
+        self
+    }
+
+    /// Add shared workflow metrics for streaming observability.
+    pub fn with_workflow_metrics(
+        mut self,
+        metrics: Arc<crate::observability::metrics::WorkflowMetrics>,
+    ) -> Self {
+        self.workflow_metrics = Some(metrics);
+        self
+    }
+
+    fn resolve_stream_brokers(config: &StreamingConfig) -> Result<Vec<String>> {
+        if let Some(brokers) = config.kafka_properties.get("bootstrap.servers") {
+            let parsed = brokers
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                return Ok(parsed);
+            }
+        }
+
+        if let Ok(brokers) = std::env::var("KAFKA_BROKERS") {
+            let parsed = brokers
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                return Ok(parsed);
+            }
+        }
+
+        Err(anyhow!(
+            "Streaming workflow '{}' requires Kafka brokers via execution_mode.kafka_properties.bootstrap.servers or KAFKA_BROKERS",
+            config.source_topic
+        ))
     }
 
     /// Start streaming execution for a workflow
@@ -267,66 +432,28 @@ impl StreamExecutor {
         // Validate workflow
         workflow.validate()?;
 
-        // Determine number of workers
-        let num_workers = config.max_parallel_workers.unwrap_or(4);
-
-        // Create state backend if needed
+        let brokers = Self::resolve_stream_brokers(config)?;
         let state_path = self.setup_state_backend(workflow, config)?;
-
-        // Create cancellation token
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
-
-        // Create metrics tracker
-        let metrics = Arc::new(StreamMetrics::new());
-
-        // Spawn Timely computation
-        let handle = StreamHandle {
-            workflow_id: workflow.id.clone(),
-            workers: num_workers,
-            consumer_group: config.consumer_group.clone(),
-            state_path: state_path.clone(),
-            cancellation_token: cancellation_token.clone(),
-            metrics: metrics.clone(),
-        };
-
-        // Clone for async task
-        let workflow_clone = workflow.clone();
-        let config_clone = config.clone();
-        let execution_store = self.execution_store.clone();
-        let workflow_store = self.workflow_store.clone();
-        let rule_executor = self.rule_executor.clone();
-
-        // Spawn streaming task
-        tokio::spawn(async move {
-            if let Err(e) = Self::run_streaming_dataflow(
-                workflow_clone,
-                config_clone,
-                state_path,
-                num_workers,
-                cancellation_token,
-                execution_store,
-                workflow_store,
-                rule_executor,
-                metrics,
-            )
-            .await
-            {
-                error!("Streaming execution failed: {:?}", e);
-            }
-        });
-
-        // Store handle
-        self.active_streams
-            .write()
-            .await
-            .insert(workflow.id.clone(), handle.clone());
-
-        info!(
-            "Streaming execution started for workflow: {} with {} workers",
-            workflow.id, num_workers
+        let runtime = StreamRuntimeSummary::from_streaming_config(
+            config,
+            state_path.as_ref(),
+            StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_ENGINE,
         );
 
-        Ok(handle)
+        info!(
+            "Using simple Kafka streaming loop for workflow: {} (brokers: {:?})",
+            workflow.id, brokers
+        );
+
+        self.start_simple_stream_loop(
+            workflow,
+            brokers,
+            config.source_topic.clone(),
+            config.consumer_group.clone(),
+            state_path,
+            runtime,
+        )
+        .await
     }
 
     /// Stop streaming execution for a workflow
@@ -336,6 +463,9 @@ impl StreamExecutor {
         let mut streams = self.active_streams.write().await;
         if let Some(handle) = streams.remove(workflow_id) {
             handle.cancellation_token.cancel();
+            if let Some(metrics) = self.workflow_metrics.as_ref() {
+                metrics.stream_stopped(workflow_id, &handle.runtime);
+            }
             info!("Streaming execution stopped for workflow: {}", workflow_id);
             Ok(())
         } else {
@@ -356,7 +486,13 @@ impl StreamExecutor {
         // Get snapshot from metrics and set active workers
         let mut stats = handle.metrics.snapshot();
         stats.active_workers = handle.workers;
+        stats.runtime = handle.runtime.clone();
         Ok(stats)
+    }
+
+    /// List full details for active streams.
+    pub async fn list_active_stream_details(&self) -> Vec<StreamHandle> {
+        self.active_streams.read().await.values().cloned().collect()
     }
 
     /// Setup state backend (RocksDB or in-memory)
@@ -767,8 +903,9 @@ impl StreamExecutor {
         kafka_brokers: Vec<String>,
         kafka_topic: String,
         consumer_group: String,
+        state_path: Option<PathBuf>,
+        runtime: StreamRuntimeSummary,
     ) -> Result<StreamHandle> {
-        use crate::observability::metrics::WorkflowMetrics;
         use crate::workflows::domain::DebeziumEvent;
         use crate::workflows::integration::{HttpClient, KafkaProducer};
         use crate::workflows::lineage::WorkflowLineageGenerator;
@@ -793,9 +930,10 @@ impl StreamExecutor {
             workflow_id: workflow.id.clone(),
             workers: 1, // Simple loop uses single consumer
             consumer_group: consumer_group.clone(),
-            state_path: None,
+            state_path: state_path.clone(),
             cancellation_token: cancellation_token.clone(),
             metrics: stream_metrics.clone(),
+            runtime: runtime.clone(),
         };
 
         // Clone for background task
@@ -804,6 +942,16 @@ impl StreamExecutor {
         let kafka_topic_clone = kafka_topic.clone();
         let consumer_group_clone = consumer_group.clone();
         let rule_executor = self.rule_executor.clone();
+        let transformer_registry = self.transformer_registry.clone();
+        let lineage_generator = self.lineage_generator.clone();
+        let manual_mapping_store = self.manual_mapping_store.clone();
+        let column_lineage_store = self.column_lineage_store.clone();
+        let execution_store = self.execution_store.clone();
+        let workflow_metrics = self.workflow_metrics.clone();
+        let active_streams = self.active_streams.clone();
+        let workflow_id = workflow.id.clone();
+        let runtime_for_task = runtime.clone();
+        let stream_metrics_for_task = stream_metrics.clone();
 
         // Spawn streaming loop in background
         tokio::spawn(async move {
@@ -813,12 +961,25 @@ impl StreamExecutor {
                 kafka_topic_clone,
                 consumer_group_clone,
                 rule_executor,
-                stream_metrics,
+                transformer_registry,
+                lineage_generator,
+                manual_mapping_store,
+                column_lineage_store,
+                execution_store,
+                workflow_metrics.clone(),
+                runtime_for_task.clone(),
+                stream_metrics_for_task,
                 cancellation_token,
             )
             .await
             {
                 error!("Simple streaming loop failed: {:?}", e);
+            }
+
+            if active_streams.write().await.remove(&workflow_id).is_some() {
+                if let Some(metrics) = workflow_metrics.as_ref() {
+                    metrics.stream_stopped(&workflow_id, &runtime_for_task);
+                }
             }
         });
 
@@ -827,6 +988,14 @@ impl StreamExecutor {
             .write()
             .await
             .insert(workflow.id.clone(), handle.clone());
+
+        if let Some(metrics) = self.workflow_metrics.as_ref() {
+            metrics.stream_started(&workflow.id, &runtime);
+            let mut initial_stats = stream_metrics.snapshot();
+            initial_stats.active_workers = handle.workers;
+            initial_stats.runtime = runtime.clone();
+            metrics.record_stream_runtime_stats(&workflow.id, &initial_stats);
+        }
 
         info!(
             "Simple streaming loop started for workflow: {}",
@@ -843,13 +1012,20 @@ impl StreamExecutor {
         kafka_topic: String,
         consumer_group: String,
         rule_executor: Option<Arc<graphica_core::orchestration::rules::RuleExecutor>>,
+        transformer_registry: Option<Arc<TransformerRegistry>>,
+        lineage_generator: Option<Arc<WorkflowLineageGenerator>>,
+        manual_mapping_store: Option<Arc<crate::mapping::manual::ManualMappingStore>>,
+        column_lineage_store: Option<
+            Arc<dyn graphica_core::core::lineage::column_level::ColumnLineageSink>,
+        >,
+        execution_store: Arc<ExecutionStore>,
+        workflow_metrics: Option<Arc<crate::observability::metrics::WorkflowMetrics>>,
+        runtime: StreamRuntimeSummary,
         stream_metrics: Arc<StreamMetrics>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        use crate::observability::metrics::WorkflowMetrics;
         use crate::workflows::domain::DebeziumEvent;
         use crate::workflows::integration::{HttpClient, KafkaProducer};
-        use crate::workflows::lineage::WorkflowLineageGenerator;
         use rdkafka::consumer::stream_consumer::StreamConsumer;
         use rdkafka::message::Message;
         use rdkafka::Message as KafkaMessage;
@@ -933,28 +1109,13 @@ impl StreamExecutor {
             }
         };
 
-        // Initialize metrics (optional)
-        let workflow_metrics = match prometheus::Registry::new() {
-            registry => match WorkflowMetrics::new(&registry) {
-                Ok(m) => {
-                    info!("✅ Workflow metrics initialized");
-                    Some(Arc::new(m))
-                }
-                Err(e) => {
-                    warn!("Failed to initialize metrics: {}", e);
-                    None
-                }
-            },
-        };
-
-        // Create streaming metrics tracker
-        let stream_metrics = Arc::new(StreamMetrics::new());
+        if workflow_metrics.is_some() {
+            info!("✅ Shared workflow metrics initialized for streaming loop");
+        } else {
+            info!("⚠️  Shared workflow metrics unavailable for streaming loop");
+        }
         info!("✅ Stream metrics initialized");
 
-        // Note: Lineage generator requires GraphicaRdfStore which is not available in this context
-        // Lineage tracking should be initialized at the API/service layer where RDF store is available
-        // For now, we keep it as None - proper integration happens when called from API handlers
-        let lineage_generator: Option<Arc<WorkflowLineageGenerator>> = None;
         if lineage_generator.is_none() {
             info!("⚠️  Lineage tracking disabled (RDF store not available in this context)");
         }
@@ -976,6 +1137,15 @@ impl StreamExecutor {
             "♻️  On restart, at most {} records may be reprocessed (idempotency recommended)",
             CHECKPOINT_INTERVAL
         );
+
+        let publish_runtime_stats = |stream_metrics: &Arc<StreamMetrics>| {
+            if let Some(metrics) = workflow_metrics.as_ref() {
+                let mut stats = stream_metrics.snapshot();
+                stats.active_workers = 1;
+                stats.runtime = runtime.clone();
+                metrics.record_stream_runtime_stats(&workflow.id, &stats);
+            }
+        };
 
         // Main streaming loop with graceful shutdown support
         loop {
@@ -1015,6 +1185,7 @@ impl StreamExecutor {
                             error!("Failed to parse CDC event: {}", e);
                             // Record failed parsing in metrics
                             stream_metrics.record_processed(0); // Record with 0 latency to indicate parse error
+                            publish_runtime_stats(&stream_metrics);
                             // Commit offset to skip bad message
                             if let Err(e) = consumer.commit_message(&message, rdkafka::consumer::CommitMode::Async) {
                                 error!("Failed to commit offset for bad message: {}", e);
@@ -1032,12 +1203,123 @@ impl StreamExecutor {
 
                     // Convert to workflow input
                     let input_data = cdc_event.to_workflow_input();
+                    let execution_id = Uuid::new_v4().to_string();
+                    let execution = WorkflowExecution::new(
+                        execution_id.clone(),
+                        workflow.id.clone(),
+                        workflow.name.clone(),
+                        input_data.clone(),
+                        None,
+                    );
+
+                    if let Err(err) = execution_store.save(execution).await {
+                        warn!(
+                            "Failed to persist streaming execution {} for workflow {}: {}",
+                            execution_id, workflow.id, err
+                        );
+                    }
+
+                    if let Err(err) = execution_store
+                        .update_status(&execution_id, ExecutionStatus::Running)
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark streaming execution {} as running: {}",
+                            execution_id, err
+                        );
+                    }
+
+                    if let Err(err) = execution_store
+                        .add_log(
+                            &execution_id,
+                            ExecutionLog::info(format!(
+                                "Streaming execution started for workflow '{}'",
+                                workflow.name
+                            )),
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to add start log for streaming execution {}: {}",
+                            execution_id, err
+                        );
+                    }
+
+                    if let Some(ref lineage_gen) = lineage_generator {
+                        if let Err(err) = lineage_gen.record_workflow_start(
+                            &execution_id,
+                            &workflow.id,
+                            chrono::Utc::now(),
+                        ) {
+                            warn!(
+                                "Failed to record streaming workflow start lineage for execution {}: {}",
+                                execution_id, err
+                            );
+                        }
+                    }
 
                     // Route through workflow (WorkflowRouter is a unit struct with static methods)
                     let route_match = match WorkflowRouter::select_route(&workflow, &input_data) {
                         Ok(Some(route_match)) => route_match,
                         Ok(None) => {
                             debug!("No route matched for CDC event, skipping");
+                            if let Err(err) = execution_store
+                                .add_log(
+                                    &execution_id,
+                                    ExecutionLog::warn("No route matched for CDC event"),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to add no-match log for streaming execution {}: {}",
+                                    execution_id, err
+                                );
+                            }
+
+                            match execution_store.get_required(&execution_id).await {
+                                Ok(mut execution) => {
+                                    execution.set_output(input_data.clone());
+                                    execution.update_status(ExecutionStatus::Completed);
+                                    if let Err(err) = execution_store.update(execution).await {
+                                        warn!(
+                                            "Failed to persist no-match completion for streaming execution {}: {}",
+                                            execution_id, err
+                                        );
+                                    }
+                                }
+                                Err(err) => warn!(
+                                    "Failed to load no-match streaming execution {}: {}",
+                                    execution_id, err
+                                ),
+                            }
+
+                            if let Some(ref lineage_gen) = lineage_generator {
+                                if let Err(err) = lineage_gen.record_route_matching(
+                                    &execution_id,
+                                    &workflow.id,
+                                    None,
+                                    None,
+                                    0,
+                                    workflow.routes.len(),
+                                    "no_match",
+                                ) {
+                                    warn!(
+                                        "Failed to record no-match streaming route lineage for execution {}: {}",
+                                        execution_id, err
+                                    );
+                                }
+
+                                if let Err(err) = lineage_gen.record_workflow_complete(
+                                    &execution_id,
+                                    true,
+                                    chrono::Utc::now(),
+                                ) {
+                                    warn!(
+                                        "Failed to record no-match streaming workflow completion lineage for execution {}: {}",
+                                        execution_id, err
+                                    );
+                                }
+                            }
                             // Commit offset
                             if let Err(e) = consumer.commit_message(&message, rdkafka::consumer::CommitMode::Async) {
                                 error!("Failed to commit offset: {}", e);
@@ -1046,8 +1328,15 @@ impl StreamExecutor {
                         }
                         Err(e) => {
                             error!("Failed to route event: {}", e);
+                            if let Err(err) = execution_store.set_error(&execution_id, e.to_string()).await {
+                                warn!(
+                                    "Failed to persist routing error for streaming execution {}: {}",
+                                    execution_id, err
+                                );
+                            }
                             // Record routing failure in metrics
                             stream_metrics.record_processed(0);
+                            publish_runtime_stats(&stream_metrics);
                             if let Err(e) = consumer.commit_message(&message, rdkafka::consumer::CommitMode::Async) {
                                 error!("Failed to commit offset: {}", e);
                             }
@@ -1061,25 +1350,64 @@ impl StreamExecutor {
                         cdc_event.source.table
                     );
 
+                    match execution_store.get_required(&execution_id).await {
+                        Ok(mut execution) => {
+                            execution.set_matched_route(
+                                route_match.route.id.clone(),
+                                route_match.route.name.clone(),
+                            );
+                            execution.add_log(ExecutionLog::info(format!(
+                                "Route '{}' matched",
+                                route_match.route.name
+                            )));
+                            if let Err(err) = execution_store.update(execution).await {
+                                warn!(
+                                    "Failed to persist route match for streaming execution {}: {}",
+                                    execution_id, err
+                                );
+                            }
+                        }
+                        Err(err) => warn!(
+                            "Failed to load matched streaming execution {}: {}",
+                            execution_id, err
+                        ),
+                    }
+
+                    if let Some(ref lineage_gen) = lineage_generator {
+                        if let Err(err) = lineage_gen.record_route_matching(
+                            &execution_id,
+                            &workflow.id,
+                            Some(&route_match.route.id),
+                            Some(&route_match.route.name),
+                            route_match.evaluation_time_ms,
+                            workflow.routes.len(),
+                            "condition_matched",
+                        ) {
+                            warn!(
+                                "Failed to record streaming route match lineage for execution {}: {}",
+                                execution_id, err
+                            );
+                        }
+                    }
+
                     // Create execution context
-                    let execution_id = Uuid::new_v4().to_string();
                     let start_time = Instant::now();
                     let context = ExecutionContext {
                         workflow_id: workflow.id.clone(),
                         route_id: route_match.route.id.clone(),
                         input_data: input_data.clone(),
                         rule_executor: rule_executor.clone(),
-                        transformer_registry: None,
+                        transformer_registry: transformer_registry.clone(),
                         kafka_producer: kafka_producer.clone(),
                         http_client: http_client.clone(),
                         lineage_generator: lineage_generator.clone(),
-            manual_mapping_store: None,
+                        manual_mapping_store: manual_mapping_store.clone(),
                         execution_id: Some(execution_id.clone()),
                         action_index: 0,
                         metrics: workflow_metrics.clone(),
                         approval_store: None,
-                        execution_store: None,
-                        column_lineage_store: None,
+                        execution_store: Some(execution_store.clone()),
+                        column_lineage_store: column_lineage_store.clone(),
                         tenant_id: "default".to_string(),
                         timeout_config: graphica_core::orchestration::workflow::ExecutionTimeout::default(),
                         workflow_start_time: std::time::Instant::now(),
@@ -1110,9 +1438,45 @@ impl StreamExecutor {
                             // Record metrics
                             let latency_ms = start_time.elapsed().as_millis() as u64;
                             stream_metrics.record_processed(latency_ms);
+                            publish_runtime_stats(&stream_metrics);
 
                             // Increment checkpoint counter
                             records_since_checkpoint += 1;
+
+                            if let Some(ref lineage_gen) = lineage_generator {
+                                if let Err(err) = lineage_gen.record_workflow_complete(
+                                    &execution_id,
+                                    true,
+                                    chrono::Utc::now(),
+                                ) {
+                                    warn!(
+                                        "Failed to record streaming workflow completion lineage for execution {}: {}",
+                                        execution_id, err
+                                    );
+                                }
+                            }
+
+                            match execution_store.get_required(&execution_id).await {
+                                Ok(mut execution) => {
+                                    execution.set_output(data.clone());
+                                    execution.actions_executed = results.len();
+                                    execution.add_log(ExecutionLog::info(format!(
+                                        "Executed {} actions successfully",
+                                        results.len()
+                                    )));
+                                    execution.update_status(ExecutionStatus::Completed);
+                                    if let Err(err) = execution_store.update(execution).await {
+                                        warn!(
+                                            "Failed to persist successful streaming execution {}: {}",
+                                            execution_id, err
+                                        );
+                                    }
+                                }
+                                Err(err) => warn!(
+                                    "Failed to load successful streaming execution {}: {}",
+                                    execution_id, err
+                                ),
+                            }
 
                             // Periodic checkpoint: sync commit every N records for durability
                             if records_since_checkpoint >= CHECKPOINT_INTERVAL {
@@ -1133,9 +1497,43 @@ impl StreamExecutor {
                         Err(e) => {
                             error!("Failed to execute actions: {}", e);
 
+                            if let Err(err) = execution_store
+                                .add_log(
+                                    &execution_id,
+                                    ExecutionLog::error(format!("Execution failed: {}", e)),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to add failure log for streaming execution {}: {}",
+                                    execution_id, err
+                                );
+                            }
+
+                            if let Err(err) = execution_store.set_error(&execution_id, e.to_string()).await {
+                                warn!(
+                                    "Failed to persist action failure for streaming execution {}: {}",
+                                    execution_id, err
+                                );
+                            }
+
+                            if let Some(ref lineage_gen) = lineage_generator {
+                                if let Err(err) = lineage_gen.record_workflow_complete(
+                                    &execution_id,
+                                    false,
+                                    chrono::Utc::now(),
+                                ) {
+                                    warn!(
+                                        "Failed to record failed streaming workflow completion lineage for execution {}: {}",
+                                        execution_id, err
+                                    );
+                                }
+                            }
+
                             // Record processing anyway but with high latency to indicate error
                             let latency_ms = start_time.elapsed().as_millis() as u64;
                             stream_metrics.record_processed(latency_ms);
+                            publish_runtime_stats(&stream_metrics);
 
                             // Still commit to avoid reprocessing forever
                             if let Err(e) = consumer.commit_message(&message, rdkafka::consumer::CommitMode::Async) {
@@ -1179,6 +1577,7 @@ impl Clone for StreamHandle {
             state_path: self.state_path.clone(),
             cancellation_token: self.cancellation_token.clone(),
             metrics: self.metrics.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }
@@ -1407,6 +1806,15 @@ mod tests {
             state_path: None,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             metrics: metrics.clone(),
+            runtime: StreamRuntimeSummary {
+                execution_engine: StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_ENGINE.to_string(),
+                storage_backend: "rocksdb".to_string(),
+                persistent_state: true,
+                state_location: Some("/tmp/test_workflow".to_string()),
+                checkpoint_interval_records:
+                    StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS,
+                configured_checkpoint_interval_ms: 60_000,
+            },
         };
 
         // Add handle to active streams
@@ -1423,6 +1831,8 @@ mod tests {
         assert_eq!(stats.lag, 500);
         assert_eq!(stats.active_workers, 4);
         assert!(stats.avg_latency_ms > 0);
+        assert_eq!(stats.runtime.storage_backend, "rocksdb");
+        assert!(stats.runtime.persistent_state);
     }
 
     #[tokio::test]

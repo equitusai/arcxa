@@ -7,7 +7,7 @@ use super::handlers::ApiError;
 use crate::api::auth::Claims;
 use crate::api::file_library::storage::FileLibraryStorage;
 use crate::api::file_library::storage_trait::FileLibraryStore;
-use crate::workflows::domain::{BatchJob, WorkflowExecutionRef};
+use crate::workflows::domain::{BatchJob, ExecutionRuntimeMetricsSummary, WorkflowExecutionRef};
 use crate::workflows::engine::BatchJobExecutor;
 use crate::workflows::storage::{BatchJobStore, ExecutionStore, WorkflowStore};
 use axum::{
@@ -67,6 +67,112 @@ impl BatchJobApiState {
             execution_store,
             Arc::new(FileLibraryStorage::new()),
         )
+    }
+}
+
+async fn fetch_execution_runtime_metrics(
+    execution_store: &ExecutionStore,
+    execution_id: &str,
+) -> Option<ExecutionRuntimeMetricsSummary> {
+    match execution_store.get(execution_id).await {
+        Ok(Some(execution)) => execution.effective_runtime_metrics_summary(),
+        Ok(None) => None,
+        Err(error) => {
+            error!(
+                execution_id = %execution_id,
+                "Failed to load execution runtime metrics for batch job telemetry: {}",
+                error
+            );
+            None
+        }
+    }
+}
+
+async fn build_batch_workflow_execution_details(
+    execution_store: &ExecutionStore,
+    workflow_executions: Vec<WorkflowExecutionRef>,
+) -> (
+    Vec<BatchWorkflowExecutionDto>,
+    Option<ExecutionRuntimeMetricsSummary>,
+) {
+    let mut execution_details = Vec::with_capacity(workflow_executions.len());
+    let mut runtime_summaries = Vec::new();
+
+    for execution in workflow_executions {
+        let runtime_metrics =
+            fetch_execution_runtime_metrics(execution_store, &execution.execution_id).await;
+        if let Some(summary) = runtime_metrics.as_ref() {
+            runtime_summaries.push(summary.clone());
+        }
+        execution_details.push(BatchWorkflowExecutionDto::from_execution_ref(
+            execution,
+            runtime_metrics,
+        ));
+    }
+
+    let runtime_metrics = ExecutionRuntimeMetricsSummary::from_summaries(runtime_summaries.iter());
+
+    (execution_details, runtime_metrics)
+}
+
+async fn build_batch_job_response(
+    execution_store: &ExecutionStore,
+    batch_job: BatchJob,
+) -> GetBatchJobResponse {
+    let duration_ms = batch_job.duration_ms();
+    let (workflow_executions, runtime_metrics) =
+        build_batch_workflow_execution_details(execution_store, batch_job.workflow_executions)
+            .await;
+
+    GetBatchJobResponse {
+        job_id: batch_job.job_id,
+        name: batch_job.name,
+        description: batch_job.description,
+        workflow_id: batch_job.workflow_id,
+        status: batch_job.status,
+        progress: batch_job.progress,
+        config: batch_job.config,
+        runtime_metrics,
+        workflow_executions,
+        metadata: batch_job.metadata,
+        created_at: batch_job.created_at,
+        updated_at: batch_job.updated_at,
+        started_at: batch_job.started_at,
+        completed_at: batch_job.completed_at,
+        duration_ms,
+        created_by: batch_job.created_by,
+    }
+}
+
+async fn build_batch_job_summary(
+    execution_store: &ExecutionStore,
+    batch_job: BatchJob,
+) -> BatchJobSummary {
+    let runtime_summaries: Vec<ExecutionRuntimeMetricsSummary> = {
+        let mut summaries = Vec::new();
+        for execution in &batch_job.workflow_executions {
+            if let Some(summary) =
+                fetch_execution_runtime_metrics(execution_store, &execution.execution_id).await
+            {
+                summaries.push(summary);
+            }
+        }
+        summaries
+    };
+
+    BatchJobSummary {
+        job_id: batch_job.job_id,
+        name: batch_job.name,
+        workflow_id: batch_job.workflow_id,
+        status: batch_job.status,
+        progress: batch_job.progress,
+        runtime_metrics: ExecutionRuntimeMetricsSummary::from_summaries(runtime_summaries.iter()),
+        created_at: batch_job.created_at,
+        updated_at: batch_job.updated_at,
+        started_at: batch_job.started_at,
+        completed_at: batch_job.completed_at,
+        total_files: batch_job.workflow_executions.len(),
+        created_by: batch_job.created_by,
     }
 }
 
@@ -178,7 +284,9 @@ pub async fn get_batch_job(
         .get(&job_id)?
         .ok_or_else(|| ApiError::NotFound(format!("Batch job not found: {}", job_id)))?;
 
-    Ok(Json(batch_job.into()))
+    Ok(Json(
+        build_batch_job_response(state.execution_store.as_ref(), batch_job).await,
+    ))
 }
 
 /// List batch jobs
@@ -225,12 +333,10 @@ pub async fn list_batch_jobs(
     let total = filtered.len();
 
     // Apply pagination
-    let batch_jobs: Vec<BatchJobSummary> = filtered
-        .into_iter()
-        .skip(query.offset)
-        .take(query.limit)
-        .map(BatchJobSummary::from)
-        .collect();
+    let mut batch_jobs = Vec::new();
+    for batch_job in filtered.into_iter().skip(query.offset).take(query.limit) {
+        batch_jobs.push(build_batch_job_summary(state.execution_store.as_ref(), batch_job).await);
+    }
 
     Ok(Json(ListBatchJobsResponse {
         batch_jobs,
@@ -409,8 +515,14 @@ pub async fn get_batch_job_transactions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflows::domain::BatchJobConfig;
+    use crate::workflows::domain::{
+        BatchJobConfig, BatchJobStatus, DataSource, ExecutionRuntimeMetricsSummary,
+        ExecutionStatus, WorkflowExecution,
+    };
+    use axum::{extract::Query, http::Extensions};
     use rocksdb::DB;
+    use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn create_test_state() -> Arc<BatchJobApiState> {
@@ -432,5 +544,182 @@ mod tests {
     async fn test_batch_job_api_state_creation() {
         let state = create_test_state();
         assert!(Arc::strong_count(&state.batch_store) >= 2); // Referenced by state and executor
+    }
+
+    fn create_test_source(file_id: &str, file_name: &str) -> DataSource {
+        DataSource::CsvFile {
+            file_id: file_id.to_string(),
+            file_path: PathBuf::from(file_name),
+            encoding: Some("UTF-8".to_string()),
+            delimiter: Some(','),
+            has_header: true,
+        }
+    }
+
+    async fn save_execution_with_runtime_metrics(
+        state: &Arc<BatchJobApiState>,
+        execution_id: &str,
+        workflow_id: &str,
+        runtime_metrics: ExecutionRuntimeMetricsSummary,
+    ) {
+        let mut execution = WorkflowExecution::new(
+            execution_id.to_string(),
+            workflow_id.to_string(),
+            "Batch Workflow".to_string(),
+            json!({"source": "batch"}),
+            None,
+        );
+        execution.runtime_metrics = Some(runtime_metrics);
+        execution.update_status(ExecutionStatus::Completed);
+        state.execution_store.save(execution).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_batch_job_enriches_execution_runtime_metrics() {
+        let state = create_test_state();
+
+        let mut batch_job = BatchJob::new(
+            "Oracle Batch".to_string(),
+            "wf_batch".to_string(),
+            BatchJobConfig::default(),
+            "system".to_string(),
+        );
+        let execution = WorkflowExecutionRef::new(
+            create_test_source("file_001", "customers.csv"),
+            "customers".to_string(),
+        );
+        let execution_id = execution.execution_id.clone();
+        batch_job.add_execution(execution);
+        batch_job.update_status(BatchJobStatus::Running);
+        state.batch_store.create(batch_job.clone()).unwrap();
+
+        save_execution_with_runtime_metrics(
+            &state,
+            &execution_id,
+            &batch_job.workflow_id,
+            ExecutionRuntimeMetricsSummary {
+                steps_with_runtime_metrics: 2,
+                steps_with_disk_storage: 1,
+                total_spill_events: 3,
+                total_spill_bytes: 2048,
+                max_memory_high_water_mark: 8192,
+                max_reserved_spill_bytes: 1024,
+                max_execution_reserved_spill_bytes: 1024,
+                max_total_reserved_spill_bytes: 1024,
+                storage_backends: vec!["parquet".to_string()],
+                planned_tiers: vec!["parquet".to_string()],
+                storage_decision_reasons: vec!["planned".to_string()],
+            },
+        )
+        .await;
+
+        let response = get_batch_job(State(state), Path(batch_job.job_id.clone()))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            response
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.steps_with_runtime_metrics),
+            Some(2)
+        );
+        assert_eq!(response.workflow_executions.len(), 1);
+        assert_eq!(
+            response.workflow_executions[0]
+                .runtime_metrics
+                .as_ref()
+                .map(|metrics| metrics.storage_backends.clone()),
+            Some(vec!["parquet".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_batch_jobs_rolls_up_runtime_metrics() {
+        let state = create_test_state();
+
+        let mut batch_job = BatchJob::new(
+            "Nightly Import".to_string(),
+            "wf_batch".to_string(),
+            BatchJobConfig::default(),
+            "system".to_string(),
+        );
+        let first_execution = WorkflowExecutionRef::new(
+            create_test_source("file_001", "customers.csv"),
+            "customers".to_string(),
+        );
+        let second_execution = WorkflowExecutionRef::new(
+            create_test_source("file_002", "orders.csv"),
+            "orders".to_string(),
+        );
+        let first_execution_id = first_execution.execution_id.clone();
+        let second_execution_id = second_execution.execution_id.clone();
+        batch_job.add_execution(first_execution);
+        batch_job.add_execution(second_execution);
+        state.batch_store.create(batch_job.clone()).unwrap();
+
+        save_execution_with_runtime_metrics(
+            &state,
+            &first_execution_id,
+            &batch_job.workflow_id,
+            ExecutionRuntimeMetricsSummary {
+                steps_with_runtime_metrics: 1,
+                steps_with_disk_storage: 0,
+                total_spill_events: 1,
+                total_spill_bytes: 1024,
+                max_memory_high_water_mark: 4096,
+                max_reserved_spill_bytes: 512,
+                max_execution_reserved_spill_bytes: 512,
+                max_total_reserved_spill_bytes: 512,
+                storage_backends: vec!["in_memory".to_string()],
+                planned_tiers: vec!["memory".to_string()],
+                storage_decision_reasons: vec!["planned".to_string()],
+            },
+        )
+        .await;
+        save_execution_with_runtime_metrics(
+            &state,
+            &second_execution_id,
+            &batch_job.workflow_id,
+            ExecutionRuntimeMetricsSummary {
+                steps_with_runtime_metrics: 2,
+                steps_with_disk_storage: 1,
+                total_spill_events: 4,
+                total_spill_bytes: 4096,
+                max_memory_high_water_mark: 16384,
+                max_reserved_spill_bytes: 2048,
+                max_execution_reserved_spill_bytes: 2048,
+                max_total_reserved_spill_bytes: 2048,
+                storage_backends: vec!["rocksdb".to_string()],
+                planned_tiers: vec!["rocksdb".to_string()],
+                storage_decision_reasons: vec!["memory_pressure".to_string()],
+            },
+        )
+        .await;
+
+        let response = list_batch_jobs(
+            State(state),
+            Extensions::new(),
+            Query(ListBatchJobsQuery {
+                status: None,
+                workflow_id: None,
+                limit: 10,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.batch_jobs.len(), 1);
+        let runtime_metrics = response.batch_jobs[0].runtime_metrics.as_ref().unwrap();
+        assert_eq!(runtime_metrics.steps_with_runtime_metrics, 3);
+        assert_eq!(runtime_metrics.total_spill_events, 5);
+        assert_eq!(
+            runtime_metrics.storage_backends,
+            vec!["in_memory".to_string(), "rocksdb".to_string()]
+        );
+        assert_eq!(runtime_metrics.max_memory_high_water_mark, 16384);
     }
 }

@@ -1285,6 +1285,42 @@ async fn main() -> Result<()> {
         }
     };
 
+    let manual_mapping_store_concrete: Option<
+        Arc<graphica_coordinator::mapping::manual::ManualMappingStore>,
+    > = {
+        use graphica_coordinator::mapping::manual::ManualMappingStore;
+
+        let manual_mapping_enabled = std::env::var("MANUAL_MAPPING_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+
+        if manual_mapping_enabled {
+            let manual_mapping_path = std::env::var("MANUAL_MAPPING_DB_PATH")
+                .unwrap_or_else(|_| "./data/manual-mappings-db".to_string());
+
+            info!(
+                "Initializing manual mapping store at: {}",
+                manual_mapping_path
+            );
+
+            match ManualMappingStore::new(rdf_store.clone(), &manual_mapping_path) {
+                Ok(store) => {
+                    info!("SUCCESS: Manual mapping store initialized");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    warn!("ERROR: Failed to initialize manual mapping store: {}", e);
+                    warn!("   Manual mapping features will not be available");
+                    None
+                }
+            }
+        } else {
+            info!("Manual mapping store disabled via MANUAL_MAPPING_ENABLED=false");
+            None
+        }
+    };
+
     // Initialize data management coordinator (GDPR Article 17 + general data lifecycle management)
     let gdpr_coordinator = {
         use graphica_coordinator::gdpr::GdprCoordinator;
@@ -1347,13 +1383,19 @@ async fn main() -> Result<()> {
                 let tracker: Arc<dyn graphica_core::orchestration::workflow::LineageTracker> =
                     if let Some(ref store) = row_lineage_store_concrete {
                         info!("Wiring lineage tracker with row-level lineage support...");
-                        Arc::new(CoordinatorLineageTracker::with_row_lineage_store(
-                            generator,
-                            store.clone(),
-                        ))
+                        Arc::new(
+                            CoordinatorLineageTracker::with_row_lineage_store(
+                                generator.clone(),
+                                store.clone(),
+                            )
+                            .with_lineage_storage(lineage_storage.clone()),
+                        )
                     } else {
                         info!("Wiring lineage tracker without row-level lineage support...");
-                        Arc::new(CoordinatorLineageTracker::new(generator))
+                        Arc::new(
+                            CoordinatorLineageTracker::new(generator.clone())
+                                .with_lineage_storage(lineage_storage.clone()),
+                        )
                     };
 
                 // Create new engine with lineage tracker
@@ -1380,17 +1422,55 @@ async fn main() -> Result<()> {
                         unsafe impl Send for SendPtr {}
 
                         let registry_clone = registry.clone();
+                        let lineage_generator_clone = Some(generator.clone());
+                        let manual_mapping_store_clone = manual_mapping_store_concrete.clone();
+                        let column_lineage_store_clone =
+                            column_lineage_store_concrete.clone().map(|store| {
+                                store
+                                    as Arc<
+                                        dyn graphica_core::core::lineage::column_level::ColumnLineageSink,
+                                    >
+                            });
                         let callback: Arc<TransformerCallback> =
                             Arc::new(Box::new(
                                 move |name: &str,
                                       config: &serde_json::Value,
-                                      data: &mut serde_json::Value|
+                                      data: &mut serde_json::Value,
+                                      core_context: &graphica_core::orchestration::workflow::executor::ExecutionContext|
                                       -> Pin<
                                     Box<dyn Future<Output = anyhow::Result<()>> + Send>,
                                 > {
                                     let name = name.to_string();
                                     let config = config.clone();
                                     let registry = registry_clone.clone();
+                                    let lineage_generator = lineage_generator_clone.clone();
+                                    let manual_mapping_store =
+                                        manual_mapping_store_clone.clone();
+                                    let column_lineage_store =
+                                        column_lineage_store_clone.clone();
+                                    let workflow_id = core_context
+                                        .workflow_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown_workflow".to_string());
+                                    let route_id = core_context
+                                        .row_lineage
+                                        .as_ref()
+                                        .and_then(|ctx| ctx.current_step_id.clone())
+                                        .unwrap_or_else(|| name.clone());
+                                    let input_data = core_context.working_data.clone();
+                                    let execution_id = core_context
+                                        .row_lineage
+                                        .as_ref()
+                                        .map(|ctx| ctx.execution_id.clone())
+                                        .or_else(|| {
+                                            core_context.metadata.get("execution_id").cloned()
+                                        });
+                                    let tenant_id = core_context
+                                        .row_lineage
+                                        .as_ref()
+                                        .map(|ctx| ctx.tenant_id.clone())
+                                        .or_else(|| core_context.metadata.get("tenant_id").cloned())
+                                        .unwrap_or_else(|| "default".to_string());
 
                                     // Wrap the raw pointer in a Send-able wrapper
                                     // SAFETY: We ensure the pointer remains valid by awaiting immediately
@@ -1404,7 +1484,40 @@ async fn main() -> Result<()> {
                                         // this future immediately and the data reference remains valid throughout
                                         let data = unsafe { &mut *ptr.0 };
 
-                                        registry.execute(&name, &config, data, None).await
+                                        let transformer_context =
+                                            graphica_coordinator::workflows::ExecutionContext {
+                                                workflow_id,
+                                                route_id,
+                                                input_data,
+                                                rule_executor: None,
+                                                transformer_registry: None,
+                                                kafka_producer: None,
+                                                http_client: None,
+                                                lineage_generator,
+                                                manual_mapping_store,
+                                                execution_id,
+                                                action_index: 0,
+                                                metrics: None,
+                                                approval_store: None,
+                                                execution_store: None,
+                                                column_lineage_store,
+                                                tenant_id,
+                                                timeout_config: graphica_core::orchestration::workflow::ExecutionTimeout::default(),
+                                                workflow_start_time: std::time::Instant::now(),
+                                                stage_start_time: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+                                                db2_pool: None,
+                                                postgres_pool: None,
+                                                memory_monitor: None,
+                                            };
+
+                                        registry
+                                            .execute(
+                                                &name,
+                                                &config,
+                                                data,
+                                                Some(&transformer_context),
+                                            )
+                                            .await
                                     })
                                 },
                             ));
@@ -1442,6 +1555,48 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    let schedule_store = Arc::new(graphica_coordinator::workflows::storage::ScheduleStore::new());
+    let workflow_store = Arc::new(graphica_coordinator::workflows::storage::WorkflowStore::new());
+    let workflow_metrics = {
+        use graphica_coordinator::observability::metrics::WorkflowMetrics;
+        if let Some(ref metrics_registry) = app_context.metrics {
+            match WorkflowMetrics::new(metrics_registry.registry()) {
+                Ok(wf_metrics) => {
+                    info!("SUCCESS: Workflow metrics initialized with Prometheus registry");
+                    Some(Arc::new(wf_metrics))
+                }
+                Err(e) => {
+                    warn!("WARNING: Failed to initialize workflow metrics: {}", e);
+                    warn!("   Workflow metrics will not be available");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    let stream_executor = graphica_coordinator::workflows::api::build_stream_executor(
+        workflow_store.clone(),
+        execution_store.clone(),
+        rule_executor.clone(),
+        transformer_registry.clone(),
+        {
+            use graphica_coordinator::workflows::lineage::rdf::WorkflowLineageGenerator;
+            if std::env::var("WORKFLOW_LINEAGE_ENABLED").unwrap_or_else(|_| "true".to_string())
+                == "true"
+            {
+                Some(Arc::new(WorkflowLineageGenerator::new(rdf_store.clone())))
+            } else {
+                None
+            }
+        },
+        manual_mapping_store_concrete.clone(),
+        column_lineage_store_concrete.clone().map(|store| {
+            store as Arc<dyn graphica_core::core::lineage::column_level::ColumnLineageSink>
+        }),
+        workflow_metrics.clone(),
+    );
 
     // Build API state
     let api_state = ApiState {
@@ -1484,16 +1639,13 @@ async fn main() -> Result<()> {
         // Versioned ontology binding lifecycle service
         binding_service,
         // Workflow schedule store for managing workflow schedules
-        schedule_store: Some(Arc::new(
-            graphica_coordinator::workflows::storage::ScheduleStore::new(),
-        )),
+        schedule_store: Some(schedule_store),
         // Workflow store for modern route-based workflows
-        workflow_store: Some(Arc::new(
-            graphica_coordinator::workflows::storage::WorkflowStore::new(),
-        )),
+        workflow_store: Some(workflow_store),
         // Execution store for workflow execution tracking (RocksDB-backed via RocksDbBackend)
         // Uses the same underlying RocksDB as CheckpointManager for data consistency
         execution_store: Some(execution_store),
+        stream_executor: Some(stream_executor),
         // File Library storage for enterprise file management (using RocksDB for persistence)
         file_library,
         // Transformer registry for workflow Transform actions (CSV parser, DB2 migrator, etc.)
@@ -1517,24 +1669,7 @@ async fn main() -> Result<()> {
             }
         },
         // Workflow metrics with Prometheus registry
-        metrics: {
-            use graphica_coordinator::observability::metrics::WorkflowMetrics;
-            if let Some(ref metrics_registry) = app_context.metrics {
-                match WorkflowMetrics::new(metrics_registry.registry()) {
-                    Ok(wf_metrics) => {
-                        info!("SUCCESS: Workflow metrics initialized with Prometheus registry");
-                        Some(Arc::new(wf_metrics))
-                    }
-                    Err(e) => {
-                        warn!("WARNING: Failed to initialize workflow metrics: {}", e);
-                        warn!("   Workflow metrics will not be available");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        },
+        metrics: workflow_metrics,
         // Distributed replay coordinator for Raft-based leader election (optional)
         replay_coordinator: None, // TODO: Initialize when distributed HA is configured
         // Row-level lineage tracking with RocksDB backend (using pre-initialized concrete store)
@@ -1548,42 +1683,7 @@ async fn main() -> Result<()> {
         // Schema evolution store for DDL change tracking and drift analysis (using pre-initialized concrete store)
         schema_evolution_store: schema_evolution_store_concrete.clone(),
         // Manual mapping store for user-defined ontology mappings (with RocksDB persistence)
-        manual_mapping_store: {
-            use graphica_coordinator::mapping::manual::ManualMappingStore;
-
-            let manual_mapping_enabled = std::env::var("MANUAL_MAPPING_ENABLED")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true);
-
-            if manual_mapping_enabled {
-                let manual_mapping_path = std::env::var("MANUAL_MAPPING_DB_PATH")
-                    .unwrap_or_else(|_| "./data/manual-mappings-db".to_string());
-
-                info!(
-                    "Initializing manual mapping store at: {}",
-                    manual_mapping_path
-                );
-
-                match ManualMappingStore::new(rdf_store.clone(), &manual_mapping_path) {
-                    Ok(store) => {
-                        info!(
-                            "SUCCESS: Manual mapping RocksDB initialized at {}",
-                            manual_mapping_path
-                        );
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        warn!("ERROR: Failed to initialize manual mapping store: {}", e);
-                        warn!("   Manual mapping features will not be available");
-                        None
-                    }
-                }
-            } else {
-                info!("INFO: Manual mapping store disabled (MANUAL_MAPPING_ENABLED=false)");
-                None
-            }
-        },
+        manual_mapping_store: manual_mapping_store_concrete.clone(),
         // DB2 connection pool for high-performance concurrent DB2 operations
         db2_pool,
         // Production persistence components (initialized above)
@@ -1846,8 +1946,6 @@ async fn main() -> Result<()> {
     // Start Streaming CDC Executor (if configured)
     // This enables CDC → Workflow → Action execution pipelines for production streaming
     if let Ok(workflow_id) = std::env::var("WORKFLOW_STREAMING_ID") {
-        use graphica_coordinator::workflows::engine::StreamExecutor;
-
         let kafka_brokers = std::env::var("KAFKA_CDC_BROKERS")
             .unwrap_or_else(|_| "localhost:9092".to_string())
             .split(',')
@@ -1868,12 +1966,11 @@ async fn main() -> Result<()> {
 
         // Clone necessary state for the background task
         let workflow_store = api_state.workflow_store.clone();
-        let execution_store = api_state.execution_store.clone();
+        let stream_executor = api_state.stream_executor.clone();
 
         tokio::spawn(async move {
-            // Unwrap Options (these should be initialized at this point)
             let workflow_store = workflow_store.expect("workflow_store not initialized");
-            let execution_store = execution_store.expect("execution_store not initialized");
+            let stream_executor = stream_executor.expect("stream_executor not initialized");
 
             // Fetch workflow definition
             let workflow = match workflow_store.get(&workflow_id) {
@@ -1893,14 +1990,46 @@ async fn main() -> Result<()> {
 
             info!("SUCCESS: Loaded workflow '{}' for streaming", workflow.name);
 
-            // Create StreamExecutor
-            let stream_executor =
-                StreamExecutor::new(workflow_store.clone(), execution_store.clone());
-
             // Start streaming loop
             info!("Starting: Starting CDC → Workflow streaming pipeline...");
+            let runtime = match &workflow.execution_mode {
+                graphica_coordinator::workflows::domain::ExecutionMode::Streaming { config } => {
+                    let (storage_backend, persistent_state) = match &config.state_backend {
+                        graphica_coordinator::workflows::domain::StateBackendConfig::Memory => {
+                            ("memory".to_string(), false)
+                        }
+                        graphica_coordinator::workflows::domain::StateBackendConfig::RocksDB {
+                            ..
+                        } => ("rocksdb".to_string(), true),
+                    };
+
+                    graphica_coordinator::workflows::engine::StreamRuntimeSummary {
+                        execution_engine: graphica_coordinator::workflows::engine::StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_ENGINE.to_string(),
+                        storage_backend,
+                        persistent_state,
+                        state_location: None,
+                        checkpoint_interval_records: graphica_coordinator::workflows::engine::StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS,
+                        configured_checkpoint_interval_ms: config.checkpoint_interval_ms,
+                    }
+                }
+                _ => graphica_coordinator::workflows::engine::StreamRuntimeSummary {
+                    execution_engine: graphica_coordinator::workflows::engine::StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_ENGINE.to_string(),
+                    storage_backend: "memory".to_string(),
+                    persistent_state: false,
+                    state_location: None,
+                    checkpoint_interval_records: graphica_coordinator::workflows::engine::StreamRuntimeSummary::SIMPLE_KAFKA_LOOP_CHECKPOINT_INTERVAL_RECORDS,
+                    configured_checkpoint_interval_ms: 0,
+                },
+            };
             if let Err(e) = stream_executor
-                .start_simple_stream_loop(&workflow, kafka_brokers, kafka_topic, consumer_group)
+                .start_simple_stream_loop(
+                    &workflow,
+                    kafka_brokers,
+                    kafka_topic,
+                    consumer_group,
+                    None,
+                    runtime,
+                )
                 .await
             {
                 error!("ERROR: Streaming loop failed: {}", e);

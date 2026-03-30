@@ -1,0 +1,122 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: arcxa-oracle-e2e-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo stat | nc localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: arcxa-oracle-e2e-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:19092
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: arcxa-oracle-e2e-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: curl -f http://localhost:8081/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: arcxa-oracle-e2e-db
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: ARCXA_DEMO
+      APP_USER_PASSWORD: arcxa_demo
+    ports:
+      - "11521:1521"
+    volumes:
+      - ./initdb:/container-entrypoint-initdb.d:ro
+      - oracle-e2e-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: docker/oracle-e2e/Dockerfile.coordinator.oracle-e2e
+      args:
+        CARGO_PROFILE: ${ORACLE_E2E_CARGO_PROFILE:-e2e}
+    image: arcxa-coordinator-oracle-e2e:latest
+    container_name: arcxa-oracle-e2e-coordinator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      oracle:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      REST_PORT: "8080"
+      GRPC_PORT: "9090"
+      REST_BIND_ADDRESS: "0.0.0.0"
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+      ROCKSDB_PATH: /app/data/rocksdb
+      PARQUET_PATH: /app/data/parquet
+      ARCHIVE_PATH: /app/data/archive
+      ROW_LINEAGE_DB_PATH: /app/data/row-lineage-db
+      AUDIT_CHAIN_PATH: /app/data/audit
+      KAFKA_MODE: durable
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CONSUMER_GROUP: arcxa-oracle-e2e
+      KAFKA_LINEAGE_TOPIC: graphica.lineage
+      KAFKA_QUALITY_TOPIC: graphica.quality
+      ENABLE_AUTH: "false"
+      ENABLE_METRICS: "true"
+      METRICS_PORT: "9091"
+      GRAPHICA_ORACLE_ODBC_DRIVER: Oracle in OraClient19Home1
+      RUST_LOG: info,graphica_coordinator::catalog_impl=debug,graphica_core::catalog::connectors::oracle=debug
+    ports:
+      - "18888:8080"
+      - "19095:9090"
+    volumes:
+      - ../../data/oracle-e2e/coordinator:/app/data
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  oracle-e2e-data:

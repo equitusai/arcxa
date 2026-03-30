@@ -1,6 +1,7 @@
 //! Workflow API request/response types
 
 use chrono::{DateTime, Utc};
+use graphica_core::orchestration::workflow::runtime::metrics::RuntimeStepMetrics;
 use graphica_core::orchestration::workflow::{WorkflowDefinition, WorkflowInput, WorkflowStep};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -246,6 +247,8 @@ pub struct ExecutionResultDto {
     pub final_output: serde_json::Value,
     pub confidence: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<ExecutionRuntimeMetricsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub materialized_dataset: Option<WorkflowOutputDatasetRef>,
 }
 
@@ -256,6 +259,92 @@ pub struct StepResultDto {
     pub output: serde_json::Value,
     pub confidence: f64,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<RuntimeStepMetricsDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RuntimeStepMetricsDto {
+    pub input_rows: usize,
+    pub output_rows: usize,
+    pub materialization_count: usize,
+    pub spill_events: usize,
+    pub spill_bytes: usize,
+    pub memory_high_water_mark: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_decision_reason: Option<String>,
+    pub reserved_spill_bytes: usize,
+    pub execution_reserved_spill_bytes: usize,
+    pub total_reserved_spill_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_location: Option<String>,
+    pub pushdown_applied: bool,
+}
+
+impl From<&RuntimeStepMetrics> for RuntimeStepMetricsDto {
+    fn from(metrics: &RuntimeStepMetrics) -> Self {
+        Self {
+            input_rows: metrics.input_rows,
+            output_rows: metrics.output_rows,
+            materialization_count: metrics.materialization_count,
+            spill_events: metrics.spill_events,
+            spill_bytes: metrics.spill_bytes,
+            memory_high_water_mark: metrics.memory_high_water_mark,
+            storage_type: metrics.storage_type.clone(),
+            storage_operation: metrics.storage_operation.clone(),
+            planned_tier: metrics.planned_tier.clone(),
+            storage_decision_reason: metrics.storage_decision_reason.clone(),
+            reserved_spill_bytes: metrics.reserved_spill_bytes,
+            execution_reserved_spill_bytes: metrics.execution_reserved_spill_bytes,
+            total_reserved_spill_bytes: metrics.total_reserved_spill_bytes,
+            storage_location: metrics.storage_location.clone(),
+            pushdown_applied: metrics.pushdown_applied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionRuntimeMetricsDto {
+    pub steps_with_runtime_metrics: usize,
+    pub steps_with_disk_storage: usize,
+    pub total_spill_events: usize,
+    pub total_spill_bytes: usize,
+    pub max_memory_high_water_mark: usize,
+    pub max_reserved_spill_bytes: usize,
+    pub max_execution_reserved_spill_bytes: usize,
+    pub max_total_reserved_spill_bytes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub storage_backends: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub planned_tiers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub storage_decision_reasons: Vec<String>,
+}
+
+impl From<&crate::workflows::domain::ExecutionRuntimeMetricsSummary>
+    for ExecutionRuntimeMetricsDto
+{
+    fn from(metrics: &crate::workflows::domain::ExecutionRuntimeMetricsSummary) -> Self {
+        Self {
+            steps_with_runtime_metrics: metrics.steps_with_runtime_metrics,
+            steps_with_disk_storage: metrics.steps_with_disk_storage,
+            total_spill_events: metrics.total_spill_events,
+            total_spill_bytes: metrics.total_spill_bytes,
+            max_memory_high_water_mark: metrics.max_memory_high_water_mark,
+            max_reserved_spill_bytes: metrics.max_reserved_spill_bytes,
+            max_execution_reserved_spill_bytes: metrics.max_execution_reserved_spill_bytes,
+            max_total_reserved_spill_bytes: metrics.max_total_reserved_spill_bytes,
+            storage_backends: metrics.storage_backends.clone(),
+            planned_tiers: metrics.planned_tiers.clone(),
+            storage_decision_reasons: metrics.storage_decision_reasons.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -440,4 +529,72 @@ pub struct WorkflowExecutionSummary {
     pub completed_at: DateTime<Utc>,
     pub success: bool,
     pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<ExecutionRuntimeMetricsDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkflowStepProgressDto {
+    pub step_name: String,
+    pub step_type: String,
+    pub rows_processed: u64,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl From<graphica_core::orchestration::workflow::StepProgress> for WorkflowStepProgressDto {
+    fn from(value: graphica_core::orchestration::workflow::StepProgress) -> Self {
+        Self {
+            step_name: value.step_name,
+            step_type: value.step_type,
+            rows_processed: value.rows_processed,
+            started_at: value.started_at,
+            completed_at: value.completed_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkflowExecutionProgressDto {
+    pub execution_id: String,
+    pub workflow_id: String,
+    pub status: graphica_core::orchestration::workflow::ExecutionStatus,
+    pub current_step: Option<WorkflowStepProgressDto>,
+    pub total_steps: usize,
+    pub steps_completed: u64,
+    pub rows_processed: u64,
+    pub total_rows: Option<u64>,
+    pub percent_complete: Option<f64>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_updated: DateTime<Utc>,
+    pub error: Option<String>,
+    pub eta_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_metrics: Option<ExecutionRuntimeMetricsDto>,
+}
+
+impl WorkflowExecutionProgressDto {
+    pub fn from_progress(
+        progress: graphica_core::orchestration::workflow::WorkflowProgress,
+        runtime_metrics: Option<ExecutionRuntimeMetricsDto>,
+    ) -> Self {
+        Self {
+            execution_id: progress.execution_id,
+            workflow_id: progress.workflow_id,
+            status: progress.status,
+            current_step: progress.current_step.map(WorkflowStepProgressDto::from),
+            total_steps: progress.total_steps,
+            steps_completed: progress.steps_completed,
+            rows_processed: progress.rows_processed,
+            total_rows: progress.total_rows,
+            percent_complete: progress.percent_complete,
+            started_at: progress.started_at,
+            completed_at: progress.completed_at,
+            last_updated: progress.last_updated,
+            error: progress.error,
+            eta_seconds: progress.eta_seconds,
+            runtime_metrics,
+        }
+    }
 }

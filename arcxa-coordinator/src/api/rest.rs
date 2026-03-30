@@ -399,6 +399,10 @@ fn write_routes() -> Router<Arc<ApiState>> {
             post(crate::api::handlers::analyze_for_mapping),
         )
         .route(
+            "/datasets/:dataset_id/analyze-for-mapping",
+            post(crate::api::handlers::analyze_dataset_for_mapping),
+        )
+        .route(
             "/mapping/sessions/:session_id/review",
             post(crate::api::handlers::review_mappings),
         )
