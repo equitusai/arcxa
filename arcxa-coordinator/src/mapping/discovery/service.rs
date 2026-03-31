@@ -36,7 +36,7 @@ use graphica_core::catalog::{
     client::DataSourceCatalog, connector::Credentials, types::DataSource,
 };
 use graphica_core::secrets::providers::SecretStoreRegistry;
-use graphica_core::secrets::SecretValue;
+use graphica_core::secrets::{get_secret_by_ref, SecretValue};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -208,8 +208,7 @@ impl CredentialResolver {
                         )
                     })?;
 
-                let secret = store
-                    .get_secret(secret_ref, None)
+                let secret = get_secret_by_ref(store.as_ref(), secret_ref, None)
                     .await
                     .context(format!("Failed to fetch secret '{}'", secret_ref))?;
 

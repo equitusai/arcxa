@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use graphica_core::catalog::{connector::Credentials, types::DataSource};
 use graphica_core::secrets::providers::SecretStoreRegistry;
-use graphica_core::secrets::SecretValue;
+use graphica_core::secrets::{get_secret_by_ref, SecretValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -22,8 +22,7 @@ pub async fn resolve_catalog_credentials(
                 .or_else(|| registry.get("default"))
                 .ok_or_else(|| anyhow!("No default secret store configured"))?;
 
-            let secret = store
-                .get_secret(&source.connection.secret_ref, None)
+            let secret = get_secret_by_ref(store.as_ref(), &source.connection.secret_ref, None)
                 .await
                 .with_context(|| {
                     format!(

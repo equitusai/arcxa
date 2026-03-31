@@ -19,7 +19,7 @@ use crate::governance::rdf_store::{GraphicaRdfStore, RdfStore};
 use crate::mapping::loader::transformation::TransformationEngine;
 use graphica_core::catalog::client::DataSourceCatalog;
 use graphica_core::orchestration::workflow::{FieldTransformation, FieldTransformerConfig};
-use graphica_core::secrets::SecretStoreRef;
+use graphica_core::secrets::{get_secret_by_ref, SecretStoreRef};
 
 use super::types::*;
 use super::unified_mapping::UnifiedMappingSession;
@@ -518,13 +518,13 @@ impl LoadOrchestrator {
 
         let secret_store = pipeline.secret_store.as_ref().unwrap();
 
-        // Parse secret_ref URI to extract path
-        let secret_path = self.parse_secret_ref(secret_ref)?;
-
-        tracing::debug!("Fetching credentials from secret store: {}", secret_path);
+        tracing::debug!(
+            "Fetching credentials from secret store for ref: {}",
+            secret_ref
+        );
 
         // Fetch secret from store
-        match secret_store.get_secret(&secret_path, None).await {
+        match get_secret_by_ref(secret_store.as_ref(), secret_ref, None).await {
             Ok(secret) => {
                 // Extract username and password from secret value
                 if let (Some(username), Some(password)) =
@@ -534,46 +534,27 @@ impl LoadOrchestrator {
                     Ok(Some((username.to_string(), password.to_string())))
                 } else {
                     tracing::warn!(
-                        "Secret {} found but does not contain username/password credentials",
-                        secret_path
+                        "Secret '{}' found but does not contain username/password credentials",
+                        secret_ref
                     );
                     Ok(None)
                 }
             }
             Err(e) => {
                 tracing::error!(
-                    "Failed to fetch secret from store (path={}): {}",
-                    secret_path,
+                    "Failed to fetch secret from store for ref '{}': {}",
+                    secret_ref,
                     e
                 );
                 // Fail fast: In production, missing secrets should cause immediate failure
                 // rather than silent fallback, which could lead to cryptic connection errors
                 anyhow::bail!(
-                    "Failed to fetch credentials from secret store at '{}': {}. \
+                    "Failed to fetch credentials from secret store for '{}': {}. \
                      Ensure the secret exists and the secret store is properly configured.",
-                    secret_path,
+                    secret_ref,
                     e
                 )
             }
-        }
-    }
-
-    /// Parse secret_ref URI to extract the secret path
-    ///
-    /// Examples:
-    /// - `vault://datasources/postgres-prod` -> `datasources/postgres-prod`
-    /// - `aws://my-db-secret` -> `my-db-secret`
-    /// - `env://DB_CREDENTIALS` -> `DB_CREDENTIALS`
-    fn parse_secret_ref(&self, secret_ref: &str) -> Result<String> {
-        if secret_ref.starts_with("vault://") {
-            Ok(secret_ref.strip_prefix("vault://").unwrap().to_string())
-        } else if secret_ref.starts_with("aws://") {
-            Ok(secret_ref.strip_prefix("aws://").unwrap().to_string())
-        } else if secret_ref.starts_with("env://") {
-            Ok(secret_ref.strip_prefix("env://").unwrap().to_string())
-        } else {
-            // Default: assume it's a direct path
-            Ok(secret_ref.to_string())
         }
     }
 
@@ -2063,40 +2044,6 @@ mod tests {
     }
 
     // ========== SECRET STORE INTEGRATION TESTS ==========
-
-    #[test]
-    fn test_parse_secret_ref_vault() {
-        let orchestrator = LoadOrchestrator::new();
-        let result = orchestrator
-            .parse_secret_ref("vault://datasources/postgres-prod")
-            .unwrap();
-        assert_eq!(result, "datasources/postgres-prod");
-    }
-
-    #[test]
-    fn test_parse_secret_ref_aws() {
-        let orchestrator = LoadOrchestrator::new();
-        let result = orchestrator.parse_secret_ref("aws://my-db-secret").unwrap();
-        assert_eq!(result, "my-db-secret");
-    }
-
-    #[test]
-    fn test_parse_secret_ref_env() {
-        let orchestrator = LoadOrchestrator::new();
-        let result = orchestrator
-            .parse_secret_ref("env://DB_CREDENTIALS")
-            .unwrap();
-        assert_eq!(result, "DB_CREDENTIALS");
-    }
-
-    #[test]
-    fn test_parse_secret_ref_direct_path() {
-        let orchestrator = LoadOrchestrator::new();
-        let result = orchestrator
-            .parse_secret_ref("direct/path/to/secret")
-            .unwrap();
-        assert_eq!(result, "direct/path/to/secret");
-    }
 
     // ========== CONSTRAINT VALIDATION TESTS ==========
 

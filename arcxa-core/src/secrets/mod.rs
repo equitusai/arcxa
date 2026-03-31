@@ -7,10 +7,14 @@ pub mod cache;
 pub mod config;
 pub mod error;
 pub mod providers;
+pub mod refs;
 pub mod types;
 
 pub use config::{SecretStoreConfig, SecretStoreType};
 pub use error::{SecretError, SecretResult};
+pub use refs::{
+    get_secret_by_ref, put_secret_by_ref, secret_exists_by_ref, secret_ref_to_store_path,
+};
 pub use types::{Secret, SecretMetadata, SecretValue, SecretVersion};
 
 use async_trait::async_trait;

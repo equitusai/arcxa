@@ -16,7 +16,7 @@ use graphica_core::catalog::{
     UpdateDataSourcePatch, UpdateDataSourceRequest,
 };
 use graphica_core::errors::GraphicaError;
-use graphica_core::secrets::SecretValue;
+use graphica_core::secrets::{get_secret_by_ref, SecretValue};
 
 // ============================================================================
 // Data Source CRUD Handlers
@@ -841,8 +841,7 @@ async fn resolve_inline_credentials(
                 )
             })?;
 
-        let secret = store
-            .get_secret(&connection.secret_ref, None)
+        let secret = get_secret_by_ref(store.as_ref(), &connection.secret_ref, None)
             .await
             .map_err(|e| {
                 create_error(

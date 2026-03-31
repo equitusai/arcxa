@@ -45,6 +45,7 @@ use crate::mapping::discovery::{
 };
 use graphica_core::catalog::connector::Credentials;
 use graphica_core::catalog::types::DataSource;
+use graphica_core::secrets::get_secret_by_ref;
 
 /// Request to start schema discovery
 #[derive(Debug, Clone, Deserialize)]
@@ -497,8 +498,7 @@ async fn get_credentials(state: &ApiState, datasource: &DataSource) -> Result<Cr
             .ok_or_else(|| anyhow!("No secret store configured in registry"))?;
 
         // Fetch secret by path
-        let secret = store
-            .get_secret(secret_ref, None)
+        let secret = get_secret_by_ref(store.as_ref(), secret_ref, None)
             .await
             .context("Failed to fetch credentials from secret store")?;
 

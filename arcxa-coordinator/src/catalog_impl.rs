@@ -19,7 +19,9 @@ use graphica_core::inference::types::{
     ColumnStatistics as CoreColumnStatistics, SemanticType, ValueFrequency,
 };
 use graphica_core::secrets::providers::SecretStoreRegistry;
-use graphica_core::secrets::SecretValue;
+use graphica_core::secrets::{
+    get_secret_by_ref, put_secret_by_ref, secret_exists_by_ref, SecretValue,
+};
 use parking_lot::RwLock;
 use rocksdb::{Options, DB};
 use std::collections::HashMap;
@@ -292,7 +294,7 @@ impl InMemoryDataSourceCatalog {
 
         let mut secret_ready = false;
         if !secret_ref.is_empty() {
-            match store.exists(&secret_ref).await {
+            match secret_exists_by_ref(store.as_ref(), &secret_ref).await {
                 Ok(exists) => secret_ready = exists,
                 Err(e) => {
                     tracing::warn!(
@@ -306,9 +308,13 @@ impl InMemoryDataSourceCatalog {
 
         if !secret_ready {
             if let Some(creds) = inline_credentials.clone() {
-                match store
-                    .put_secret(&secret_ref, SecretValue::KeyValue(creds), None)
-                    .await
+                match put_secret_by_ref(
+                    store.as_ref(),
+                    &secret_ref,
+                    SecretValue::KeyValue(creds),
+                    None,
+                )
+                .await
                 {
                     Ok(_) => {
                         secret_ready = true;
@@ -428,7 +434,7 @@ impl InMemoryDataSourceCatalog {
                         )
                     })?;
 
-                match store.get_secret(&source.connection.secret_ref, None).await {
+                match get_secret_by_ref(store.as_ref(), &source.connection.secret_ref, None).await {
                     Ok(secret) => {
                         return Self::credentials_from_secret_value(&secret.value);
                     }

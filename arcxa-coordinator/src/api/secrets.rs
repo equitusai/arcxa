@@ -160,7 +160,7 @@ pub struct HealthCheckResponse {
 
 /// List all secrets (optionally filtered by prefix)
 ///
-/// GET /api/v1/secrets?prefix=datasource&store=default
+/// GET /api/v1/secrets?prefix=datasources&store=default
 async fn list_secrets(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ListSecretsQuery>,
@@ -191,7 +191,7 @@ async fn list_secrets(
 
 /// Get a secret by path
 ///
-/// GET /api/v1/secrets/datasource/postgres/credentials
+/// GET /api/v1/secrets/datasources/postgres/credentials
 async fn get_secret(
     State(state): State<Arc<ApiState>>,
     Path(path): Path<String>,
@@ -236,7 +236,7 @@ async fn get_secret(
 
 /// Store a secret
 ///
-/// PUT /api/v1/secrets/datasource/postgres/credentials
+/// PUT /api/v1/secrets/datasources/postgres/credentials
 async fn put_secret(
     State(state): State<Arc<ApiState>>,
     Path(path): Path<String>,
@@ -278,7 +278,7 @@ async fn put_secret(
 
 /// Delete a secret
 ///
-/// DELETE /api/v1/secrets/datasource/postgres/credentials
+/// DELETE /api/v1/secrets/datasources/postgres/credentials
 async fn delete_secret(
     State(state): State<Arc<ApiState>>,
     Path(path): Path<String>,
@@ -304,7 +304,7 @@ async fn delete_secret(
 
 /// Rotate a secret (creates new version)
 ///
-/// POST /api/v1/secrets/datasource/postgres/credentials/rotate
+/// POST /api/v1/secrets/datasources/postgres/credentials/rotate
 async fn rotate_secret(
     State(state): State<Arc<ApiState>>,
     Path(path): Path<String>,
@@ -347,7 +347,7 @@ async fn rotate_secret(
 
 /// Get secret metadata (without revealing the secret value)
 ///
-/// GET /api/v1/secrets/datasource/postgres/credentials/metadata
+/// GET /api/v1/secrets/datasources/postgres/credentials/metadata
 async fn get_secret_metadata(
     State(state): State<Arc<ApiState>>,
     Path(path): Path<String>,
