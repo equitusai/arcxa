@@ -1873,7 +1873,7 @@ export interface PluginCapabilities {
  * Credentials are stored in a secret vault and referenced via secretRef
  */
 export interface ConnectionDetails {
-  /** Reference to credentials in secret vault (e.g., "vault://credentials/my-postgres") */
+  /** Reference to credentials in secret vault (e.g., "vault://datasources/my-postgres/credentials") */
   secretRef: string;
   /** Source-specific configuration (includes type field) */
   config: {

@@ -46,7 +46,10 @@ import {
 import type { AvailablePlugin } from '@/api/types';
 import { DatasourceTypeSelectorEnhanced } from './DatasourceTypeSelectorEnhanced';
 import { mapPluginNameToBackendType } from '@/api/datasources';
-import { storeDatasourceCredentials } from '@/api/secrets';
+import {
+  buildDatasourceSecretRef,
+  storeDatasourceCredentials,
+} from '@/api/secrets';
 
 interface DatasourceWizardEnhancedProps {
   open: boolean;
@@ -326,7 +329,7 @@ export function DatasourceWizardEnhanced({ open, onOpenChange }: DatasourceWizar
 
     try {
       const backendType = selectedPlugin.source_type || mapPluginNameToBackendType(selectedPlugin.name);
-      const secretRef = `vault://credentials/${datasourceName}`;
+      const secretRef = buildDatasourceSecretRef(datasourceName);
 
       const connectionConfig: Record<string, DatasourceFormValue> = {};
       const credentials: Record<string, string> = {};

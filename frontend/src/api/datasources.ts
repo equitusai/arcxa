@@ -346,7 +346,7 @@ export async function getDatasource(id: string): Promise<Datasource> {
  *   "title": "postgresql-j6ds",
  *   "sourceType": "PostgreSQL",
  *   "connection": {
- *     "secretRef": "vault://credentials/postgresql-j6ds",
+ *     "secretRef": "vault://datasources/postgresql-j6ds/credentials",
  *     "config": {
  *       "type": "PostgreSQL",
  *       "host": "localhost",

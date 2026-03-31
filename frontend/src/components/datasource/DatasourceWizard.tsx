@@ -24,7 +24,10 @@ import { useAvailablePlugins, useRegisterDatasource } from '@/hooks/useDatasourc
 import type { AvailablePlugin } from '@/api/types';
 import { DatasourceTypeSelector } from './DatasourceTypeSelector';
 import { mapPluginNameToBackendType } from '@/api/datasources';
-import { storeDatasourceCredentials } from '@/api/secrets';
+import {
+  buildDatasourceSecretRef,
+  storeDatasourceCredentials,
+} from '@/api/secrets';
 
 interface DatasourceWizardProps {
   open: boolean;
@@ -195,7 +198,7 @@ export function DatasourceWizard({ open, onOpenChange }: DatasourceWizardProps) 
     }
 
     const backendSourceType = selectedPlugin.source_type || mapPluginNameToBackendType(selectedPlugin.name);
-    const secretRef = `vault://credentials/${datasourceName}`;
+    const secretRef = buildDatasourceSecretRef(datasourceName);
 
     const connectionConfig: Record<string, DatasourceFormValue> = {};
     const credentials: Record<string, string> = {};
