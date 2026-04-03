@@ -1,7 +1,10 @@
 use anyhow::Result;
 use regex::Regex;
 
-use super::{build_rows_output, BatchStepExecutionResult, ExecutionContext, WorkflowExecutor};
+use super::{
+    build_materialized_rows_step_result, BatchStepExecutionResult, ExecutionContext,
+    WorkflowExecutor,
+};
 
 impl WorkflowExecutor {
     /// Execute data validator step - validate data against rules
@@ -14,11 +17,11 @@ impl WorkflowExecutor {
 
         tracing::info!("Executing data validator: {} rules", config.rules.len());
 
-        let rows = self.get_rows_from_context(context)?;
-
-        if let Some(batch_result) = self.try_execute_data_validator_batch(context, config, &rows)? {
+        if let Some(batch_result) = self.try_execute_data_validator_batch(context, config)? {
             return Ok(batch_result);
         }
+
+        let rows = self.get_rows_from_context(context)?;
 
         let mut errors: Vec<serde_json::Value> = Vec::new();
         let mut warnings: Vec<serde_json::Value> = Vec::new();
@@ -85,31 +88,27 @@ impl WorkflowExecutor {
             warnings.len()
         );
 
-        let row_count = rows.len();
         let error_count = errors.len();
         let warning_count = warnings.len();
 
-        Ok(BatchStepExecutionResult::without_frame(
+        Ok(build_materialized_rows_step_result(
+            rows,
+            vec![
+                (
+                    "_errors".to_string(),
+                    serde_json::Value::Array(errors.clone()),
+                ),
+                (
+                    "_warnings".to_string(),
+                    serde_json::Value::Array(warnings.clone()),
+                ),
+                ("_error_count".to_string(), serde_json::json!(error_count)),
+                (
+                    "_warning_count".to_string(),
+                    serde_json::json!(warning_count),
+                ),
+            ],
             success,
-            build_rows_output(
-                rows,
-                row_count,
-                vec![
-                    (
-                        "_errors".to_string(),
-                        serde_json::Value::Array(errors.clone()),
-                    ),
-                    (
-                        "_warnings".to_string(),
-                        serde_json::Value::Array(warnings.clone()),
-                    ),
-                    ("_error_count".to_string(), serde_json::json!(error_count)),
-                    (
-                        "_warning_count".to_string(),
-                        serde_json::json!(warning_count),
-                    ),
-                ],
-            ),
             if errors.is_empty() { 1.0 } else { 0.0 },
         ))
     }

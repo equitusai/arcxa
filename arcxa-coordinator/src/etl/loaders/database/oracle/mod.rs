@@ -529,7 +529,6 @@ fn collect_columns(rows: &[Map<String, Value>]) -> Result<Vec<String>> {
     Ok(ordered)
 }
 
-#[cfg(feature = "odbc")]
 fn ensure_target_columns_present(
     table_name: &str,
     columns: &[String],
@@ -552,7 +551,6 @@ fn ensure_target_columns_present(
     ))
 }
 
-#[cfg(feature = "odbc")]
 fn build_value_expressions(
     columns: &[String],
     target_column_types: &HashMap<String, String>,

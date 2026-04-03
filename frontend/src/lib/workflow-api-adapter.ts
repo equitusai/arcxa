@@ -1,9 +1,10 @@
 /**
  * Workflow API Adapter
- * Converts frontend workflow node configurations to backend API format
+ * Converts frontend workflow state into the coordinator's current API contract.
  *
- * The frontend uses developer-friendly formats (UPPER_CASE enums, flat structures)
- * The backend expects specific formats (PascalCase, nested structures)
+ * The frontend normalizes workflow details into a friendlier editing shape, but
+ * outbound requests still need to preserve the backend's current step config
+ * conventions.
  */
 
 import type {
@@ -17,26 +18,10 @@ import type {
 // Field Transformer Adapters
 // ============================================================================
 
-/**
- * Convert frontend operation type to backend format
- *
- * Frontend: 'TRIM', 'UPPER', 'LOWER', 'REGEX', 'CONCAT', 'SPLIT', 'CUSTOM'
- * Backend: 'Trim', 'Upper', 'Lower', 'Regex', 'Concat', 'Split', 'Custom'
- */
 function convertOperationType(
-  frontendType: 'TRIM' | 'LOWER' | 'UPPER' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM'
+  frontendType: 'TRIM' | 'LOWER' | 'UPPER' | 'ROUND' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM'
 ): string {
-  const mapping: Record<string, string> = {
-    TRIM: 'Trim',
-    LOWER: 'Lower',
-    UPPER: 'Upper',
-    REGEX: 'Regex',
-    CONCAT: 'Concat',
-    SPLIT: 'Split',
-    CUSTOM: 'Custom',
-  };
-
-  return mapping[frontendType] || frontendType;
+  return frontendType;
 }
 
 /**
@@ -99,75 +84,63 @@ export function adaptFieldTransformerConfig(
 // Data Validator Adapters
 // ============================================================================
 
-/**
- * Convert frontend rule type to backend format
- *
- * Frontend: 'NOT_NULL' | 'REGEX' | 'RANGE' | 'IN_SET' | 'UNIQUE' | 'CUSTOM'
- * Backend: { type: 'NotNull' | 'Regex' | 'Range' | 'InSet' | 'Unique' }
- */
 function convertRuleType(
   frontendRuleType: ValidationRule['rule_type'],
   params?: Record<string, any>
 ): any {
-  const typeMapping: Record<string, string> = {
-    NOT_NULL: 'NotNull',
-    REGEX: 'Regex',
-    RANGE: 'Range',
-    IN_SET: 'InSet',
-    UNIQUE: 'Unique',
-    CUSTOM: 'Custom', // Note: Backend doesn't support CUSTOM, will fail validation
-  };
+  const hasParams = Boolean(params && Object.keys(params).length > 0);
 
-  const backendType = typeMapping[frontendRuleType] || frontendRuleType;
+  switch (frontendRuleType) {
+    case 'REGEX':
+      return hasParams
+        ? {
+            REGEX: {
+              ...(params?.pattern ? { pattern: params.pattern } : {}),
+            },
+          }
+        : 'REGEX';
 
-  // Build the rule_type object based on type
-  const ruleType: any = {
-    type: backendType,
-  };
+    case 'RANGE':
+      if (!hasParams) {
+        return 'RANGE';
+      }
 
-  // Add type-specific params
-  if (params) {
-    switch (frontendRuleType) {
-      case 'REGEX':
-        if (params.pattern) {
-          ruleType.pattern = params.pattern;
-        }
-        break;
+      return {
+        RANGE: {
+          ...(params?.min !== undefined ? { min: params.min } : {}),
+          ...(params?.max !== undefined ? { max: params.max } : {}),
+          ...(params?.inclusive !== undefined ? { inclusive: params.inclusive } : {}),
+        },
+      };
 
-      case 'RANGE':
-        if (params.min !== undefined) ruleType.min = params.min;
-        if (params.max !== undefined) ruleType.max = params.max;
-        break;
+    case 'IN_SET':
+      if (!hasParams) {
+        return 'IN_SET';
+      }
 
-      case 'IN_SET':
-        if (params.values) {
-          ruleType.values = params.values;
-        }
-        break;
+      return {
+        IN_SET: {
+          ...(Array.isArray(params?.values)
+            ? { values: params.values }
+            : Array.isArray(params?.allowed_values)
+              ? { values: params.allowed_values }
+              : {}),
+          ...(params?.case_sensitive !== undefined
+            ? { case_sensitive: params.case_sensitive }
+            : {}),
+        },
+      };
 
-      default:
-        // For other types, merge params directly
-        Object.assign(ruleType, params);
-    }
+    case 'NOT_NULL':
+    case 'UNIQUE':
+    case 'CUSTOM':
+    default:
+      return frontendRuleType;
   }
-
-  return ruleType;
 }
 
-/**
- * Convert frontend severity to backend format
- *
- * Frontend: 'error' | 'warning'
- * Backend: 'Error' | 'Warning' | 'Info'
- */
 function convertSeverity(frontendSeverity: 'error' | 'warning'): string {
-  const mapping: Record<string, string> = {
-    error: 'Error',
-    warning: 'Warning',
-    info: 'Info',
-  };
-
-  return mapping[frontendSeverity] || 'Error';
+  return frontendSeverity;
 }
 
 /**
@@ -185,10 +158,11 @@ function convertSeverity(frontendSeverity: 'error' | 'warning'): string {
  * {
  *   field: "email",
  *   rule_type: {
- *     type: "Regex",
- *     pattern: "^[a-z]+@.*"
+ *     REGEX: {
+ *       pattern: "^[a-z]+@.*"
+ *     }
  *   },
- *   severity: "Error"
+ *   severity: "error"
  * }
  */
 function convertValidationRule(rule: ValidationRule): any {
@@ -206,6 +180,33 @@ export function adaptDataValidatorConfig(config: DataValidatorConfig): any {
   return {
     rules: config.rules.map(convertValidationRule),
     fail_on_error: config.fail_on_error,
+  };
+}
+
+function adaptWorkflowStepConfigForBackend(stepType: string | undefined, config: any): any {
+  if (!config || typeof config !== 'object') {
+    return config;
+  }
+
+  if (stepType === 'field_transformer') {
+    return adaptFieldTransformerConfig(config);
+  }
+
+  if (stepType === 'data_validator') {
+    return adaptDataValidatorConfig(config);
+  }
+
+  return config;
+}
+
+export function adaptWorkflowStepForBackend(step: any): any {
+  if (!step || typeof step !== 'object') {
+    return step;
+  }
+
+  return {
+    ...step,
+    config: adaptWorkflowStepConfigForBackend(step.step_type, step.config),
   };
 }
 
@@ -241,6 +242,24 @@ export function adaptWorkflowNode(node: any): any {
  * Convert entire workflow definition to backend format
  */
 export function adaptWorkflowDefinition(workflow: any): any {
+  if (!workflow || typeof workflow !== 'object') {
+    return workflow;
+  }
+
+  if (Array.isArray(workflow.steps)) {
+    return {
+      ...workflow,
+      steps: workflow.steps.map(adaptWorkflowStepForBackend),
+    };
+  }
+
+  if (workflow.definition && Array.isArray(workflow.definition.steps)) {
+    return {
+      ...workflow,
+      definition: adaptWorkflowDefinition(workflow.definition),
+    };
+  }
+
   return {
     ...workflow,
     nodes: workflow.nodes?.map(adaptWorkflowNode) || [],
@@ -256,6 +275,7 @@ export function adaptWorkflowDefinition(workflow: any): any {
  */
 function convertBackendOperationType(backendType: string): string {
   const mapping: Record<string, string> = {
+    ROUND: 'ROUND',
     Trim: 'TRIM',
     Lower: 'LOWER',
     Upper: 'UPPER',
@@ -276,6 +296,12 @@ function convertBackendRuleType(backendRuleType: any): {
   params?: Record<string, any>;
 } {
   const typeMapping: Record<string, ValidationRule['rule_type']> = {
+    NOT_NULL: 'NOT_NULL',
+    REGEX: 'REGEX',
+    RANGE: 'RANGE',
+    IN_SET: 'IN_SET',
+    UNIQUE: 'UNIQUE',
+    CUSTOM: 'CUSTOM',
     NotNull: 'NOT_NULL',
     Regex: 'REGEX',
     Range: 'RANGE',
@@ -284,23 +310,55 @@ function convertBackendRuleType(backendRuleType: any): {
     Custom: 'CUSTOM',
   };
 
-  const frontendType = typeMapping[backendRuleType.type] || ('CUSTOM' as const);
+  if (typeof backendRuleType === 'string') {
+    return {
+      rule_type: typeMapping[backendRuleType] || 'CUSTOM',
+    };
+  }
+
+  if (!backendRuleType || typeof backendRuleType !== 'object') {
+    return {
+      rule_type: 'CUSTOM',
+    };
+  }
+
+  let backendType: string | undefined;
+  let backendParams: Record<string, any> = {};
+
+  if (typeof backendRuleType.type === 'string') {
+    backendType = backendRuleType.type;
+    backendParams = backendRuleType;
+  } else {
+    const entries = Object.entries(backendRuleType);
+
+    if (entries.length === 1) {
+      const [entryType, entryParams] = entries[0];
+      backendType = entryType;
+      backendParams =
+        entryParams && typeof entryParams === 'object'
+          ? (entryParams as Record<string, any>)
+          : {};
+    }
+  }
+
+  const frontendType = backendType ? typeMapping[backendType] || ('CUSTOM' as const) : 'CUSTOM';
 
   // Extract params based on type
   const params: Record<string, any> = {};
 
-  switch (backendRuleType.type) {
-    case 'Regex':
-      if (backendRuleType.pattern) params.pattern = backendRuleType.pattern;
+  switch (frontendType) {
+    case 'REGEX':
+      if (backendParams.pattern) params.pattern = backendParams.pattern;
       break;
 
-    case 'Range':
-      if (backendRuleType.min !== undefined) params.min = backendRuleType.min;
-      if (backendRuleType.max !== undefined) params.max = backendRuleType.max;
+    case 'RANGE':
+      if (backendParams.min !== undefined) params.min = backendParams.min;
+      if (backendParams.max !== undefined) params.max = backendParams.max;
       break;
 
-    case 'InSet':
-      if (backendRuleType.values) params.values = backendRuleType.values;
+    case 'IN_SET':
+      if (backendParams.values) params.values = backendParams.values;
+      if (backendParams.allowed_values) params.values = backendParams.allowed_values;
       break;
   }
 
@@ -315,6 +373,9 @@ function convertBackendRuleType(backendRuleType: any): {
  */
 function convertBackendSeverity(backendSeverity: string): 'error' | 'warning' {
   const mapping: Record<string, 'error' | 'warning'> = {
+    error: 'error',
+    warning: 'warning',
+    info: 'warning',
     Error: 'error',
     Warning: 'warning',
     Info: 'warning', // Map Info to warning for frontend
@@ -323,12 +384,92 @@ function convertBackendSeverity(backendSeverity: string): 'error' | 'warning' {
   return mapping[backendSeverity] || 'error';
 }
 
+function adaptBackendOperation(operation: any): FieldTransformation['operations'][0] {
+  if (!operation || typeof operation !== 'object') {
+    return {
+      type: 'CUSTOM',
+    } as FieldTransformation['operations'][0];
+  }
+
+  const { type, ...params } = operation;
+
+  return {
+    type: convertBackendOperationType(type) as FieldTransformation['operations'][0]['type'],
+    params: Object.keys(params).length > 0 ? params : undefined,
+  };
+}
+
+function adaptFieldTransformerResponseConfig(config: any): FieldTransformerConfig {
+  return {
+    transformations: (config?.transformations || []).map((transformation: any) => ({
+      field: transformation.field,
+      operations: (transformation.operations || []).map(adaptBackendOperation),
+    })),
+  };
+}
+
+function adaptValidationRule(rule: any): ValidationRule {
+  const adaptedRuleType = convertBackendRuleType(rule?.rule_type);
+
+  return {
+    field: rule?.field || '',
+    rule_type: adaptedRuleType.rule_type,
+    params: adaptedRuleType.params ?? (rule?.params ?? undefined),
+    severity: convertBackendSeverity(rule?.severity || 'Error'),
+  };
+}
+
+function adaptDataValidatorResponseConfig(config: any): DataValidatorConfig {
+  return {
+    rules: (config?.rules || []).map(adaptValidationRule),
+    fail_on_error: Boolean(config?.fail_on_error),
+  };
+}
+
+function adaptWorkflowStepResponse(step: any): any {
+  if (!step || typeof step !== 'object') {
+    return step;
+  }
+
+  if (step.step_type === 'field_transformer') {
+    return {
+      ...step,
+      config: adaptFieldTransformerResponseConfig(step.config),
+    };
+  }
+
+  if (step.step_type === 'data_validator') {
+    return {
+      ...step,
+      config: adaptDataValidatorResponseConfig(step.config),
+    };
+  }
+
+  return step;
+}
+
 /**
  * Adapt backend workflow response to frontend format
  */
 export function adaptWorkflowResponse(backendWorkflow: any): any {
-  // For now, mostly pass through
-  // We may need to convert operation types and rule types back
+  if (!backendWorkflow || typeof backendWorkflow !== 'object') {
+    return backendWorkflow;
+  }
+
+  if (Array.isArray(backendWorkflow.steps)) {
+    return {
+      ...backendWorkflow,
+      steps: backendWorkflow.steps.map(adaptWorkflowStepResponse),
+    };
+  }
+
+  if (backendWorkflow.definition && Array.isArray(backendWorkflow.definition.steps)) {
+    return {
+      ...backendWorkflow,
+      definition: adaptWorkflowResponse(backendWorkflow.definition),
+    };
+  }
+
   return backendWorkflow;
 }
 

@@ -18,8 +18,7 @@ impl WorkflowExecutor {
             config.table_name
         );
 
-        let rows = self.get_rows_from_context(context)?;
-        let row_count = rows.len();
+        let row_count = self.get_context_row_count(context)?;
 
         if let Some(callback) = &self.db_loader_callback {
             tracing::info!(
@@ -30,16 +29,17 @@ impl WorkflowExecutor {
             );
 
             let mode_str = format!("{:?}", config.mode);
-
-            let rows_vec: Vec<serde_json::Map<String, serde_json::Value>> = rows
-                .iter()
-                .filter_map(|row| row.as_object().cloned())
-                .collect();
+            let object_rows = self.get_context_object_rows(context)?;
+            let callback_rows = if self.lineage_tracker.is_some() {
+                object_rows.clone()
+            } else {
+                object_rows
+            };
 
             let load_result = callback(
                 &config.datasource_id,
                 &config.table_name,
-                rows_vec,
+                callback_rows,
                 &mode_str,
                 config.key_fields.clone(),
             )
@@ -51,8 +51,11 @@ impl WorkflowExecutor {
                 )
             })?;
 
-            self.record_db_load_lineage(context, config, &rows, &load_result)
-                .await;
+            if self.lineage_tracker.is_some() {
+                let lineage_rows = self.get_context_object_rows(context)?;
+                self.record_db_load_lineage(context, config, &lineage_rows, &load_result)
+                    .await;
+            }
 
             tracing::info!(
                 "Successfully loaded {} rows to {}.{}",
@@ -98,7 +101,7 @@ impl WorkflowExecutor {
         &self,
         context: &ExecutionContext,
         config: &crate::orchestration::workflow::definition::DbLoaderConfig,
-        rows: &[serde_json::Value],
+        rows: &[serde_json::Map<String, serde_json::Value>],
         load_result: &DbLoadResult,
     ) {
         let Some(tracker) = &self.lineage_tracker else {
@@ -176,7 +179,7 @@ impl WorkflowExecutor {
     }
 }
 
-fn extract_source_row_id(row: &serde_json::Value) -> Option<RowId> {
+fn extract_source_row_id(row: &serde_json::Map<String, serde_json::Value>) -> Option<RowId> {
     row.get("_row_id")
         .and_then(|value| value.as_str())
         .and_then(parse_row_id_key)

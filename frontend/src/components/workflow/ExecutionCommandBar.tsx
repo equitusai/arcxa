@@ -75,7 +75,7 @@ export function ExecutionCommandBar({
       label: 'Execute Workflow',
       icon: Play,
       onClick: onExecute,
-      disabled: !canExecute || hasErrors,
+      disabled: !canExecute,
       variant: 'default' as const,
       shortcut: '⌘↵',
     };

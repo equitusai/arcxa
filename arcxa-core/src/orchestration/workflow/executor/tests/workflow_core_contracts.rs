@@ -579,6 +579,51 @@ async fn test_execute_data_validator_falls_back_to_legacy_output_contract() {
 }
 
 #[tokio::test]
+async fn test_execute_data_validator_legacy_object_rows_attach_batch_frame() {
+    use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+    use crate::orchestration::rules::RuleExecutor;
+    use crate::orchestration::workflow::definition::{
+        DataValidatorConfig, RuleType, Severity, ValidationRule,
+    };
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let executor = WorkflowExecutor::new(workflow, invoker, rule_executor).unwrap();
+
+    let context = ExecutionContext::new(serde_json::json!({
+        "_rows": [
+            {"name": "Alice"},
+            {"id": 2}
+        ]
+    }));
+    let config = DataValidatorConfig {
+        rules: vec![ValidationRule {
+            field: "name".to_string(),
+            rule_type: RuleType::NotNull,
+            params: None,
+            severity: Severity::Error,
+        }],
+        fail_on_error: false,
+    };
+
+    let result = executor
+        .execute_data_validator(&config, &context)
+        .await
+        .expect("legacy object-row validator path should execute");
+
+    assert!(result.success);
+    assert_eq!(result.output["_row_count"], serde_json::json!(2));
+    assert_eq!(result.output["_error_count"], serde_json::json!(1));
+    let batch_frame = result
+        .batch_frame
+        .expect("object-row validator output should attach a frame sidecar");
+    assert_eq!(batch_frame.row_count(), 2);
+}
+
+#[tokio::test]
 async fn test_execute_step_aggregator_attaches_batch_frame_sidecar() {
     use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
     use crate::orchestration::rules::RuleExecutor;
@@ -668,7 +713,10 @@ async fn test_execute_aggregator_falls_back_to_legacy_output_contract() {
         .expect("legacy aggregator path should execute");
 
     assert!(result.success);
-    assert!(result.batch_frame.is_none());
+    let batch_frame = result
+        .batch_frame
+        .expect("legacy aggregator object-row output should attach a frame sidecar");
+    assert_eq!(batch_frame.row_count(), 1);
     assert_eq!(result.confidence, 1.0);
     assert_eq!(result.output["_row_count"], serde_json::json!(1));
     assert_eq!(result.output["_original_count"], serde_json::json!(2));
@@ -768,7 +816,10 @@ async fn test_execute_deduplicator_falls_back_to_legacy_output_contract() {
         .expect("legacy deduplicator path should execute");
 
     assert!(result.success);
-    assert!(result.batch_frame.is_none());
+    let batch_frame = result
+        .batch_frame
+        .expect("legacy deduplicator object-row output should attach a frame sidecar");
+    assert_eq!(batch_frame.row_count(), 2);
     assert_eq!(result.confidence, 1.0);
     assert_eq!(result.output["_row_count"], serde_json::json!(2));
     assert_eq!(result.output["_original_count"], serde_json::json!(3));

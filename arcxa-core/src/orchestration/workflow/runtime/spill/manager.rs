@@ -11,6 +11,7 @@ use crate::orchestration::workflow::error::{Result, WorkflowError};
 use crate::orchestration::workflow::row_storage::{
     estimate_memory_size, RowStorage, RowStorageHandle,
 };
+use crate::orchestration::workflow::runtime::frame::BatchFrame;
 
 use super::parquet as parquet_backend;
 use super::rocksdb as rocksdb_backend;
@@ -311,6 +312,69 @@ impl StorageManager {
         ))
     }
 
+    pub fn create_parquet_storage_from_batch_frame_with_details(
+        &self,
+        execution_id: &str,
+        step_id: &str,
+        frame: &BatchFrame,
+    ) -> Result<StoragePlacementOutcome> {
+        let estimated_reserved_bytes = frame.estimated_size_bytes();
+        self.reserve_spill_quota(execution_id, estimated_reserved_bytes)?;
+
+        let parquet_storage = parquet_backend::create_parquet_storage_from_batch_frame(
+            &self.temp_dir,
+            execution_id,
+            step_id,
+            frame,
+        )
+        .map_err(|err| {
+            self.release_spill_quota(execution_id, estimated_reserved_bytes);
+            err
+        })?;
+
+        let reserved_bytes = parquet_storage.file_size_bytes;
+        if let Err(err) =
+            self.reconcile_spill_quota(execution_id, estimated_reserved_bytes, reserved_bytes)
+        {
+            let _ = std::fs::remove_file(&parquet_storage.path);
+            self.release_spill_quota(execution_id, estimated_reserved_bytes);
+            return Err(err);
+        }
+
+        let storage_location = parquet_storage.path.display().to_string();
+        let storage_key = format!(
+            "{}/parquet/{}",
+            execution_id,
+            parquet_storage
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("spill.parquet")
+        );
+        self.active_storage.write().insert(
+            storage_key,
+            ManagedStorageEntry {
+                storage: StorageEntry::Parquet(parquet_storage.path.clone()),
+                execution_id: execution_id.to_string(),
+                reserved_bytes,
+            },
+        );
+
+        let storage = RowStorage::Parquet {
+            path: parquet_storage.path,
+            schema: parquet_storage.schema,
+            row_count: parquet_storage.row_count,
+            index: parquet_storage.index,
+        };
+
+        Ok(self.build_placement_outcome(
+            execution_id,
+            reserved_bytes,
+            Some(storage_location),
+            storage,
+        ))
+    }
+
     pub fn store_rows(
         &self,
         execution_id: &str,
@@ -409,6 +473,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::orchestration::workflow::row_storage::{RowAccessor, StorageType};
+    use crate::orchestration::workflow::runtime::frame::BatchFrame;
 
     use super::{SpillQuotaConfig, StorageManager};
 
@@ -517,6 +582,42 @@ mod tests {
         );
 
         manager.cleanup_execution("exec_parquet").unwrap();
+        let usage_after_cleanup = manager.spill_quota_usage();
+        assert_eq!(usage_after_cleanup.total_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn creates_parquet_storage_from_batch_frame_and_reconciles_quota_usage() {
+        let rocks_dir = tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let manager = StorageManager::with_quota_config(
+            rocks_dir.path(),
+            temp_dir.path(),
+            SpillQuotaConfig {
+                max_total_spill_bytes: 1024 * 1024,
+                max_spill_bytes_per_execution: 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+        let rows = vec![
+            serde_json::json!({"id": 1, "name": "alpha", "active": true}),
+            serde_json::json!({"id": 2, "name": "beta", "active": false}),
+            serde_json::json!({"id": 3, "name": "gamma", "active": true}),
+        ];
+        let frame = BatchFrame::from_json_values(&rows).expect("frame");
+        let outcome = manager
+            .create_parquet_storage_from_batch_frame_with_details("exec_frame", "step_1", &frame)
+            .expect("parquet storage to be created");
+
+        assert_eq!(outcome.storage.storage_type(), StorageType::Parquet);
+        assert!(outcome.reserved_spill_bytes > 0);
+        assert!(outcome.storage_location.is_some());
+
+        let materialized = RowAccessor::new(outcome.storage.clone()).to_vec().unwrap();
+        assert_eq!(materialized, rows);
+
+        manager.cleanup_execution("exec_frame").unwrap();
         let usage_after_cleanup = manager.spill_quota_usage();
         assert_eq!(usage_after_cleanup.total_reserved_bytes, 0);
     }

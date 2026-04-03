@@ -2,6 +2,8 @@
 
 from typing import Any, Dict, List, Optional
 
+from graphica.errors import NotFoundError
+
 
 class WorkflowsAPI:
     """Manage ETL workflows with scheduling and execution."""
@@ -93,12 +95,40 @@ class WorkflowsAPI:
             "input": inputs if inputs else {}
         }
 
-        # Use async endpoint if async_mode is True
         endpoint = f"{self._base}/{workflow_id}/execute"
         if async_mode:
-            endpoint = f"{self._base}/{workflow_id}/execute-async"
+            async_endpoint = f"{self._base}/{workflow_id}/execute-async"
+            try:
+                return self._client.post(async_endpoint, json=data)
+            except NotFoundError:
+                sync_result = self._client.post(endpoint, json=data)
+                return self._adapt_sync_execution_as_async(sync_result, workflow_id)
 
         return self._client.post(endpoint, json=data)
+
+    def _adapt_sync_execution_as_async(
+        self,
+        response: Dict[str, Any],
+        workflow_id: str,
+    ) -> Dict[str, Any]:
+        results = response.get("results", [])
+        first_result = results[0] if isinstance(results, list) and results else {}
+        execution_id = first_result.get("execution_id") or response.get("execution_id")
+
+        if not execution_id:
+            raise RuntimeError(
+                "Synchronous workflow execution completed, but no execution_id was returned"
+            )
+
+        return {
+            "execution_id": execution_id,
+            "workflow_id": response.get("workflow_id", workflow_id),
+            "status": "completed",
+            "fallback": "synchronous_execute",
+            "started_at": response.get("started_at"),
+            "completed_at": response.get("completed_at"),
+            "result": response,
+        }
 
     def list_executions(
         self,

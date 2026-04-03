@@ -27,7 +27,7 @@ interface TransformationPipelineProps {
   upstreamSchema: Array<{ name: string; type: string; sample_values?: string[] }>;
 }
 
-type OperationType = 'TRIM' | 'LOWER' | 'UPPER' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM';
+type OperationType = 'TRIM' | 'LOWER' | 'UPPER' | 'ROUND' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM';
 
 const OPERATION_META: Record<
   OperationType,
@@ -50,6 +50,12 @@ const OPERATION_META: Record<
     description: 'Convert to UPPERCASE',
     color: 'bg-indigo-50 dark:bg-indigo-950/30 border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300',
     icon: '⬆️',
+  },
+  ROUND: {
+    label: 'Round',
+    description: 'Round numeric values to fixed decimals',
+    color: 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300',
+    icon: '🔢',
   },
   REGEX: {
     label: 'Regex',

@@ -11,7 +11,6 @@ impl WorkflowExecutor {
         &self,
         context: &ExecutionContext,
         config: &crate::orchestration::workflow::definition::DeduplicatorConfig,
-        rows: &[serde_json::Value],
     ) -> Result<Option<BatchStepExecutionResult>> {
         if !matches!(config.method, DedupMethod::Exact)
             || !matches!(config.keep, KeepStrategy::First)
@@ -20,22 +19,44 @@ impl WorkflowExecutor {
         }
 
         let operator = DeduplicatorBatchOperator;
-        let Some(result) = self
-            .try_with_context_batch_frame(context, rows, |frame| operator.execute(frame, config))?
+        if let Some((result, original_count)) =
+            self.try_with_cached_context_batch_frame(context, |frame| {
+                let original_count = frame.row_count();
+                operator
+                    .execute(frame, config)
+                    .map(|result| (result, original_count))
+            })?
+        {
+            return self.build_deduplicator_batch_result(config, result, original_count);
+        }
+
+        let rows = self.get_rows_from_context(context)?;
+        let Some(result) = self.try_with_context_batch_frame(context, &rows, |frame| {
+            operator.execute(frame, config)
+        })?
         else {
             return Ok(None);
         };
 
+        self.build_deduplicator_batch_result(config, result, rows.len())
+    }
+
+    fn build_deduplicator_batch_result(
+        &self,
+        config: &crate::orchestration::workflow::definition::DeduplicatorConfig,
+        result: crate::orchestration::workflow::runtime::frame::BatchFrame,
+        original_count: usize,
+    ) -> Result<Option<BatchStepExecutionResult>> {
         let deduped_count = result.row_count();
-        let duplicate_count = rows.len().saturating_sub(deduped_count);
-        let dedup_rate = if rows.is_empty() {
+        let duplicate_count = original_count.saturating_sub(deduped_count);
+        let dedup_rate = if original_count == 0 {
             0.0
         } else {
-            (duplicate_count as f64 / rows.len() as f64) * 100.0
+            (duplicate_count as f64 / original_count as f64) * 100.0
         };
         let modifications = vec![serde_json::json!({
             "field_name": "_deduplication",
-            "old_value": rows.len(),
+            "old_value": original_count,
             "new_value": deduped_count,
             "is_reversible": false,
             "operations": duplicate_count,
@@ -52,7 +73,10 @@ impl WorkflowExecutor {
         Ok(Some(build_batch_rows_success_result(
             result,
             vec![
-                ("_original_count".to_string(), serde_json::json!(rows.len())),
+                (
+                    "_original_count".to_string(),
+                    serde_json::json!(original_count),
+                ),
                 (
                     "_duplicates_removed".to_string(),
                     serde_json::json!(duplicate_count),

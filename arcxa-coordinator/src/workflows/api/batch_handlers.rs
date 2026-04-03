@@ -70,7 +70,7 @@ impl BatchJobApiState {
     }
 }
 
-async fn fetch_execution_runtime_metrics(
+pub(crate) async fn fetch_execution_runtime_metrics(
     execution_store: &ExecutionStore,
     execution_id: &str,
 ) -> Option<ExecutionRuntimeMetricsSummary> {
@@ -86,6 +86,23 @@ async fn fetch_execution_runtime_metrics(
             None
         }
     }
+}
+
+pub(crate) async fn summarize_batch_runtime_metrics(
+    execution_store: &ExecutionStore,
+    workflow_executions: &[WorkflowExecutionRef],
+) -> Option<ExecutionRuntimeMetricsSummary> {
+    let mut runtime_summaries = Vec::new();
+
+    for execution in workflow_executions {
+        if let Some(summary) =
+            fetch_execution_runtime_metrics(execution_store, &execution.execution_id).await
+        {
+            runtime_summaries.push(summary);
+        }
+    }
+
+    ExecutionRuntimeMetricsSummary::from_summaries(runtime_summaries.iter())
 }
 
 async fn build_batch_workflow_execution_details(
@@ -148,25 +165,17 @@ async fn build_batch_job_summary(
     execution_store: &ExecutionStore,
     batch_job: BatchJob,
 ) -> BatchJobSummary {
-    let runtime_summaries: Vec<ExecutionRuntimeMetricsSummary> = {
-        let mut summaries = Vec::new();
-        for execution in &batch_job.workflow_executions {
-            if let Some(summary) =
-                fetch_execution_runtime_metrics(execution_store, &execution.execution_id).await
-            {
-                summaries.push(summary);
-            }
-        }
-        summaries
-    };
-
     BatchJobSummary {
         job_id: batch_job.job_id,
         name: batch_job.name,
         workflow_id: batch_job.workflow_id,
         status: batch_job.status,
         progress: batch_job.progress,
-        runtime_metrics: ExecutionRuntimeMetricsSummary::from_summaries(runtime_summaries.iter()),
+        runtime_metrics: summarize_batch_runtime_metrics(
+            execution_store,
+            &batch_job.workflow_executions,
+        )
+        .await,
         created_at: batch_job.created_at,
         updated_at: batch_job.updated_at,
         started_at: batch_job.started_at,

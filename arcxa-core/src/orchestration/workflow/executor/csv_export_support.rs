@@ -1,7 +1,14 @@
 use anyhow::{Context, Result};
 
 use super::{ExecutionContext, WorkflowExecutor};
+use crate::orchestration::workflow::runtime::frame::BatchFrame;
 use crate::orchestration::workflow::runtime::operators::CsvExportBatchOperator;
+
+pub(super) struct CsvExportBatchExecution {
+    pub(super) rows_written: usize,
+    pub(super) columns: Vec<String>,
+    pub(super) frame: BatchFrame,
+}
 
 impl WorkflowExecutor {
     pub(super) fn try_execute_csv_export_batch(
@@ -9,8 +16,7 @@ impl WorkflowExecutor {
         context: &ExecutionContext,
         config: &crate::orchestration::workflow::definition::CsvExporterConfig,
         actual_output_path: &str,
-        rows: &[serde_json::Value],
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<CsvExportBatchExecution>> {
         let operator = CsvExportBatchOperator;
         let batch_config = crate::orchestration::workflow::definition::CsvExporterConfig {
             output_path: actual_output_path.to_string(),
@@ -19,9 +25,20 @@ impl WorkflowExecutor {
             encoding: config.encoding.clone(),
         };
 
-        self.try_with_context_batch_frame(context, rows, |frame| {
-            operator.execute(&frame, &batch_config)
-        })
+        if let Some(frame) = self.get_cached_context_batch_frame(context)? {
+            return Ok(self
+                .execute_csv_export_batch_frame(&operator, &batch_config, frame)
+                .ok());
+        }
+
+        let rows = self.get_rows_from_context(context)?;
+        let Some(frame) = self.get_context_batch_frame(context, &rows)? else {
+            return Ok(None);
+        };
+
+        Ok(self
+            .execute_csv_export_batch_frame(&operator, &batch_config, frame)
+            .ok())
     }
 
     pub(super) fn write_csv_export_rows(
@@ -69,5 +86,26 @@ impl WorkflowExecutor {
 
         writer.flush().context("Failed to flush CSV writer")?;
         Ok(rows_written)
+    }
+
+    fn execute_csv_export_batch_frame(
+        &self,
+        operator: &CsvExportBatchOperator,
+        batch_config: &crate::orchestration::workflow::definition::CsvExporterConfig,
+        frame: BatchFrame,
+    ) -> Result<CsvExportBatchExecution> {
+        let columns = frame
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        let rows_written = operator.execute(&frame, batch_config)?;
+
+        Ok(CsvExportBatchExecution {
+            rows_written,
+            columns,
+            frame,
+        })
     }
 }

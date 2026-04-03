@@ -34,17 +34,7 @@ impl FieldTransformerBatchOperator {
         config: &FieldTransformerConfig,
     ) -> Result<FieldTransformerBatchResult> {
         let metadata = frame.metadata().clone();
-        let rows = frame.to_json_values()?;
-        let object_rows = rows
-            .into_iter()
-            .map(|row| {
-                row.as_object().cloned().ok_or_else(|| {
-                    crate::orchestration::workflow::error::WorkflowError::InvalidData(
-                        "Batch field transformer requires object rows".into(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let object_rows = frame.to_object_rows()?;
         let (transformed_rows, stats, modifications) =
             crate::orchestration::workflow::field_transformer::transform_object_rows_with_metadata(
                 &object_rows,

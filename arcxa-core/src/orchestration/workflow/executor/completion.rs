@@ -44,7 +44,10 @@ impl WorkflowExecutor {
             completed_at,
             step_result.confidence,
             format!("Step '{}' failed", step.id),
-            state.context.working_data.clone(),
+            state
+                .context
+                .materialize_working_output()
+                .unwrap_or_else(|_| state.context.working_data.clone()),
         )
     }
 

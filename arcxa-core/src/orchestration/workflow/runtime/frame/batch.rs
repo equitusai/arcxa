@@ -1,11 +1,14 @@
 use super::json::{json_values_to_object_rows, object_rows_to_json_values};
-use super::schema::{infer_arrow_schema, FrameDataType, FrameSchemaProfile};
+use super::schema::{
+    infer_arrow_schema, schema_profile_from_arrow, FrameDataType, FrameSchemaProfile,
+};
 use crate::orchestration::workflow::error::{Result, WorkflowError};
 use crate::orchestration::workflow::RowAccessor;
 use arrow2::array::{
     Array, BooleanArray, MutableBooleanArray, MutablePrimitiveArray, MutableUtf8Array,
     PrimitiveArray, Utf8Array,
 };
+use arrow2::bitmap::Bitmap;
 use arrow2::chunk::Chunk;
 use arrow2::datatypes::Schema;
 use serde::{Deserialize, Serialize};
@@ -45,8 +48,7 @@ impl BatchFrame {
     }
 
     pub fn from_row_accessor(accessor: &RowAccessor) -> Result<Self> {
-        let rows = accessor.to_vec()?;
-        Self::from_json_values(&rows)
+        accessor.to_batch_frame()
     }
 
     pub fn from_object_rows(rows: &[Map<String, Value>]) -> Result<Self> {
@@ -59,6 +61,19 @@ impl BatchFrame {
             schema,
             columns,
             row_count: rows.len(),
+            metadata: BatchFrameMetadata::default(),
+        })
+    }
+
+    pub fn from_arrow_chunk(schema: Schema, columns: Chunk<Box<dyn Array>>) -> Result<Self> {
+        let schema_profile = schema_profile_from_arrow(&schema)?;
+        let row_count = columns.len();
+
+        Ok(Self {
+            schema_profile,
+            schema: Arc::new(schema),
+            columns,
+            row_count,
             metadata: BatchFrameMetadata::default(),
         })
     }
@@ -79,6 +94,50 @@ impl BatchFrame {
         self.row_count
     }
 
+    pub fn estimated_size_bytes(&self) -> usize {
+        self.schema
+            .fields
+            .iter()
+            .zip(self.columns.arrays().iter())
+            .map(|(field, column)| match field.data_type() {
+                arrow2::datatypes::DataType::Boolean => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("boolean schema/profile mismatch");
+                    bitmap_bytes(array.values()) + optional_bitmap_bytes(array.validity())
+                }
+                arrow2::datatypes::DataType::Int64 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<PrimitiveArray<i64>>()
+                        .expect("int64 schema/profile mismatch");
+                    array.values().len() * std::mem::size_of::<i64>()
+                        + optional_bitmap_bytes(array.validity())
+                }
+                arrow2::datatypes::DataType::Float64 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<PrimitiveArray<f64>>()
+                        .expect("float64 schema/profile mismatch");
+                    array.values().len() * std::mem::size_of::<f64>()
+                        + optional_bitmap_bytes(array.validity())
+                }
+                arrow2::datatypes::DataType::Utf8 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<Utf8Array<i32>>()
+                        .expect("utf8 schema/profile mismatch");
+                    array.values().len()
+                        + (array.offsets().len() * std::mem::size_of::<i32>())
+                        + optional_bitmap_bytes(array.validity())
+                }
+                arrow2::datatypes::DataType::Null => self.row_count.div_ceil(8),
+                _ => self.row_count * 16,
+            })
+            .sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
@@ -92,7 +151,7 @@ impl BatchFrame {
         self
     }
 
-    pub fn to_json_values(&self) -> Result<Vec<Value>> {
+    pub fn to_object_rows(&self) -> Result<Vec<Map<String, Value>>> {
         let mut rows = vec![Map::new(); self.row_count];
 
         for (field, column) in self.schema.fields.iter().zip(self.columns.arrays().iter()) {
@@ -189,8 +248,21 @@ impl BatchFrame {
             }
         }
 
-        Ok(object_rows_to_json_values(rows))
+        Ok(rows)
     }
+
+    pub fn to_json_values(&self) -> Result<Vec<Value>> {
+        self.to_object_rows().map(object_rows_to_json_values)
+    }
+}
+
+fn bitmap_bytes(bitmap: &Bitmap) -> usize {
+    let (bytes, _, _) = bitmap.as_slice();
+    bytes.len()
+}
+
+fn optional_bitmap_bytes(bitmap: Option<&Bitmap>) -> usize {
+    bitmap.map(bitmap_bytes).unwrap_or(0)
 }
 
 fn build_arrow_columns(
@@ -308,6 +380,21 @@ mod tests {
 
         let round_tripped = frame.to_json_values().expect("frame to round-trip");
         assert_eq!(round_tripped, rows);
+    }
+
+    #[test]
+    fn round_trips_object_rows_through_batch_frame() {
+        let rows = vec![
+            json!({"id": 1, "name": "alice", "active": true, "score": 10.5}),
+            json!({"id": 2, "name": "bob", "active": false, "score": null}),
+        ];
+
+        let frame = BatchFrame::from_json_values(&rows).expect("frame to build");
+        let object_rows = frame.to_object_rows().expect("object rows");
+
+        assert_eq!(object_rows.len(), 2);
+        assert_eq!(object_rows[0].get("name"), Some(&json!("alice")));
+        assert_eq!(object_rows[1].get("active"), Some(&json!(false)));
     }
 
     #[test]

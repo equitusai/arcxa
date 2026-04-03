@@ -48,6 +48,18 @@ export function TransformationPreview({
             currentValue = String(currentValue).toUpperCase();
             break;
 
+          case 'ROUND': {
+            const decimals = Number(operation.params?.decimals ?? 0);
+            const numericValue = Number(currentValue);
+
+            if (!Number.isFinite(numericValue)) {
+              throw new Error('ROUND: Value must be numeric');
+            }
+
+            currentValue = numericValue.toFixed(decimals);
+            break;
+          }
+
           case 'REGEX': {
             const pattern = operation.params?.pattern;
             const replacement = operation.params?.replacement ?? '';

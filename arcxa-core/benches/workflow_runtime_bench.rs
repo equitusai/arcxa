@@ -33,11 +33,11 @@ use graphica_core::orchestration::workflow::executor::{
 use graphica_core::orchestration::workflow::input::{
     DatasetResolver, JsonInputAdapter, WorkflowInput,
 };
-use graphica_core::orchestration::workflow::{DatasetInputAdapter, WorkflowEngine};
 #[cfg(feature = "workflow-storage")]
 use graphica_core::orchestration::workflow::{
-    ExecutionContextV2, StorageManager, StorageType as WorkflowStorageType,
+    BatchFrame, ExecutionContextV2, StorageManager, StorageType as WorkflowStorageType,
 };
+use graphica_core::orchestration::workflow::{DatasetInputAdapter, WorkflowEngine};
 use serde_json::{json, Map, Value as JsonValue};
 #[cfg(feature = "workflow-storage")]
 use tempfile::tempdir;
@@ -78,9 +78,15 @@ impl BenchProfile {
         match self {
             Self::Baseline => vec![
                 ("rocksdb_round_trip", 150_000, WorkflowStorageType::RocksDB),
+                ("rocksdb_round_trip", 500_000, WorkflowStorageType::RocksDB),
                 (
                     "parquet_round_trip",
                     1_200_000,
+                    WorkflowStorageType::Parquet,
+                ),
+                (
+                    "parquet_round_trip",
+                    2_000_000,
                     WorkflowStorageType::Parquet,
                 ),
             ],
@@ -140,10 +146,15 @@ fn configure_storage_group(
             group.warm_up_time(Duration::from_secs(1));
             group.measurement_time(Duration::from_secs(10));
         }
+        (BenchProfile::Baseline, 200_001..=1_500_000) => {
+            group.sample_size(10);
+            group.warm_up_time(Duration::from_secs(1));
+            group.measurement_time(Duration::from_secs(40));
+        }
         (BenchProfile::Baseline, _) => {
             group.sample_size(10);
             group.warm_up_time(Duration::from_secs(1));
-            group.measurement_time(Duration::from_secs(10));
+            group.measurement_time(Duration::from_secs(120));
         }
         (BenchProfile::Quick, _) => {
             group.sample_size(10);
@@ -654,12 +665,75 @@ fn benchmark_storage_tiering_round_trip(c: &mut Criterion) {
 #[cfg(not(feature = "workflow-storage"))]
 fn benchmark_storage_tiering_round_trip(_: &mut Criterion) {}
 
+#[cfg(feature = "workflow-storage")]
+fn benchmark_storage_tiering_batch_frame_round_trip(c: &mut Criterion) {
+    let profile = BenchProfile::from_env();
+    let cases = profile.storage_tiering_cases();
+    if cases.is_empty() {
+        return;
+    }
+
+    let rocks_dir = tempdir().expect("rocks tempdir");
+    let temp_dir = tempdir().expect("spill tempdir");
+    let storage_manager =
+        Arc::new(StorageManager::new(rocks_dir.path(), temp_dir.path()).expect("storage manager"));
+    let mut group = c.benchmark_group("workflow_runtime/storage_tiering_batch_frame_round_trip");
+
+    for (case_name, size, expected_storage_type) in cases {
+        let frame = Arc::new(BatchFrame::from_json_values(&generate_rows(size)).expect("frame"));
+        group.throughput(Throughput::Elements(size as u64));
+        configure_storage_group(&mut group, profile, size);
+
+        group.bench_with_input(BenchmarkId::new(case_name, size), &size, |b, _| {
+            let frame = frame.clone();
+            let storage_manager = storage_manager.clone();
+
+            b.iter(|| {
+                let mut ctx =
+                    ExecutionContextV2::with_storage_manager(json!({}), storage_manager.clone());
+                ctx.resource_limits.max_row_count = size.saturating_mul(2);
+                ctx.resource_limits.max_memory_bytes = usize::MAX / 4;
+                ctx.set_current_step(case_name.to_string());
+                ctx.set_batch_frame((*frame).clone())
+                    .expect("storage placement to succeed");
+
+                let actual_storage_type = ctx
+                    .row_storage
+                    .as_ref()
+                    .expect("row storage to be present")
+                    .storage_type();
+                assert_eq!(actual_storage_type, expected_storage_type);
+
+                let frame = ctx.get_batch_frame().expect("batch frame");
+                let row_count = frame.row_count();
+                let column_count = frame.schema().fields.len();
+                let reserved_bytes = ctx.get_metrics().total_spill_reserved_bytes_current;
+                let storage_location = ctx
+                    .get_metrics()
+                    .recent_storage_decisions
+                    .last()
+                    .and_then(|decision| decision.storage_location.clone());
+
+                ctx.cleanup().expect("cleanup");
+
+                black_box((row_count, column_count, reserved_bytes, storage_location))
+            });
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "workflow-storage"))]
+fn benchmark_storage_tiering_batch_frame_round_trip(_: &mut Criterion) {}
+
 criterion_group!(
     benches,
     benchmark_dataset_transform,
     benchmark_dataset_transform_validate,
     benchmark_extract_transform_load,
     benchmark_stream_micro_batch_transform_validate,
-    benchmark_storage_tiering_round_trip
+    benchmark_storage_tiering_round_trip,
+    benchmark_storage_tiering_batch_frame_round_trip
 );
 criterion_main!(benches);

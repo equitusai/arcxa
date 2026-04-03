@@ -15,6 +15,8 @@
 //! - Schema names are typically uppercase
 //! - TABSCHEMA for schema name, TABNAME for table name
 //! - Statistics stored directly in SYSCAT.COLUMNS
+//! - Null-fraction is not reliably available in the DB2 catalog we target, so we
+//!   report a conservative `0.0` fallback instead of issuing unsupported queries
 //!
 //! ## Performance
 //!
@@ -134,6 +136,10 @@ FETCH FIRST {} ROWS ONLY
     /// - COLCARD: Number of distinct values (cardinality)
     /// - HIGH2KEY/LOW2KEY: High/low values
     /// - AVGCOLLEN: Average column length
+    ///
+    /// DB2 community images used in our demo/runtime do not expose a reliable
+    /// catalog field for null-fraction, so we keep that metric at `0.0` here
+    /// instead of issuing slower table probes or unsupported catalog queries.
     fn build_statistics_query(schema: &str, table_name: &str, column_name: &str) -> String {
         let upper_schema = schema.to_uppercase();
         let upper_table = table_name.to_uppercase();
@@ -146,11 +152,7 @@ SELECT
     TABNAME as table_name,
     COLNAME as column_name,
     COLCARD as distinct_count,
-    CASE WHEN NULLS = 'Y' THEN
-        CAST((SELECT FLOAT(STATS_ROWS_MODIFIED) / NULLIF(CARD, 0)
-              FROM SYSCAT.TABLES
-              WHERE TABSCHEMA = c.TABSCHEMA AND TABNAME = c.TABNAME) AS DECIMAL(5,2))
-    ELSE 0.0 END as null_fraction,
+    CAST(0 AS DECIMAL(5,2)) as null_fraction,
     HIGH2KEY as high_value,
     LOW2KEY as low_value,
     AVGCOLLEN as avg_length

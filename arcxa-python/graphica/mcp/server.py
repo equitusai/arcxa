@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import requests
 import sys
 import time
 from dataclasses import dataclass
@@ -1508,9 +1509,43 @@ def build_client_from_env(environ: Optional[Dict[str, str]] = None) -> Client:
     if token:
         auth = TokenAuth(token)
     elif username and password:
-        auth = BasicAuth(username, password)
+        auth = _build_login_auth(base_url, username, password, timeout)
 
     return Client(base_url=base_url, auth=auth, timeout=timeout)
+
+
+def _build_login_auth(base_url: str, username: str, password: str, timeout: int) -> Any:
+    """Build auth for MCP requests using the same token login flow as the frontend."""
+    login_url = f"{_auth_root_url(base_url)}/auth/login"
+    response = requests.post(
+        login_url,
+        json={"username": username, "password": password},
+        timeout=timeout,
+    )
+
+    # Older deployments may still rely on direct Basic auth on protected routes.
+    if response.status_code in {404, 405}:
+        logger.info("Falling back to Basic auth because %s is unavailable", login_url)
+        return BasicAuth(username, password)
+
+    if response.status_code == 401:
+        raise RuntimeError("Authentication failed")
+    if not response.ok:
+        message = response.text.strip() or f"Login failed with HTTP {response.status_code}"
+        raise RuntimeError(message)
+
+    payload = response.json()
+    token = payload.get("token")
+    if not token:
+        raise RuntimeError("Authentication succeeded but no token was returned")
+    return TokenAuth(token)
+
+
+def _auth_root_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/api/v1"):
+        normalized = normalized[: -len("/api/v1")]
+    return normalized
 
 
 def read_message(stdin: Any) -> Optional[JSON]:

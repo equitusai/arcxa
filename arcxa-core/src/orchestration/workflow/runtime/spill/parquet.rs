@@ -3,8 +3,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow2::array::{Array, BooleanArray, PrimitiveArray, Utf8Array};
+use arrow2::array::{new_empty_array, Array, BooleanArray, PrimitiveArray, Utf8Array};
 use arrow2::chunk::Chunk;
+use arrow2::compute::concatenate::concatenate;
 use arrow2::datatypes::Schema;
 use arrow2::io::parquet::read;
 use arrow2::io::parquet::write::{
@@ -51,8 +52,17 @@ pub(crate) fn create_parquet_storage(
     step_id: &str,
     rows: &[Value],
 ) -> Result<ParquetStorageDescriptor> {
-    let prepared = prepare_parquet_spill(temp_dir, execution_id, step_id)?;
     let batch = BatchFrame::from_json_values(rows)?;
+    create_parquet_storage_from_batch_frame(temp_dir, execution_id, step_id, &batch)
+}
+
+pub(crate) fn create_parquet_storage_from_batch_frame(
+    temp_dir: &Path,
+    execution_id: &str,
+    step_id: &str,
+    batch: &BatchFrame,
+) -> Result<ParquetStorageDescriptor> {
+    let prepared = prepare_parquet_spill(temp_dir, execution_id, step_id)?;
     let schema = Arc::new(batch.schema().clone());
     let row_group_index = build_row_group_index(batch.row_count(), DEFAULT_PARQUET_ROW_GROUP_SIZE);
 
@@ -97,7 +107,7 @@ pub(crate) fn create_parquet_storage(
     Ok(ParquetStorageDescriptor {
         path: prepared.path,
         schema,
-        row_count: rows.len(),
+        row_count: batch.row_count(),
         index: Arc::new(row_group_index),
         file_size_bytes,
     })
@@ -105,6 +115,10 @@ pub(crate) fn create_parquet_storage(
 
 pub(crate) fn read_parquet_rows(path: &Path) -> Result<Vec<Value>> {
     read_selected_row_groups(path, None)
+}
+
+pub(crate) fn read_parquet_batch_frame(path: &Path) -> Result<BatchFrame> {
+    read_selected_row_groups_as_batch_frame(path, None)
 }
 
 pub(crate) fn read_parquet_range(
@@ -233,6 +247,67 @@ fn read_selected_row_groups(path: &Path, selected_groups: Option<&[usize]>) -> R
     Ok(rows)
 }
 
+fn read_selected_row_groups_as_batch_frame(
+    path: &Path,
+    selected_groups: Option<&[usize]>,
+) -> Result<BatchFrame> {
+    let mut file = File::open(path).map_err(|e| WorkflowError::IoError(e.to_string()))?;
+    let metadata =
+        read::read_metadata(&mut file).map_err(|e| WorkflowError::Storage(e.to_string()))?;
+    let schema =
+        read::infer_schema(&metadata).map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+    let selected_set = selected_groups.map(|groups| groups.iter().copied().collect::<HashSet<_>>());
+    let row_groups = metadata
+        .row_groups
+        .into_iter()
+        .enumerate()
+        .filter(|(ordinal, _)| {
+            selected_set
+                .as_ref()
+                .map(|groups| groups.contains(ordinal))
+                .unwrap_or(true)
+        })
+        .map(|(_, row_group)| row_group)
+        .collect::<Vec<_>>();
+
+    let mut reader = read::FileReader::new(file, row_groups, schema.clone(), None, None, None);
+    let mut fragments: Vec<Vec<Box<dyn Array>>> =
+        (0..schema.fields.len()).map(|_| Vec::new()).collect();
+
+    while let Some(chunk) = reader.next() {
+        let chunk = chunk.map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        for (column_index, array) in chunk.into_arrays().into_iter().enumerate() {
+            fragments[column_index].push(array);
+        }
+    }
+
+    let arrays = fragments
+        .into_iter()
+        .enumerate()
+        .map(|(column_index, column_fragments)| {
+            if column_fragments.is_empty() {
+                Ok(new_empty_array(
+                    schema.fields[column_index].data_type().clone(),
+                ))
+            } else if column_fragments.len() == 1 {
+                Ok(column_fragments
+                    .into_iter()
+                    .next()
+                    .expect("single fragment"))
+            } else {
+                let refs = column_fragments
+                    .iter()
+                    .map(|array| array.as_ref())
+                    .collect::<Vec<_>>();
+                concatenate(&refs).map_err(|e| WorkflowError::Storage(e.to_string()))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    BatchFrame::from_arrow_chunk(schema, Chunk::new(arrays))
+}
+
 fn chunk_to_json_rows(schema: &Schema, chunk: &Chunk<Box<dyn Array>>) -> Result<Vec<Value>> {
     if schema.fields.len() != chunk.arrays().len() {
         return Err(WorkflowError::InvalidData(format!(
@@ -341,12 +416,13 @@ fn chunk_to_json_rows(schema: &Schema, chunk: &Chunk<Box<dyn Array>>) -> Result<
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::orchestration::workflow::runtime::frame::BatchFrame;
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        create_parquet_storage, prepare_parquet_spill, read_parquet_range, read_parquet_row,
-        read_parquet_rows,
+        create_parquet_storage, create_parquet_storage_from_batch_frame, prepare_parquet_spill,
+        read_parquet_batch_frame, read_parquet_range, read_parquet_row, read_parquet_rows,
     };
 
     #[test]
@@ -384,6 +460,27 @@ mod tests {
 
         let ranged = read_parquet_range(&storage.path, &storage.index, 1, 3).unwrap();
         assert_eq!(ranged, rows[1..3].to_vec());
+
+        let frame = read_parquet_batch_frame(&storage.path).unwrap();
+        assert_eq!(frame.to_json_values().unwrap(), rows);
+    }
+
+    #[test]
+    fn parquet_storage_from_batch_frame_round_trips_rows() {
+        let temp_dir = tempdir().unwrap();
+        let rows = vec![
+            json!({"id": 1, "name": "alpha", "active": true, "score": 10.5}),
+            json!({"id": 2, "name": "beta", "active": false, "score": 11.25}),
+            json!({"id": 3, "name": "gamma", "active": true, "score": 12.75}),
+        ];
+        let frame = BatchFrame::from_json_values(&rows).unwrap();
+
+        let storage =
+            create_parquet_storage_from_batch_frame(temp_dir.path(), "exec_1", "step_b", &frame)
+                .unwrap();
+
+        let materialized = read_parquet_rows(&storage.path).unwrap();
+        assert_eq!(materialized, rows);
     }
 
     #[test]

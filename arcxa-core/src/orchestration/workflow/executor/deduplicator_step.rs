@@ -2,7 +2,10 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
 use super::utilities::parse_row_id_key;
-use super::{build_rows_output, BatchStepExecutionResult, ExecutionContext, WorkflowExecutor};
+use super::{
+    build_materialized_rows_step_result, BatchStepExecutionResult, ExecutionContext,
+    WorkflowExecutor,
+};
 use crate::core::lineage::row_level::{RowId, RowLineageEvent, RowTransformation};
 use crate::orchestration::workflow::lineage_tracker::{RowTransformationEvent, TransformationType};
 
@@ -22,17 +25,16 @@ impl WorkflowExecutor {
         );
 
         tracing::info!("DEDUP: Starting deduplication step");
-        let rows = self.get_rows_from_context(context)?;
-        let original_count = rows.len();
-        tracing::info!("DEDUP: Retrieved {} rows from context", original_count);
 
         if context.row_lineage.is_none() && self.lineage_tracker.is_none() {
-            if let Some(batch_result) =
-                self.try_execute_deduplicator_batch(context, config, &rows)?
-            {
+            if let Some(batch_result) = self.try_execute_deduplicator_batch(context, config)? {
                 return Ok(batch_result);
             }
         }
+
+        let rows = self.get_rows_from_context(context)?;
+        let original_count = rows.len();
+        tracing::info!("DEDUP: Retrieved {} rows from context", original_count);
 
         let mut seen_keys: HashMap<String, Vec<usize>> = HashMap::new();
         let mut deduped_rows: Vec<serde_json::Value> = Vec::new();
@@ -411,11 +413,8 @@ impl WorkflowExecutor {
             }
         })];
 
-        let deduped_count = deduped_rows.len();
-
-        Ok(BatchStepExecutionResult::success(build_rows_output(
+        Ok(build_materialized_rows_step_result(
             deduped_rows,
-            deduped_count,
             vec![
                 (
                     "_original_count".to_string(),
@@ -430,6 +429,8 @@ impl WorkflowExecutor {
                     serde_json::Value::Array(modifications),
                 ),
             ],
-        )))
+            true,
+            1.0,
+        ))
     }
 }

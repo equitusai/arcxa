@@ -10,11 +10,29 @@ impl WorkflowExecutor {
         &self,
         context: &ExecutionContext,
         config: &crate::orchestration::workflow::definition::AggregatorConfig,
-        rows: &[serde_json::Value],
     ) -> Result<Option<BatchStepExecutionResult>> {
         let operator = AggregatorBatchOperator;
-        let Some(result) = self
-            .try_with_context_batch_frame(context, rows, |frame| operator.execute(frame, config))?
+        if let Some((result, original_count)) =
+            self.try_with_cached_context_batch_frame(context, |frame| {
+                let original_count = frame.row_count();
+                operator
+                    .execute(frame, config)
+                    .map(|result| (result, original_count))
+            })?
+        {
+            return Ok(Some(build_batch_rows_success_result(
+                result,
+                vec![(
+                    "_original_count".to_string(),
+                    serde_json::json!(original_count),
+                )],
+            )?));
+        }
+
+        let rows = self.get_rows_from_context(context)?;
+        let Some(result) = self.try_with_context_batch_frame(context, &rows, |frame| {
+            operator.execute(frame, config)
+        })?
         else {
             return Ok(None);
         };

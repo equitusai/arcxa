@@ -23,6 +23,12 @@ fn create_test_workflow() -> WorkflowDefinition {
     }
 }
 
+fn build_large_result_rows(count: usize) -> Vec<serde_json::Value> {
+    (0..count)
+        .map(|idx| serde_json::json!({"id": idx, "status": "done"}))
+        .collect()
+}
+
 #[derive(Default)]
 struct TestLineageTracker {
     workflow_starts: Mutex<Vec<WorkflowExecutionRecord>>,
@@ -1293,6 +1299,138 @@ fn test_build_successful_workflow_completion_preserves_run_state_and_output_rows
     assert_eq!(result.confidence, 0.95);
     assert_eq!(result.final_output, final_output);
     assert_eq!(result.output_rows.as_ref().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn test_complete_session_outcome_materializes_large_batch_backed_final_output() {
+    use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+    use crate::orchestration::rules::RuleExecutor;
+    use crate::orchestration::workflow::runtime::frame::BatchFrame;
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let executor = WorkflowExecutor::new(workflow, invoker, rule_executor).unwrap();
+
+    let rows = build_large_result_rows(10_001);
+    let frame = BatchFrame::from_json_values(&rows).unwrap();
+    let run_state = WorkflowRunState {
+        execution_id: "exec_large_final_output".to_string(),
+        started_at: chrono::Utc::now(),
+    };
+    let mut step_results = HashMap::new();
+    step_results.insert(
+        "gate1".to_string(),
+        StepResult {
+            step_id: "gate1".to_string(),
+            success: true,
+            output: serde_json::json!({"confidence": 0.95}),
+            confidence: 0.95,
+            started_at: run_state.started_at,
+            completed_at: run_state.started_at,
+            batch_metadata: None,
+            runtime_metrics: None,
+            batch_frame: None,
+        },
+    );
+
+    let mut context = ExecutionContext::new(serde_json::json!({
+        "_row_count": 10_001,
+        "_status": "done"
+    }));
+    context.batch_frame = Some(frame);
+
+    let result = executor
+        .complete_session_outcome(
+            &run_state,
+            ExecuteLoopOutcome::Completed {
+                context,
+                step_results,
+            },
+        )
+        .await
+        .expect("completion should materialize rows from cached frame");
+
+    assert!(result.success);
+    assert_eq!(result.final_output["_row_count"], 10_001);
+    assert_eq!(result.final_output["_status"], "done");
+    assert_eq!(result.output_rows.as_ref().map(Vec::len), Some(10_001));
+    assert_eq!(result.final_output["_rows"][0]["id"], 0);
+    assert_eq!(result.final_output["_rows"][10_000]["id"], 10_000);
+}
+
+#[test]
+fn test_build_failed_workflow_completion_materializes_large_batch_backed_rows() {
+    use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+    use crate::orchestration::rules::RuleExecutor;
+    use crate::orchestration::workflow::runtime::frame::BatchFrame;
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let executor = WorkflowExecutor::new(workflow, invoker, rule_executor).unwrap();
+
+    let started_at = chrono::Utc::now();
+    let completed_at = started_at + chrono::Duration::milliseconds(5);
+    let run_state = WorkflowRunState {
+        execution_id: "exec_large_failed_output".to_string(),
+        started_at,
+    };
+    let step = WorkflowStep {
+        id: "failed_step".to_string(),
+        step_type: StepType::ConfidenceGate,
+        config: StepConfig::ConfidenceGate(ConfidenceGateConfig {
+            threshold: 0.5,
+            input_step: None,
+        }),
+        depends_on: vec![],
+    };
+    let step_result = StepResult {
+        step_id: step.id.clone(),
+        success: false,
+        output: serde_json::json!({
+            "_row_count": 10_001,
+            "_status": "failed"
+        }),
+        confidence: 0.25,
+        started_at,
+        completed_at: started_at,
+        batch_metadata: None,
+        runtime_metrics: None,
+        batch_frame: None,
+    };
+
+    let rows = build_large_result_rows(10_001);
+    let frame = BatchFrame::from_json_values(&rows).unwrap();
+
+    let mut state = ExecuteLoopState::new(ExecutionContext::new(serde_json::json!({})));
+    state
+        .step_results
+        .insert(step.id.clone(), step_result.clone());
+    state.context.working_data = serde_json::json!({
+        "_row_count": 10_001,
+        "_status": "failed"
+    });
+    state.context.batch_frame = Some(frame);
+
+    let result = executor.build_failed_workflow_completion(
+        &run_state,
+        &step,
+        &step_result,
+        &state,
+        completed_at,
+    );
+
+    assert!(!result.success);
+    assert_eq!(result.final_output["_row_count"], 10_001);
+    assert_eq!(result.final_output["_status"], "failed");
+    assert_eq!(result.output_rows.as_ref().map(Vec::len), Some(10_001));
+    assert_eq!(result.final_output["_rows"][0]["id"], 0);
+    assert_eq!(result.final_output["_rows"][10_000]["id"], 10_000);
 }
 
 #[tokio::test]

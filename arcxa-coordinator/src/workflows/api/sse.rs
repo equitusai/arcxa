@@ -18,8 +18,10 @@
 //! });
 //! ```
 
-use crate::workflows::domain::{BatchJobStatus, WorkflowExecutionStatus};
-use crate::workflows::storage::BatchJobStore;
+use crate::workflows::domain::{
+    BatchJobStatus, ExecutionRuntimeMetricsSummary, WorkflowExecutionStatus,
+};
+use crate::workflows::storage::{BatchJobStore, ExecutionStore};
 use axum::{
     extract::{Path, State},
     response::{
@@ -33,10 +35,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tokio_stream::StreamExt as _;
 use tracing::{debug, error, info};
 
-use super::batch_handlers::BatchJobApiState;
+use super::batch_handlers::{summarize_batch_runtime_metrics, BatchJobApiState};
 use super::handlers::ApiError;
 
 /// Batch job progress event
@@ -47,6 +48,8 @@ pub enum ProgressEvent {
     Connected {
         job_id: String,
         status: BatchJobStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
     },
 
     /// Progress update
@@ -62,6 +65,8 @@ pub enum ProgressEvent {
         progress_percent: f64,
         current_wave: Option<usize>,
         total_waves: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
     },
 
     /// Workflow execution update
@@ -74,6 +79,8 @@ pub enum ProgressEvent {
         error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         rows_processed: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
     },
 
     /// Batch job completed
@@ -83,6 +90,8 @@ pub enum ProgressEvent {
         total_completed: usize,
         total_failed: usize,
         duration_ms: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
     },
 
     /// Batch job failed
@@ -90,6 +99,8 @@ pub enum ProgressEvent {
         job_id: String,
         error: String,
         failed_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
     },
 
     /// Batch job cancelled
@@ -97,6 +108,8 @@ pub enum ProgressEvent {
         job_id: String,
         completed_count: usize,
         pending_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
     },
 
     /// Heartbeat to keep connection alive
@@ -140,7 +153,18 @@ pub async fn stream_batch_job_progress(
         .ok_or_else(|| ApiError::NotFound(format!("Batch job not found: {}", job_id)))?;
 
     // Create event stream
-    let stream = create_progress_stream(state.batch_store.clone(), job_id.clone());
+    let initial_runtime_metrics = summarize_batch_runtime_metrics(
+        state.execution_store.as_ref(),
+        &batch_job.workflow_executions,
+    )
+    .await;
+    let stream = create_progress_stream(
+        state.batch_store.clone(),
+        state.execution_store.clone(),
+        job_id.clone(),
+        batch_job.status,
+        initial_runtime_metrics,
+    );
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -148,7 +172,10 @@ pub async fn stream_batch_job_progress(
 /// Create a progress event stream for a batch job
 fn create_progress_stream(
     batch_store: Arc<BatchJobStore>,
+    execution_store: Arc<ExecutionStore>,
     job_id: String,
+    initial_status: BatchJobStatus,
+    initial_runtime_metrics: Option<ExecutionRuntimeMetricsSummary>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     // Poll interval (1 second)
     let poll_interval = Duration::from_secs(1);
@@ -157,8 +184,55 @@ fn create_progress_stream(
     let heartbeat_interval = Duration::from_secs(30);
 
     stream::unfold(
-        (batch_store, job_id, 0, std::time::Instant::now()),
-        move |(store, job_id, mut heartbeat_counter, last_heartbeat)| async move {
+        (
+            batch_store,
+            execution_store,
+            job_id,
+            0,
+            std::time::Instant::now(),
+            false,
+            initial_status,
+            initial_runtime_metrics,
+        ),
+        move |(
+            store,
+            execution_store,
+            job_id,
+            heartbeat_counter,
+            last_heartbeat,
+            connected_sent,
+            initial_status,
+            initial_runtime_metrics,
+        )| async move {
+            if !connected_sent {
+                let connected_event = ProgressEvent::Connected {
+                    job_id: job_id.clone(),
+                    status: initial_status,
+                    runtime_metrics: initial_runtime_metrics.clone(),
+                };
+
+                match connected_event.to_sse_event() {
+                    Ok(event) => {
+                        return Some((
+                            Ok(event),
+                            (
+                                store,
+                                execution_store,
+                                job_id,
+                                heartbeat_counter,
+                                last_heartbeat,
+                                true,
+                                initial_status,
+                                initial_runtime_metrics,
+                            ),
+                        ));
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize connected event: {}", e);
+                    }
+                }
+            }
+
             // Check if we should send a heartbeat
             let now = std::time::Instant::now();
             let since_heartbeat = now.duration_since(last_heartbeat);
@@ -170,7 +244,19 @@ fn create_progress_stream(
 
                 match heartbeat_event.to_sse_event() {
                     Ok(event) => {
-                        return Some((Ok(event), (store, job_id, 0, now)));
+                        return Some((
+                            Ok(event),
+                            (
+                                store,
+                                execution_store,
+                                job_id,
+                                0,
+                                now,
+                                connected_sent,
+                                initial_status,
+                                initial_runtime_metrics,
+                            ),
+                        ));
                     }
                     Err(e) => {
                         error!("Failed to serialize heartbeat event: {}", e);
@@ -181,6 +267,12 @@ fn create_progress_stream(
             // Poll batch job status
             match store.get(&job_id) {
                 Ok(Some(batch_job)) => {
+                    let runtime_metrics = summarize_batch_runtime_metrics(
+                        execution_store.as_ref(),
+                        &batch_job.workflow_executions,
+                    )
+                    .await;
+
                     debug!(
                         "Batch job {} status: {:?}, progress: {:.1}%",
                         job_id, batch_job.status, batch_job.progress.progress_percent
@@ -194,18 +286,21 @@ fn create_progress_stream(
                             total_completed: batch_job.progress.completed,
                             total_failed: batch_job.progress.failed,
                             duration_ms: batch_job.duration_ms(),
+                            runtime_metrics,
                         }
                     } else if batch_job.status == BatchJobStatus::Failed {
                         ProgressEvent::Failed {
                             job_id: batch_job.job_id.clone(),
                             error: "Batch job execution failed".to_string(),
                             failed_count: batch_job.progress.failed,
+                            runtime_metrics,
                         }
                     } else if batch_job.status == BatchJobStatus::Cancelled {
                         ProgressEvent::Cancelled {
                             job_id: batch_job.job_id.clone(),
                             completed_count: batch_job.progress.completed,
                             pending_count: batch_job.progress.pending,
+                            runtime_metrics,
                         }
                     } else {
                         ProgressEvent::Progress {
@@ -220,6 +315,7 @@ fn create_progress_stream(
                             progress_percent: batch_job.progress.progress_percent,
                             current_wave: None,
                             total_waves: None,
+                            runtime_metrics,
                         }
                     };
 
@@ -234,7 +330,16 @@ fn create_progress_stream(
                                 info!("Batch job {} reached terminal state, ending stream", job_id);
                                 return Some((
                                     Ok(sse_event),
-                                    (store, job_id, heartbeat_counter + 1, last_heartbeat),
+                                    (
+                                        store,
+                                        execution_store,
+                                        job_id,
+                                        heartbeat_counter + 1,
+                                        last_heartbeat,
+                                        connected_sent,
+                                        initial_status,
+                                        initial_runtime_metrics,
+                                    ),
                                 ));
                             }
 
@@ -243,7 +348,16 @@ fn create_progress_stream(
 
                             Some((
                                 Ok(sse_event),
-                                (store, job_id, heartbeat_counter + 1, last_heartbeat),
+                                (
+                                    store,
+                                    execution_store,
+                                    job_id,
+                                    heartbeat_counter + 1,
+                                    last_heartbeat,
+                                    connected_sent,
+                                    initial_status,
+                                    initial_runtime_metrics,
+                                ),
                             ))
                         }
                         Err(e) => {
@@ -253,7 +367,16 @@ fn create_progress_stream(
                                 Ok(Event::default()
                                     .event("error")
                                     .data("Failed to serialize event")),
-                                (store, job_id, heartbeat_counter + 1, last_heartbeat),
+                                (
+                                    store,
+                                    execution_store,
+                                    job_id,
+                                    heartbeat_counter + 1,
+                                    last_heartbeat,
+                                    connected_sent,
+                                    initial_status,
+                                    initial_runtime_metrics,
+                                ),
                             ))
                         }
                     }
@@ -269,7 +392,16 @@ fn create_progress_stream(
                         Ok(Event::default()
                             .event("error")
                             .data(format!("Failed to fetch batch job: {}", e))),
-                        (store, job_id, heartbeat_counter + 1, last_heartbeat),
+                        (
+                            store,
+                            execution_store,
+                            job_id,
+                            heartbeat_counter + 1,
+                            last_heartbeat,
+                            connected_sent,
+                            initial_status,
+                            initial_runtime_metrics,
+                        ),
                     ))
                 }
             }
@@ -295,6 +427,7 @@ mod tests {
             progress_percent: 60.0,
             current_wave: Some(2),
             total_waves: Some(4),
+            runtime_metrics: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -311,6 +444,7 @@ mod tests {
             total_completed: 18,
             total_failed: 2,
             duration_ms: Some(120000),
+            runtime_metrics: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -327,6 +461,7 @@ mod tests {
             status: WorkflowExecutionStatus::Completed,
             error: None,
             rows_processed: Some(10000),
+            runtime_metrics: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -340,7 +475,42 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        let sse_event = event.to_sse_event().unwrap();
+        let _sse_event = event.to_sse_event().unwrap();
         // SSE event should be created successfully
+    }
+
+    #[test]
+    fn test_progress_event_serialization_includes_runtime_metrics() {
+        let event = ProgressEvent::Progress {
+            job_id: "batch_123".to_string(),
+            status: BatchJobStatus::Running,
+            total_files: 20,
+            pending: 5,
+            in_progress: 3,
+            completed: 10,
+            failed: 2,
+            retrying: 0,
+            progress_percent: 60.0,
+            current_wave: Some(2),
+            total_waves: Some(4),
+            runtime_metrics: Some(ExecutionRuntimeMetricsSummary {
+                steps_with_runtime_metrics: 2,
+                steps_with_disk_storage: 1,
+                total_spill_events: 3,
+                total_spill_bytes: 4096,
+                max_memory_high_water_mark: 8192,
+                max_reserved_spill_bytes: 2048,
+                max_execution_reserved_spill_bytes: 1024,
+                max_total_reserved_spill_bytes: 4096,
+                storage_backends: vec!["parquet".to_string()],
+                planned_tiers: vec!["spill_parquet".to_string()],
+                storage_decision_reasons: vec!["spill_threshold_exceeded".to_string()],
+            }),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"runtime_metrics\""));
+        assert!(json.contains("\"steps_with_runtime_metrics\":2"));
+        assert!(json.contains("\"storage_backends\":[\"parquet\"]"));
     }
 }

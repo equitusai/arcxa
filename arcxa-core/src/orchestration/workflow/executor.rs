@@ -73,8 +73,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use self::batch_results::{
-    build_batch_rows_step_result, build_batch_rows_success_result, build_rows_output,
-    BatchStepExecutionResult,
+    build_batch_rows_step_result, build_batch_rows_success_result,
+    build_materialized_rows_step_result, build_rows_output, BatchStepExecutionResult,
 };
 use self::utilities::extract_materializable_rows;
 #[cfg(test)]
@@ -434,6 +434,8 @@ pub struct ExecutionContext {
     pub batch_frame: Option<BatchFrame>,
 }
 
+pub(super) const LARGE_ROW_PAYLOAD_THRESHOLD: u64 = 10_000;
+
 impl ExecutionContext {
     pub fn new(input_data: serde_json::Value) -> Self {
         // Initialize working_data as a copy of input_data
@@ -499,12 +501,16 @@ impl ExecutionContext {
         output: &serde_json::Value,
         batch_frame: Option<BatchFrame>,
     ) -> Result<()> {
+        let working_output = Self::build_working_output_with_batch(output, batch_frame.as_ref());
+
         if let serde_json::Value::Object(ref mut working_obj) = self.working_data {
-            if let serde_json::Value::Object(output_obj) = output {
+            if let serde_json::Value::Object(output_obj) = &working_output {
                 for (key, value) in output_obj {
                     working_obj.insert(key.clone(), value.clone());
                 }
             }
+        } else if matches!(working_output, serde_json::Value::Object(_)) {
+            self.working_data = working_output;
         }
 
         if let Some(frame) = batch_frame {

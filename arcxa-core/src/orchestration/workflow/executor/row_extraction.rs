@@ -17,6 +17,10 @@ impl WorkflowExecutor {
             return Ok(rows.clone());
         }
 
+        if let Some(frame) = &context.batch_frame {
+            return Ok(frame.to_json_values()?);
+        }
+
         let mut best_rows: Option<Vec<serde_json::Value>> = None;
         for output in context.step_outputs.values() {
             if let Some(rows) = output.get("_rows").and_then(|value| value.as_array()) {

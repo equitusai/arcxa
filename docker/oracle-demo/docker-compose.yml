@@ -1,0 +1,243 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: arcxa-oracle-demo-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo stat | nc localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: arcxa-oracle-demo-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:19093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "19093:19093"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "nc -z localhost 29092 && nc -z localhost 19093",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: arcxa-oracle-demo-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: curl -f http://localhost:8081/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: on-failure
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: arcxa-oracle-demo-db
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: ARCXA_DEMO
+      APP_USER_PASSWORD: arcxa_demo
+    ports:
+      - "11531:1521"
+    volumes:
+      - ../oracle-e2e/initdb:/container-entrypoint-initdb.d:ro
+      - oracle-demo-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  db2:
+    image: icr.io/db2_community/db2:11.5.9.0
+    container_name: arcxa-oracle-demo-db2
+    hostname: db2
+    networks:
+      default:
+        aliases:
+          - db2-server
+    privileged: true
+    ports:
+      - "15000:50000"
+      - "15500:55000"
+    environment:
+      LICENSE: accept
+      DB2INST1_PASSWORD: graphica-db2-pass
+      DB2INSTANCE: db2inst1
+      DBNAME: GRAPHICA
+      DB2_ENABLE_AUTOCONFIG: "NO"
+      BLU: "false"
+      PAGESIZE: "32768"
+      MAX_CONNECTIONS: "200"
+      LOGARCHMETH1: "OFF"
+      LOGFILSIZ: "4096"
+      LOGPRIMARY: "13"
+      LOGSECOND: "12"
+    volumes:
+      - db2-demo-data:/database
+      - db2-demo-global-reg:/var/db2
+      - ../db2/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /database/config/.shared-data/setup_complete && test -f /database/config/.shared-data/db_activated",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: docker/oracle-e2e/Dockerfile.coordinator.oracle-e2e
+      args:
+        CARGO_PROFILE: ${ORACLE_DEMO_CARGO_PROFILE:-e2e}
+    image: arcxa-coordinator-oracle-demo:latest
+    container_name: arcxa-oracle-demo-coordinator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      oracle:
+        condition: service_healthy
+      db2:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      REST_PORT: "8080"
+      GRPC_PORT: "9090"
+      REST_BIND_ADDRESS: "0.0.0.0"
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+      ROCKSDB_PATH: /app/data/rocksdb
+      PARQUET_PATH: /app/data/parquet
+      ARCHIVE_PATH: /app/data/archive
+      ROW_LINEAGE_DB_PATH: /app/data/row-lineage-db
+      AUDIT_CHAIN_PATH: /app/data/audit
+      DATASOURCE_DB_PATH: /app/data/datasources
+      KAFKA_MODE: durable
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CONSUMER_GROUP: arcxa-oracle-demo
+      KAFKA_LINEAGE_TOPIC: graphica.lineage
+      KAFKA_QUALITY_TOPIC: graphica.quality
+      ENABLE_AUTH: "true"
+      JWT_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+      CORS_ALLOWED_ORIGINS: "http://localhost:13000,http://localhost:3000,http://localhost:5173"
+      ENABLE_METRICS: "true"
+      METRICS_PORT: "9091"
+      GRAPHICA_SECRET_STORE_TYPE: file
+      GRAPHICA_SECRET_STORE_DIR: /app/data/secrets
+      SETUP_TOKEN_OUTPUT_PATH: /app/data/bootstrap/setup-token.txt
+      GRAPHICA_ORACLE_ODBC_DRIVER: Oracle in OraClient19Home1
+      DB2_HOST: db2-server
+      DB2_PORT: "50000"
+      DB2_DATABASE: GRAPHICA
+      DB2_USER: db2inst1
+      DB2_PASSWORD: graphica-db2-pass
+      RUST_LOG: info,graphica_coordinator::catalog_impl=debug,graphica_core::catalog::connectors::oracle=debug
+    ports:
+      - "18898:8080"
+      - "19096:9090"
+    volumes:
+      - coordinator-demo-data:/app/data
+      - db2-demo-data:/database
+      - db2-demo-global-reg:/var/db2
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  bootstrap:
+    build:
+      context: ../../..
+      dockerfile: graphica/docker/oracle-demo/Dockerfile.bootstrap
+    image: arcxa-oracle-demo-bootstrap:latest
+    container_name: arcxa-oracle-demo-bootstrap
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      db2:
+        condition: service_healthy
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: GraphicaDemoAdmin123!
+      SETUP_TOKEN_PATH: /coordinator-data/bootstrap/setup-token.txt
+      BOOTSTRAP_SUMMARY_PATH: /coordinator-data/bootstrap/oracle-demo-bootstrap-summary.json
+      ORACLE_DATASOURCE_TITLE: oracle-demo-freepdb1
+      ORACLE_DATASOURCE_SECRET_REF: vault://datasources/oracle-demo-freepdb1/credentials
+      ORACLE_HOST: oracle
+      ORACLE_PORT: "1521"
+      ORACLE_SERVICE_NAME: FREEPDB1
+      ORACLE_SCHEMA: ARCXA_DEMO
+      ORACLE_USERNAME: ARCXA_DEMO
+      ORACLE_PASSWORD: arcxa_demo
+      ORACLE_ODBC_DRIVER: Oracle in OraClient19Home1
+      INFER_TABLE_NAME: CUSTOMER_FEED
+      DB2_DATASOURCE_TITLE: db2-demo-graphica
+      DB2_DATASOURCE_SECRET_REF: vault://datasources/db2-demo-graphica/credentials
+      DB2_HOST: db2-server
+      DB2_PORT: "50000"
+      DB2_DATABASE: GRAPHICA
+      DB2_SCHEMA: DB2INST1
+      DB2_USERNAME: db2inst1
+      DB2_PASSWORD: graphica-db2-pass
+      DB2_TARGET_TABLE: CUSTOMER_FEED_CURATED
+      WORKFLOW_ID: oracle-demo-customer-feed-to-db2
+      WORKFLOW_NAME: Oracle Demo Customer Feed to DB2
+    volumes:
+      - coordinator-demo-data:/coordinator-data
+    restart: "no"
+
+  frontend:
+    build:
+      context: ../../..
+      dockerfile: graphica/docker/oracle-demo/Dockerfile.frontend-demo
+      args:
+        VITE_API_BASE_URL: http://localhost:18898/api/v1
+    image: arcxa-frontend-oracle-demo:latest
+    container_name: arcxa-oracle-demo-frontend
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    ports:
+      - "13000:80"
+
+volumes:
+  oracle-demo-data:
+  db2-demo-data:
+  db2-demo-global-reg:
+  coordinator-demo-data:

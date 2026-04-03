@@ -499,11 +499,11 @@ function WorkflowDesignerInner() {
   );
 
   const validationErrors = useMemo(() => {
-    const errors = [...localValidation.errors];
-
     if (nodes.length === 0) {
-      errors.push('Workflow is empty. Add at least one node to execute.');
+      return [];
     }
+
+    const errors = [...localValidation.errors];
 
     if (!selectedWorkflowId) {
       errors.push('Please save the workflow first.');
@@ -517,12 +517,8 @@ function WorkflowDesignerInner() {
       );
     });
 
-    if (isBackendValidating) {
-      errors.push('Validating datasource-backed workflow steps...');
-    }
-
     return Array.from(new Set(errors));
-  }, [blockingBackendIssues, isBackendValidating, localValidation.errors, nodes.length, selectedWorkflowId]);
+  }, [blockingBackendIssues, localValidation.errors, nodes.length, selectedWorkflowId]);
 
   const canRunWorkflow = Boolean(
     selectedWorkflowId &&
@@ -532,6 +528,8 @@ function WorkflowDesignerInner() {
       !isBackendValidating &&
       blockingBackendIssues.length === 0
   );
+
+  const canAttemptExecute = Boolean(nodes.length > 0 && !execution.isExecuting);
 
   const runBackendValidation = useCallback(
     async (options?: { showToast?: boolean }) => {
@@ -1100,7 +1098,7 @@ function WorkflowDesignerInner() {
               }
             : undefined
         }
-        canExecute={canRunWorkflow}
+        canExecute={canAttemptExecute}
         canStop={execution.isExecuting}
         canPause={false} // TODO: Enable when backend API is available
         canResume={false} // TODO: Enable when backend API is available

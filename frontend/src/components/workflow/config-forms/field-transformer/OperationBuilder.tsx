@@ -2,7 +2,7 @@
  * Operation Builder Component
  *
  * Type-specific parameter configuration for each transformation operation
- * Provides tailored UI for TRIM, LOWER, UPPER, REGEX, CONCAT, SPLIT, CUSTOM
+ * Provides tailored UI for TRIM, LOWER, UPPER, ROUND, REGEX, CONCAT, SPLIT, CUSTOM
  */
 
 import React, { useState } from 'react';
@@ -16,7 +16,7 @@ import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 
 interface OperationBuilderProps {
-  operationType: 'TRIM' | 'LOWER' | 'UPPER' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM';
+  operationType: 'TRIM' | 'LOWER' | 'UPPER' | 'ROUND' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM';
   params: Record<string, any>;
   onUpdate: (params: Record<string, any>) => void;
   upstreamSchema: Array<{ name: string; type: string; sample_values?: string[] }>;
@@ -37,6 +37,8 @@ export function OperationBuilder({
       return <LowerBuilder />;
     case 'UPPER':
       return <UpperBuilder />;
+    case 'ROUND':
+      return <RoundBuilder params={params} onUpdate={onUpdate} />;
     case 'REGEX':
       return <RegexBuilder params={params} onUpdate={onUpdate} />;
     case 'CONCAT':
@@ -96,6 +98,42 @@ function UpperBuilder() {
       </div>
       <div className="p-2 bg-neutral-50 dark:bg-neutral-800 rounded text-xs font-mono">
         <span className="text-muted-foreground">Example:</span> "Hello World" → "HELLO WORLD"
+      </div>
+    </div>
+  );
+}
+
+function RoundBuilder({
+  params,
+  onUpdate,
+}: {
+  params: Record<string, any>;
+  onUpdate: (params: Record<string, any>) => void;
+}) {
+  const decimals = params.decimals ?? 0;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start gap-2 p-2 bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-800 rounded text-xs">
+        <Info className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0 mt-0.5" />
+        <div className="text-emerald-800 dark:text-emerald-300">
+          Rounds numeric values to a fixed number of decimal places.
+        </div>
+      </div>
+
+      <div className="space-y-1.5">
+        <Label className="text-xs font-medium text-foreground">Decimal Places</Label>
+        <Input
+          type="number"
+          min={0}
+          step={1}
+          value={decimals}
+          onChange={(e) => onUpdate({ ...params, decimals: Number(e.target.value || 0) })}
+          className="text-xs h-8"
+        />
+        <p className="text-xs text-muted-foreground">
+          Example: 123.4567 with 2 decimals becomes 123.46
+        </p>
       </div>
     </div>
   );

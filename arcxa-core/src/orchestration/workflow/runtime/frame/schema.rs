@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+use crate::orchestration::workflow::error::{Result, WorkflowError};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrameDataType {
     Null,
@@ -85,6 +87,35 @@ pub fn infer_arrow_schema(rows: &[Map<String, Value>]) -> FrameSchemaProfile {
     FrameSchemaProfile {
         fields: profiles.into_values().collect(),
     }
+}
+
+pub fn schema_profile_from_arrow(schema: &Schema) -> Result<FrameSchemaProfile> {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| {
+            let data_type = match field.data_type() {
+                DataType::Boolean => FrameDataType::Boolean,
+                DataType::Int64 => FrameDataType::Int64,
+                DataType::Float64 => FrameDataType::Float64,
+                DataType::Utf8 => FrameDataType::Utf8,
+                other => {
+                    return Err(WorkflowError::NotImplemented(format!(
+                        "BatchFrame Arrow conversion does not support Arrow type {:?}",
+                        other
+                    )));
+                }
+            };
+
+            Ok(FrameFieldProfile {
+                name: field.name.clone(),
+                data_type,
+                nullable: field.is_nullable,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(FrameSchemaProfile { fields })
 }
 
 impl FrameSchemaProfile {

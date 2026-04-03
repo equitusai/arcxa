@@ -1,5 +1,7 @@
 from graphica.errors import GraphicaError
-from graphica.mcp.server import ArcxaMcpServer
+from graphica.auth import BasicAuth, TokenAuth
+from graphica.mcp import server as mcp_server_module
+from graphica.mcp.server import ArcxaMcpServer, build_client_from_env
 
 
 class FakeDatasourcesAPI:
@@ -825,3 +827,90 @@ def test_get_row_lineage_tool_returns_structured_row_events():
 
     assert response["result"]["isError"] is False
     assert response["result"]["structuredContent"]["row_key"] == "postgres:public.customers:id=1"
+
+
+def test_build_client_from_env_uses_token_login_for_username_password(monkeypatch):
+    calls = {}
+
+    class FakeResponse:
+        status_code = 200
+        ok = True
+
+        @staticmethod
+        def json():
+            return {"token": "jwt-token"}
+
+    def fake_post(url, json, timeout):
+        calls["url"] = url
+        calls["json"] = json
+        calls["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(mcp_server_module.requests, "post", fake_post)
+
+    client = build_client_from_env(
+        {
+            "ARCXA_BASE_URL": "http://localhost:18898",
+            "ARCXA_USERNAME": "admin",
+            "ARCXA_PASSWORD": "secret",
+            "ARCXA_TIMEOUT": "17",
+        }
+    )
+
+    assert isinstance(client.auth, TokenAuth)
+    assert client.auth.token == "jwt-token"
+    assert calls["url"] == "http://localhost:18898/auth/login"
+    assert calls["json"] == {"username": "admin", "password": "secret"}
+    assert calls["timeout"] == 17
+
+
+def test_build_client_from_env_strips_api_v1_for_login(monkeypatch):
+    calls = {}
+
+    class FakeResponse:
+        status_code = 200
+        ok = True
+
+        @staticmethod
+        def json():
+            return {"token": "jwt-token"}
+
+    def fake_post(url, json, timeout):
+        calls["url"] = url
+        return FakeResponse()
+
+    monkeypatch.setattr(mcp_server_module.requests, "post", fake_post)
+
+    client = build_client_from_env(
+        {
+            "ARCXA_BASE_URL": "http://localhost:18898/api/v1",
+            "ARCXA_USERNAME": "admin",
+            "ARCXA_PASSWORD": "secret",
+        }
+    )
+
+    assert isinstance(client.auth, TokenAuth)
+    assert calls["url"] == "http://localhost:18898/auth/login"
+
+
+def test_build_client_from_env_falls_back_to_basic_auth_for_legacy_servers(monkeypatch):
+    class FakeResponse:
+        status_code = 405
+        ok = False
+        text = ""
+
+        @staticmethod
+        def json():
+            return {}
+
+    monkeypatch.setattr(mcp_server_module.requests, "post", lambda *args, **kwargs: FakeResponse())
+
+    client = build_client_from_env(
+        {
+            "ARCXA_BASE_URL": "http://legacy.example.com",
+            "ARCXA_USERNAME": "admin",
+            "ARCXA_PASSWORD": "secret",
+        }
+    )
+
+    assert isinstance(client.auth, BasicAuth)

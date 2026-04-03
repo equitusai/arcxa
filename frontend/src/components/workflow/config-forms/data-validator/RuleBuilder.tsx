@@ -38,6 +38,19 @@ export interface RuleBuilderProps {
   sampleValues?: string[];
 }
 
+function formatRuleTypeLabel(ruleType: unknown): string {
+  if (typeof ruleType === 'string') {
+    return ruleType.replace(/_/g, ' ');
+  }
+
+  if (!ruleType || typeof ruleType !== 'object') {
+    return 'CUSTOM';
+  }
+
+  const entries = Object.entries(ruleType as Record<string, unknown>);
+  return entries.length === 1 ? entries[0][0].replace(/_/g, ' ') : 'CUSTOM';
+}
+
 export function RuleBuilder({ rule, onUpdate, fieldType, sampleValues = [] }: RuleBuilderProps) {
   const [testValue, setTestValue] = useState('');
   const [testResult, setTestResult] = useState<{ valid: boolean; message: string } | null>(null);
@@ -664,7 +677,7 @@ export function RuleBuilder({ rule, onUpdate, fieldType, sampleValues = [] }: Ru
     default:
       return (
         <div className="p-4 text-center text-sm text-muted-foreground">
-          Unknown rule type: {rule.rule_type}
+          Unknown rule type: {formatRuleTypeLabel(rule.rule_type)}
         </div>
       );
   }

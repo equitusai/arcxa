@@ -67,6 +67,22 @@ pub(super) fn build_batch_rows_success_result(
     build_batch_rows_step_result(frame, extra_fields, true, 1.0)
 }
 
+pub(super) fn build_materialized_rows_step_result(
+    rows: Vec<serde_json::Value>,
+    extra_fields: Vec<(String, serde_json::Value)>,
+    success: bool,
+    confidence: f64,
+) -> BatchStepExecutionResult {
+    let row_count = rows.len();
+    let batch_frame = BatchFrame::from_json_values(&rows).ok();
+    let output = build_rows_output(rows, row_count, extra_fields);
+
+    match batch_frame {
+        Some(frame) => BatchStepExecutionResult::with_frame(success, output, confidence, frame),
+        None => BatchStepExecutionResult::without_frame(success, output, confidence),
+    }
+}
+
 pub(super) fn build_rows_output(
     rows: Vec<serde_json::Value>,
     row_count: usize,

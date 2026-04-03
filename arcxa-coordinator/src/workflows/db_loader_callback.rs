@@ -331,6 +331,14 @@ fn generate_batch_insert(table_name: &str, columns: &[String], batch_size: usize
     )
 }
 
+fn generate_db2_truncate(table_name: &str) -> String {
+    format!("TRUNCATE TABLE {} IMMEDIATE", table_name)
+}
+
+fn is_replace_mode(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("replace")
+}
+
 /// Wrapper struct to implement SqlParam for JSON-derived values
 struct JsonSqlParam {
     value: String,
@@ -889,7 +897,10 @@ fn convert_db2_config(
         min_idle_connections: Some(2),
         connection_timeout: Duration::from_secs(30),
         query_timeout: Duration::from_secs(60),
-        auto_commit: false, // Default to false for transactional safety
+        // Start in autocommit so DB2 replace-mode TRUNCATE ... IMMEDIATE can run
+        // as the first statement in its own unit of work. The batched insert phase
+        // explicitly starts a transaction immediately before writing rows.
+        auto_commit: true,
         max_retry_attempts: 3,
         retry_backoff_ms: 1000,
     })
@@ -965,26 +976,37 @@ async fn load_to_db2(
 
     tracing::info!("Successfully connected to DB2, loading {} rows", rows.len());
 
-    // PRE-VALIDATE: Check table existence BEFORE attempting INSERT
-    // If table doesn't exist, we'll auto-create it from the data schema
-    tracing::info!("Checking if target table exists: {}", table_name);
-    match connection.validate_table_exists(table_name) {
-        Ok(_) => {
-            tracing::info!("Table {} exists - validation passed", table_name);
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Table {} does not exist: {} - will auto-create",
-                table_name,
-                e
-            );
-            // TODO: Auto-create table from inferred schema
-            // For now, return error to avoid ODBC panic
-            return Err(anyhow!(
-                "Table {} does not exist. Please create it first. Error: {}",
-                table_name,
-                e
-            ));
+    if is_replace_mode(mode) {
+        let truncate_sql = generate_db2_truncate(table_name);
+        tracing::info!(
+            "DB2 Replace mode: clearing target table before batched insert: {}",
+            table_name
+        );
+        connection
+            .execute(&truncate_sql, &[])
+            .map_err(|e| anyhow!("Failed to clear target table for replace mode: {}", e))?;
+    } else {
+        // PRE-VALIDATE: Check table existence BEFORE attempting INSERT
+        // If table doesn't exist, we'll auto-create it from the data schema
+        tracing::info!("Checking if target table exists: {}", table_name);
+        match connection.validate_table_exists(table_name) {
+            Ok(_) => {
+                tracing::info!("Table {} exists - validation passed", table_name);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Table {} does not exist: {} - will auto-create",
+                    table_name,
+                    e
+                );
+                // TODO: Auto-create table from inferred schema
+                // For now, return error to avoid ODBC panic
+                return Err(anyhow!(
+                    "Table {} does not exist. Please create it first. Error: {}",
+                    table_name,
+                    e
+                ));
+            }
         }
     }
 
@@ -1011,7 +1033,7 @@ async fn load_to_db2(
         columns.len()
     );
 
-    // Begin transaction
+    // Begin transaction for batched inserts after any replace-mode table clear.
     connection
         .begin_transaction()
         .map_err(|e| anyhow!("Failed to begin transaction: {}", e))?;
@@ -1640,6 +1662,29 @@ mod tests {
 
     fn dummy_credentials() -> Credentials {
         Credentials::new("db2inst1".to_string(), "secret".to_string())
+    }
+
+    #[test]
+    fn test_generate_db2_truncate_uses_immediate_clause() {
+        assert_eq!(
+            generate_db2_truncate("CUSTOMER_FEED_CURATED"),
+            "TRUNCATE TABLE CUSTOMER_FEED_CURATED IMMEDIATE"
+        );
+    }
+
+    #[test]
+    fn test_is_replace_mode_is_case_insensitive() {
+        assert!(is_replace_mode("Replace"));
+        assert!(is_replace_mode("replace"));
+        assert!(is_replace_mode("REPLACE"));
+        assert!(!is_replace_mode("Insert"));
+    }
+
+    #[test]
+    fn test_convert_db2_config_starts_in_autocommit_mode() {
+        let config = convert_db2_config(&dummy_db2_config(), &dummy_credentials())
+            .expect("db2 loader config");
+        assert!(config.auto_commit);
     }
 
     #[tokio::test]

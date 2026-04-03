@@ -82,13 +82,13 @@ impl OptimizedStepExecutor {
                 .streaming_deduplicate_large(&row_accessor, config)
                 .await?;
             let deduped_count = deduped_rows.len();
-            context.set_rows(deduped_rows)?;
+            context.set_json_rows_preserving_batch(deduped_rows)?;
             deduped_count
         } else if original_count > 10_000 {
             // Medium dataset: streaming with in-memory seen keys
             let deduped_rows = self.streaming_deduplicate_medium(&row_accessor, config)?;
             let deduped_count = deduped_rows.len();
-            context.set_rows(deduped_rows)?;
+            context.set_json_rows_preserving_batch(deduped_rows)?;
             deduped_count
         } else {
             let frame = context.get_batch_frame()?;
@@ -168,26 +168,15 @@ impl OptimizedStepExecutor {
         };
 
         // Create ExecutionContextV2 wrapper for the streaming deduplicator
-        // We need to convert the RowAccessor data into the context format
-        let rows = accessor.to_vec()?;
-        let row_storage = super::row_storage::RowStorage::from_rows(rows)?;
-
-        let mut temp_context = ExecutionContextV2 {
-            input_data: serde_json::json!({}),
-            working_data: serde_json::json!({}),
-            row_storage: Some(row_storage),
-            batch_frame: None,
-            step_outputs: Default::default(),
-            step_row_storage: Default::default(),
-            metadata: Default::default(),
-            row_lineage: None,
-            workflow_id: None,
-            execution_id: uuid::Uuid::new_v4().to_string(),
-            current_step_id: Some("dedup".to_string()),
-            resource_limits: Default::default(),
-            storage_manager: Some(self.storage_manager.clone()),
-            metrics: Default::default(),
-        };
+        // Reuse the existing storage backend directly so large Parquet/RocksDB
+        // inputs do not get materialized back into JSON rows just to be handed
+        // back to the streaming deduplicator.
+        let mut temp_context = ExecutionContextV2::with_storage_manager(
+            serde_json::json!({}),
+            self.storage_manager.clone(),
+        );
+        temp_context.row_storage = Some(accessor.clone_storage());
+        temp_context.set_current_step("dedup".to_string());
 
         // Create and execute streaming deduplicator with the advanced implementation
         let mut deduplicator = StreamingDeduplicator::new(
@@ -419,10 +408,10 @@ impl OptimizedStepExecutor {
         let row_count = row_accessor.len();
 
         let mapped_count = if row_count > 50_000 {
-            let mapped_rows = self.streaming_map_large(&row_accessor, config)?;
-            let mapped_count = mapped_rows.len();
-            context.set_rows(mapped_rows)?;
-            mapped_count
+            tracing::info!(
+                "MAPPER_OPTIMIZED: Large-dataset semantic mapping is currently pass-through; preserving existing row storage"
+            );
+            row_count
         } else {
             let frame = context.get_batch_frame()?;
             let operator = SemanticMapperBatchOperator;
@@ -522,12 +511,7 @@ impl OptimizedStepExecutor {
                 .collect::<Result<Vec<_>>>()?;
             let (transformed_rows, stats) =
                 super::field_transformer::transform_object_rows(&object_rows, config)?;
-            context.set_rows(
-                transformed_rows
-                    .into_iter()
-                    .map(serde_json::Value::Object)
-                    .collect(),
-            )?;
+            context.set_object_rows(transformed_rows)?;
             (stats, "row_json")
         } else {
             let frame = context.get_batch_frame()?;
@@ -573,7 +557,7 @@ impl OptimizedStepExecutor {
             let rows = row_accessor.to_vec()?;
             let aggregated_rows = self.aggregate_rows_large(&rows, config)?;
             let aggregated_count = aggregated_rows.len();
-            context.set_rows(aggregated_rows)?;
+            context.set_object_rows(aggregated_rows)?;
             (aggregated_count, "row_json")
         } else {
             let frame = context.get_batch_frame()?;
@@ -601,49 +585,6 @@ impl OptimizedStepExecutor {
                 )?,
             }),
         ))
-    }
-
-    /// Streaming semantic mapping for large datasets
-    fn streaming_map_large(
-        &self,
-        accessor: &RowAccessor,
-        _config: &SemanticMapperConfig,
-    ) -> Result<Vec<serde_json::Value>> {
-        tracing::info!("MAPPER_OPTIMIZED: Using streaming strategy for large dataset");
-
-        let mut result = Vec::new();
-
-        for batch_result in accessor.iter_batches(5_000) {
-            let batch = batch_result?;
-
-            for row in batch {
-                // TODO: Call semantic mapping service using config.target_ontology
-                // For now, just pass through the row
-                result.push(row);
-            }
-
-            // Periodic memory check
-            if result.len() % 50_000 == 0 {
-                tracing::debug!("MAPPER_OPTIMIZED: Processed {} rows", result.len());
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// In-memory semantic mapping for smaller datasets
-    fn in_memory_map(
-        &self,
-        accessor: &RowAccessor,
-        _config: &SemanticMapperConfig,
-    ) -> Result<Vec<serde_json::Value>> {
-        tracing::info!("MAPPER_OPTIMIZED: Using in-memory strategy");
-
-        let rows = accessor.to_vec()?;
-
-        // TODO: Call semantic mapping service using config.target_ontology
-        // For now, just pass through the rows
-        Ok(rows)
     }
 
     fn validate_rows_large(
@@ -718,7 +659,7 @@ impl OptimizedStepExecutor {
         &self,
         rows: &[serde_json::Value],
         config: &AggregatorConfig,
-    ) -> Result<Vec<serde_json::Value>> {
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
         use super::definition::AggFunction;
         use std::collections::HashMap;
 
@@ -744,14 +685,14 @@ impl OptimizedStepExecutor {
             let keys: Vec<&str> = key_str.split('|').collect();
             for (index, field) in config.group_by.iter().enumerate() {
                 if index < keys.len() {
-                    result_row.insert(field.clone(), serde_json::json!(keys[index]));
+                    result_row.insert(field.clone(), Self::parse_group_key_token(keys[index]));
                 }
             }
 
             for aggregation in &config.aggregations {
                 let values: Vec<f64> = group_rows
                     .iter()
-                    .filter_map(|row| row.get(&aggregation.field).and_then(|value| value.as_f64()))
+                    .filter_map(|row| Self::numeric_json_value(row.get(&aggregation.field)))
                     .collect();
 
                 let aggregate_value = match aggregation.function {
@@ -775,10 +716,22 @@ impl OptimizedStepExecutor {
                 result_row.insert(field_name, serde_json::json!(aggregate_value));
             }
 
-            result_rows.push(serde_json::Value::Object(result_row));
+            result_rows.push(result_row);
         }
 
         Ok(result_rows)
+    }
+
+    fn parse_group_key_token(token: &str) -> serde_json::Value {
+        serde_json::from_str(token).unwrap_or_else(|_| serde_json::Value::String(token.to_string()))
+    }
+
+    fn numeric_json_value(value: Option<&serde_json::Value>) -> Option<f64> {
+        match value {
+            Some(serde_json::Value::Number(number)) => number.as_f64(),
+            Some(serde_json::Value::String(string)) => string.trim().parse::<f64>().ok(),
+            _ => None,
+        }
     }
 }
 
@@ -813,6 +766,7 @@ impl StorageManager {
 mod tests {
     use super::*;
     use crate::orchestration::workflow::runtime::frame::{BatchFrame, BatchFrameMetadata};
+    use crate::orchestration::workflow::StorageType;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -881,6 +835,139 @@ mod tests {
             result_frame.metadata().source_step_id.as_deref(),
             Some("extract_dedup")
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_deduplicate_large_accepts_parquet_backed_storage() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+
+        let rows = vec![
+            json!({"id": 1, "name": "Alice"}),
+            json!({"id": 1, "name": "Alice"}),
+            json!({"id": 2, "name": "Bob"}),
+            json!({"id": 2, "name": "Bob"}),
+            json!({"id": 3, "name": "Charlie"}),
+        ];
+        let frame = BatchFrame::from_json_values(&rows).unwrap();
+        let placement = storage_manager
+            .create_parquet_storage_from_batch_frame_with_details(
+                "exec_dedup",
+                "step_dedup",
+                &frame,
+            )
+            .unwrap();
+        let accessor = RowAccessor::new(placement.storage);
+
+        let config = DeduplicatorConfig {
+            key_fields: vec!["id".to_string()],
+            method: super::super::definition::DedupMethod::Exact,
+            threshold: None,
+            keep: super::super::definition::KeepStrategy::First,
+        };
+
+        let deduped_rows = executor
+            .streaming_deduplicate_large(&accessor, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            accessor.clone_storage().storage_type(),
+            StorageType::Parquet
+        );
+        assert_eq!(deduped_rows.len(), 3);
+        assert_eq!(deduped_rows[0]["id"], 1);
+        assert_eq!(deduped_rows[1]["id"], 2);
+        assert_eq!(deduped_rows[2]["id"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_medium_deduplicator_caches_batch_frame_for_reentry() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+
+        let rows = (0..20_000)
+            .map(|idx| {
+                let key = idx / 2;
+                json!({"id": key, "name": format!("customer-{key}")})
+            })
+            .collect::<Vec<_>>();
+        context.set_rows(rows).unwrap();
+
+        let config = DeduplicatorConfig {
+            key_fields: vec!["id".to_string()],
+            method: super::super::definition::DedupMethod::Exact,
+            threshold: None,
+            keep: super::super::definition::KeepStrategy::First,
+        };
+
+        let (success, output) = executor
+            .execute_deduplicator(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 10_000);
+        assert_eq!(output["_duplicates_removed"], 10_000);
+        assert_eq!(output["_execution_path"], "streaming_memory");
+        assert!(context.batch_frame.is_some());
+        assert_eq!(context.get_batch_frame().unwrap().row_count(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_large_deduplicator_caches_batch_frame_for_reentry() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+
+        let rows = (0..120_000)
+            .map(|idx| {
+                let key = idx / 2;
+                json!({"id": key, "name": format!("customer-{key}")})
+            })
+            .collect::<Vec<_>>();
+        context.set_rows(rows).unwrap();
+
+        let config = DeduplicatorConfig {
+            key_fields: vec!["id".to_string()],
+            method: super::super::definition::DedupMethod::Exact,
+            threshold: None,
+            keep: super::super::definition::KeepStrategy::First,
+        };
+
+        let (success, output) = executor
+            .execute_deduplicator(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 60_000);
+        assert_eq!(output["_duplicates_removed"], 60_000);
+        assert_eq!(output["_execution_path"], "streaming_disk");
+        assert!(context.batch_frame.is_some());
+        assert_eq!(context.get_batch_frame().unwrap().row_count(), 60_000);
     }
 
     #[tokio::test]
@@ -999,6 +1086,66 @@ mod tests {
             result_frame.metadata().source_kind.as_deref(),
             Some("db_extract")
         );
+    }
+
+    #[tokio::test]
+    async fn test_large_semantic_mapper_preserves_existing_storage_for_passthrough() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = (0..60_000)
+            .map(|id| json!({"id": id, "name": format!("customer-{id}")}))
+            .collect::<Vec<_>>();
+        context.set_rows(rows).unwrap();
+
+        let original_storage_type = context.row_storage.as_ref().unwrap().storage_type();
+        let original_set_rows_count = context
+            .metrics
+            .storage_operations
+            .get("set_rows")
+            .copied()
+            .unwrap_or(0);
+
+        let config = SemanticMapperConfig {
+            target_ontology: vec!["gph:Customer".to_string()],
+            auto_approve_threshold: 0.95,
+            mapping_mode: super::super::definition::MappingMode::Hybrid,
+            mapping_session_id: None,
+            source_id: None,
+            table_name: None,
+            entity_uri: None,
+        };
+
+        let (success, output) = executor
+            .execute_semantic_mapper(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 60_000);
+        assert_eq!(output["_original_count"], 60_000);
+        assert_eq!(
+            context.row_storage.as_ref().unwrap().storage_type(),
+            original_storage_type
+        );
+        assert_eq!(
+            context
+                .metrics
+                .storage_operations
+                .get("set_rows")
+                .copied()
+                .unwrap_or(0),
+            original_set_rows_count
+        );
+        assert_eq!(context.get_rows().unwrap().len(), 60_000);
     }
 
     #[tokio::test]
@@ -1211,5 +1358,118 @@ mod tests {
         assert_eq!(result_rows[0]["email"], json!("test@example.com"));
         assert_eq!(result_rows[0]["status"], json!("active"));
         assert_eq!(result_rows[1]["status"], json!("pending"));
+    }
+
+    #[tokio::test]
+    async fn test_large_field_transformer_caches_batch_frame_for_reentry() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = (0..60_000)
+            .map(|id| json!({"email": format!(" USER{id}@EXAMPLE.COM "), "status": "ACTIVE"}))
+            .collect::<Vec<_>>();
+        context.set_rows(rows).unwrap();
+
+        let config = super::super::definition::FieldTransformerConfig {
+            transformations: vec![
+                super::super::definition::FieldTransformation {
+                    field: "email".to_string(),
+                    operations: vec![
+                        super::super::definition::TransformOperation::Trim,
+                        super::super::definition::TransformOperation::Lower,
+                    ],
+                },
+                super::super::definition::FieldTransformation {
+                    field: "status".to_string(),
+                    operations: vec![super::super::definition::TransformOperation::Lower],
+                },
+            ],
+        };
+
+        let (success, output) = executor
+            .execute_field_transformer(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 60_000);
+        assert_eq!(output["_execution_path"], "row_json");
+        assert!(context.batch_frame.is_some());
+        assert_eq!(context.get_batch_frame().unwrap().row_count(), 60_000);
+
+        let result_rows = context.get_batch_frame().unwrap().to_json_values().unwrap();
+        assert_eq!(result_rows[0]["email"], json!("user0@example.com"));
+        assert_eq!(result_rows[0]["status"], json!("active"));
+    }
+
+    #[tokio::test]
+    async fn test_large_aggregator_caches_batch_frame_for_reentry() {
+        let temp_dir = tempdir().unwrap();
+        let storage_manager = Arc::new(
+            StorageManager::new(
+                &temp_dir.path().join("rocks"),
+                &temp_dir.path().join("temp"),
+            )
+            .unwrap(),
+        );
+
+        let executor = OptimizedStepExecutor::new(storage_manager.clone());
+        let mut context = ExecutionContextV2::with_storage_manager(json!({}), storage_manager);
+        let rows = (0..60_000)
+            .map(|idx| {
+                if idx % 2 == 0 {
+                    json!({"region": "east", "amount": "1.5", "orders": idx})
+                } else {
+                    json!({"region": "west", "amount": "2.0", "orders": idx})
+                }
+            })
+            .collect::<Vec<_>>();
+        context.set_rows(rows).unwrap();
+
+        let config = AggregatorConfig {
+            group_by: vec!["region".to_string()],
+            aggregations: vec![
+                super::super::definition::Aggregation {
+                    field: "amount".to_string(),
+                    function: super::super::definition::AggFunction::Sum,
+                    alias: Some("total_amount".to_string()),
+                },
+                super::super::definition::Aggregation {
+                    field: "orders".to_string(),
+                    function: super::super::definition::AggFunction::Count,
+                    alias: Some("order_count".to_string()),
+                },
+            ],
+        };
+
+        let (success, output) = executor
+            .execute_aggregator(&config, &mut context)
+            .await
+            .unwrap();
+
+        assert!(success);
+        assert_eq!(output["_row_count"], 2);
+        assert_eq!(output["_execution_path"], "row_json");
+        assert!(context.batch_frame.is_some());
+
+        let result_rows = context.get_batch_frame().unwrap().to_json_values().unwrap();
+        assert!(result_rows.iter().any(|row| {
+            row["region"] == "east"
+                && row["total_amount"] == json!(45_000.0)
+                && row["order_count"] == json!(30_000.0)
+        }));
+        assert!(result_rows.iter().any(|row| {
+            row["region"] == "west"
+                && row["total_amount"] == json!(60_000.0)
+                && row["order_count"] == json!(30_000.0)
+        }));
     }
 }

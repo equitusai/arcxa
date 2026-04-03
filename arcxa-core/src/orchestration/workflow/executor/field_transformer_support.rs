@@ -10,13 +10,21 @@ impl WorkflowExecutor {
         &self,
         context: &ExecutionContext,
         config: &crate::orchestration::workflow::definition::FieldTransformerConfig,
-        rows: &[serde_json::Value],
     ) -> Result<Option<BatchStepExecutionResult>> {
         let operator = FieldTransformerBatchOperator;
-        let Some(result) = self
-            .try_with_context_batch_frame(context, rows, |frame| operator.execute(frame, config))?
-        else {
-            return Ok(None);
+        let result = if let Some(result) = self
+            .try_with_cached_context_batch_frame(context, |frame| operator.execute(frame, config))?
+        {
+            result
+        } else {
+            let rows = self.get_rows_from_context(context)?;
+            let Some(result) = self.try_with_context_batch_frame(context, &rows, |frame| {
+                operator.execute(frame, config)
+            })?
+            else {
+                return Ok(None);
+            };
+            result
         };
 
         let modifications = result

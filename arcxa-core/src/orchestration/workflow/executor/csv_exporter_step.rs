@@ -44,11 +44,10 @@ impl WorkflowExecutor {
             unique_id
         );
 
-        tracing::info!("CSV exporter: About to call get_rows_from_context");
-        let rows = self.get_rows_from_context(context)?;
-        tracing::info!("CSV exporter: Got {} rows from context", rows.len());
+        let row_count = self.get_context_row_count(context)?;
+        tracing::info!("CSV exporter: Context exposes {} rows", row_count);
 
-        if rows.is_empty() {
+        if row_count == 0 {
             tracing::warn!("CSV exporter: No rows found in context, returning empty result");
             tracing::warn!(
                 "CSV exporter: working_data keys: {:?}",
@@ -73,23 +72,48 @@ impl WorkflowExecutor {
             ));
         }
 
-        tracing::info!("CSV exporter: Processing {} rows", rows.len());
+        let has_lineage = self.lineage_tracker.is_some();
+        if let Some(ref tracker) = context.progress_tracker {
+            tracker.set_total_rows(row_count as u64);
+        }
 
-        let columns: Vec<String> = rows[0]
-            .as_object()
-            .map(|object| object.keys().cloned().collect())
-            .unwrap_or_default();
+        tracing::info!("CSV exporter: Processing {} rows", row_count);
 
-        let rows_written = if let Some(batch_rows_written) =
-            self.try_execute_csv_export_batch(context, config, &actual_output_path_str, &rows)?
+        let (rows_written, columns, lineage_rows, memory_bytes) = if let Some(batch_export) =
+            self.try_execute_csv_export_batch(context, config, &actual_output_path_str)?
         {
-            batch_rows_written
+            let lineage_rows = if has_lineage {
+                Some(batch_export.frame.to_object_rows()?)
+            } else {
+                None
+            };
+
+            (
+                batch_export.rows_written,
+                batch_export.columns,
+                lineage_rows,
+                batch_export.frame.estimated_size_bytes(),
+            )
         } else {
-            self.write_csv_export_rows(config, &actual_output_path_str, &rows, &columns)?
+            let rows = self.get_rows_from_context(context)?;
+            let columns: Vec<String> = rows
+                .first()
+                .and_then(|row| row.as_object())
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default();
+            let rows_written =
+                self.write_csv_export_rows(config, &actual_output_path_str, &rows, &columns)?;
+            let memory_bytes = Self::estimate_json_memory(&serde_json::Value::Array(rows.clone()));
+            let lineage_rows = if has_lineage {
+                Some(self.get_context_object_rows(context)?)
+            } else {
+                None
+            };
+
+            (rows_written, columns, lineage_rows, memory_bytes)
         };
 
         let mut lineage_events = Vec::new();
-        let has_lineage = self.lineage_tracker.is_some();
         let step_id = if has_lineage {
             context
                 .row_lineage
@@ -109,68 +133,71 @@ impl WorkflowExecutor {
             .cloned()
             .unwrap_or_else(|| "csv_export".to_string());
 
-        let extract_row_id = |row: &serde_json::Value| -> Option<RowId> {
+        let extract_row_id = |row: &serde_json::Map<String, serde_json::Value>| -> Option<RowId> {
             row.get("_row_id")
                 .and_then(|value| value.as_str())
                 .and_then(parse_row_id_key)
         };
 
-        if let Some(ref tracker) = context.progress_tracker {
-            tracker.set_total_rows(rows.len() as u64);
-        }
+        if let Some(rows) = lineage_rows.as_ref() {
+            for (row_index, row) in rows.iter().enumerate() {
+                if row_index > 0 && row_index % context.resource_limits.yield_interval == 0 {
+                    tokio::task::yield_now().await;
 
-        for (row_index, row) in rows.iter().enumerate() {
-            if row_index > 0 && row_index % context.resource_limits.yield_interval == 0 {
-                tokio::task::yield_now().await;
+                    if let Some(ref tracker) = context.progress_tracker {
+                        tracker.update_rows_processed(row_index as u64);
+                    }
 
-                if let Some(ref tracker) = context.progress_tracker {
-                    tracker.update_rows_processed(row_index as u64);
+                    if let Some(ref token) = context.cancellation_token {
+                        if token.is_cancelled() {
+                            tracing::warn!("CSV exporter cancelled after {} rows", row_index);
+                            anyhow::bail!("Workflow execution cancelled");
+                        }
+                    }
+
+                    tracing::debug!(
+                        "CSV exporter yielded after {} rows ({:.1}% complete)",
+                        row_index,
+                        (row_index as f64 / row_count as f64) * 100.0
+                    );
                 }
 
-                if let Some(ref token) = context.cancellation_token {
-                    if token.is_cancelled() {
-                        tracing::warn!("CSV exporter cancelled after {} rows", row_index);
-                        anyhow::bail!("Workflow execution cancelled");
+                if has_lineage {
+                    if let Some(source_row_id) = extract_row_id(row) {
+                        let output_row_id =
+                            RowId::csv(&actual_output_path_str, (row_index + 2) as u64);
+
+                        let mut event = RowLineageEvent::success_with_step(
+                            source_row_id,
+                            format!("batch_{}", uuid::Uuid::new_v4()),
+                            job_id.clone(),
+                            step_id.clone(),
+                            actual_output_path_str.clone(),
+                            tenant_id.clone(),
+                        );
+
+                        event.output_row_id = Some(output_row_id);
+
+                        let mut transformation = RowTransformation::new(
+                            "csv_export".to_string(),
+                            vec!["_row".to_string()],
+                        );
+                        let mut after_values = HashMap::new();
+                        after_values.insert(
+                            "output_path".to_string(),
+                            serde_json::json!(actual_output_path_str),
+                        );
+                        after_values
+                            .insert("output_line".to_string(), serde_json::json!(row_index + 1));
+                        transformation.after_values = Some(after_values);
+                        event.add_transformation(transformation);
+
+                        lineage_events.push(event);
                     }
                 }
-
-                tracing::debug!(
-                    "CSV exporter yielded after {} rows ({:.1}% complete)",
-                    row_index,
-                    (row_index as f64 / rows.len() as f64) * 100.0
-                );
             }
-
-            if has_lineage {
-                if let Some(source_row_id) = extract_row_id(row) {
-                    let output_row_id = RowId::csv(&actual_output_path_str, (row_index + 2) as u64);
-
-                    let mut event = RowLineageEvent::success_with_step(
-                        source_row_id,
-                        format!("batch_{}", uuid::Uuid::new_v4()),
-                        job_id.clone(),
-                        step_id.clone(),
-                        actual_output_path_str.clone(),
-                        tenant_id.clone(),
-                    );
-
-                    event.output_row_id = Some(output_row_id);
-
-                    let mut transformation =
-                        RowTransformation::new("csv_export".to_string(), vec!["_row".to_string()]);
-                    let mut after_values = HashMap::new();
-                    after_values.insert(
-                        "output_path".to_string(),
-                        serde_json::json!(actual_output_path_str),
-                    );
-                    after_values
-                        .insert("output_line".to_string(), serde_json::json!(row_index + 1));
-                    transformation.after_values = Some(after_values);
-                    event.add_transformation(transformation);
-
-                    lineage_events.push(event);
-                }
-            }
+        } else if let Some(ref tracker) = context.progress_tracker {
+            tracker.update_rows_processed(row_count as u64);
         }
 
         if !lineage_events.is_empty() {
@@ -188,15 +215,13 @@ impl WorkflowExecutor {
             }
         }
 
-        let rows_json = serde_json::Value::Array(rows.clone());
-        let memory_bytes = Self::estimate_json_memory(&rows_json);
         let memory_mb = memory_bytes as f64 / 1_000_000.0;
 
         tracing::info!(
             target: "workflow_memory",
             memory_bytes = memory_bytes,
             memory_mb = memory_mb,
-            row_count = rows.len(),
+            row_count = row_count,
             step = "csv_export",
             output_file = %actual_output_path_str,
             "Memory usage during CSV export ({:.2} MB)",
@@ -205,7 +230,7 @@ impl WorkflowExecutor {
 
         tracing::info!(
             "CSV export complete: {} rows written to {} ({:.2} MB)",
-            rows.len(),
+            row_count,
             actual_output_path_str,
             memory_mb
         );

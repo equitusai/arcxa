@@ -23,6 +23,12 @@ fn create_test_workflow() -> WorkflowDefinition {
     }
 }
 
+fn build_large_object_rows(count: usize) -> Vec<serde_json::Value> {
+    (0..count)
+        .map(|idx| serde_json::json!({"id": idx, "status": "active"}))
+        .collect()
+}
+
 #[test]
 fn test_extract_materializable_rows_prefers_internal_rows() {
     let output = serde_json::json!({
@@ -229,6 +235,43 @@ fn test_try_with_context_batch_frame_passes_cached_frame_to_closure() {
 }
 
 #[test]
+fn test_try_with_cached_context_batch_frame_passes_cached_frame_without_working_rows() {
+    use crate::orchestration::workflow::runtime::frame::{BatchFrame, BatchFrameMetadata};
+
+    let frame = BatchFrame::from_json_values(&[
+        serde_json::json!({"id": 1, "status": "new"}),
+        serde_json::json!({"id": 2, "status": "done"}),
+    ])
+    .unwrap()
+    .with_metadata(BatchFrameMetadata {
+        source_step_id: Some("extract_cached".to_string()),
+        source_kind: Some("db_extract".to_string()),
+        source_id: Some("datasource-1".to_string()),
+    });
+
+    let mut context = ExecutionContext::new(serde_json::json!({
+        "job": "backfill",
+        "_status": "seeded"
+    }));
+    context.batch_frame = Some(frame);
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let executor = WorkflowExecutor::new(workflow, invoker, rule_executor).unwrap();
+
+    let source_id = executor
+        .try_with_cached_context_batch_frame(&context, |batch| {
+            Ok::<_, anyhow::Error>(batch.metadata().source_id.clone())
+        })
+        .unwrap();
+
+    assert_eq!(source_id, Some(Some("datasource-1".to_string())));
+}
+
+#[test]
 fn test_get_rows_from_context_falls_back_to_step_outputs_when_working_data_has_no_rows() {
     let workflow = create_test_workflow();
     let registry = Arc::new(ModelRegistry::new());
@@ -383,6 +426,59 @@ fn test_merge_and_store_step_result_preserves_metadata_and_drops_frame() {
 }
 
 #[test]
+fn test_merge_and_store_large_batch_backed_step_result_strips_working_rows_but_preserves_access() {
+    use crate::orchestration::workflow::runtime::frame::BatchFrame;
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let executor = WorkflowExecutor::new(workflow, invoker, rule_executor).unwrap();
+
+    let rows = build_large_object_rows(10_001);
+    let frame = BatchFrame::from_json_values(&rows).unwrap();
+
+    let step_result = StepResult {
+        step_id: "extract_step".to_string(),
+        success: true,
+        output: serde_json::json!({
+            "_rows": rows.clone(),
+            "_row_count": rows.len(),
+            "_status": "ok"
+        }),
+        confidence: 1.0,
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
+        batch_metadata: None,
+        runtime_metrics: None,
+        batch_frame: Some(frame),
+    };
+
+    let mut context = ExecutionContext::new(serde_json::json!({"job": "seed"}));
+    let mut step_results = HashMap::new();
+
+    executor
+        .merge_and_store_step_result(&mut context, &mut step_results, &step_result)
+        .unwrap();
+
+    assert_eq!(context.working_data["job"], "seed");
+    assert_eq!(context.working_data["_status"], "ok");
+    assert_eq!(context.working_data["_row_count"], 10_001);
+    assert!(context.working_data.get("_rows").is_none());
+    assert_eq!(context.get_batch_frame().unwrap().row_count(), 10_001);
+
+    let extracted_rows = executor.get_rows_from_context(&context).unwrap();
+    assert_eq!(extracted_rows.len(), 10_001);
+    assert_eq!(extracted_rows[0]["id"], 0);
+    assert_eq!(extracted_rows[10_000]["id"], 10_000);
+
+    let stored = step_results.get("extract_step").unwrap();
+    assert!(stored.output.get("_rows").is_none());
+    assert_eq!(stored.output["_row_count"], 10_001);
+}
+
+#[test]
 fn test_data_validator_batch_path_preserves_legacy_output_shape() {
     use crate::orchestration::workflow::definition::{
         DataValidatorConfig, RuleType, Severity, ValidationRule,
@@ -434,7 +530,7 @@ fn test_data_validator_batch_path_preserves_legacy_output_shape() {
     .unwrap();
 
     let result = executor
-        .try_execute_data_validator_batch(&context, &config, &rows)
+        .try_execute_data_validator_batch(&context, &config)
         .unwrap()
         .expect("supported row data should use batch validation path");
 
@@ -475,7 +571,7 @@ fn test_data_validator_batch_path_falls_back_for_unsupported_rows() {
     }));
 
     let result = executor
-        .try_execute_data_validator_batch(&context, &config, &rows)
+        .try_execute_data_validator_batch(&context, &config)
         .unwrap();
     assert!(
         result.is_none(),
@@ -520,7 +616,7 @@ fn test_aggregator_batch_path_preserves_legacy_output_shape() {
     .unwrap();
 
     let result = executor
-        .try_execute_aggregator_batch(&context, &config, &rows)
+        .try_execute_aggregator_batch(&context, &config)
         .unwrap()
         .expect("supported row data should use batch aggregation path");
 
@@ -537,6 +633,54 @@ fn test_aggregator_batch_path_preserves_legacy_output_shape() {
     assert!(output_rows.iter().any(|row| {
         row["region"] == "west" && row["total_amount"] == 7.0 && row["order_count"] == 1.0
     }));
+}
+
+#[test]
+fn test_aggregator_batch_path_uses_cached_frame_without_working_rows() {
+    use crate::orchestration::workflow::definition::{AggFunction, Aggregation, AggregatorConfig};
+    use crate::orchestration::workflow::runtime::frame::{BatchFrame, BatchFrameMetadata};
+
+    let workflow = create_test_workflow();
+    let registry = Arc::new(ModelRegistry::new());
+    let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+    let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+    let rule_executor = Arc::new(RuleExecutor::new());
+    let executor = WorkflowExecutor::new(workflow, invoker, rule_executor).unwrap();
+
+    let frame = BatchFrame::from_json_values(&[
+        serde_json::json!({"region": "east", "amount": 10.0}),
+        serde_json::json!({"region": "east", "amount": 15.0}),
+        serde_json::json!({"region": "west", "amount": 7.0}),
+    ])
+    .unwrap()
+    .with_metadata(BatchFrameMetadata {
+        source_step_id: Some("extract_step".to_string()),
+        source_kind: Some("db_extract".to_string()),
+        source_id: None,
+    });
+    let mut context = ExecutionContext::new(serde_json::json!({
+        "_status": "seeded"
+    }));
+    context.batch_frame = Some(frame);
+
+    let config = AggregatorConfig {
+        group_by: vec!["region".to_string()],
+        aggregations: vec![Aggregation {
+            field: "amount".to_string(),
+            function: AggFunction::Sum,
+            alias: Some("total_amount".to_string()),
+        }],
+    };
+
+    let result = executor
+        .try_execute_aggregator_batch(&context, &config)
+        .unwrap()
+        .expect("cached batch frame should be sufficient for the fast path");
+
+    assert!(result.success);
+    assert_eq!(result.output["_row_count"], 2);
+    assert_eq!(result.output["_original_count"], 3);
+    assert!(result.output.get("_rows").is_some());
 }
 
 #[test]
@@ -564,7 +708,7 @@ fn test_aggregator_batch_path_falls_back_for_unsupported_rows() {
     }));
 
     let result = executor
-        .try_execute_aggregator_batch(&context, &config, &rows)
+        .try_execute_aggregator_batch(&context, &config)
         .unwrap();
     assert!(
         result.is_none(),
@@ -602,7 +746,7 @@ fn test_deduplicator_batch_path_preserves_legacy_output_shape_for_exact_first() 
     .unwrap();
 
     let result = executor
-        .try_execute_deduplicator_batch(&context, &config, &rows)
+        .try_execute_deduplicator_batch(&context, &config)
         .unwrap()
         .expect("exact+first dedup rows should use batch fast path");
 
@@ -652,7 +796,7 @@ fn test_deduplicator_batch_path_declines_for_unsupported_strategy() {
     .unwrap();
 
     let result = executor
-        .try_execute_deduplicator_batch(&context, &config, &rows)
+        .try_execute_deduplicator_batch(&context, &config)
         .unwrap();
     assert!(
         result.is_none(),
@@ -695,7 +839,7 @@ fn test_field_transformer_batch_path_preserves_row_output_shape() {
     .unwrap();
 
     let result = executor
-        .try_execute_field_transformer_batch(&context, &config, &rows)
+        .try_execute_field_transformer_batch(&context, &config)
         .unwrap()
         .expect("supported row data should use batch field-transform path");
 
@@ -742,7 +886,7 @@ fn test_field_transformer_batch_path_falls_back_for_unsupported_rows() {
     }));
 
     let result = executor
-        .try_execute_field_transformer_batch(&context, &config, &rows)
+        .try_execute_field_transformer_batch(&context, &config)
         .unwrap();
     assert!(
         result.is_none(),

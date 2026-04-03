@@ -1,11 +1,27 @@
 use anyhow::Result;
 
 use super::{
-    BatchStepExecutionResult, ExecutionContext, StepConfig, StepResult, StepType, WorkflowExecutor,
-    WorkflowStep,
+    utilities::extract_materializable_rows, BatchStepExecutionResult, ExecutionContext, StepConfig,
+    StepResult, StepType, WorkflowExecutor, WorkflowStep,
 };
+use crate::orchestration::workflow::runtime::frame::BatchFrame;
 
 impl WorkflowExecutor {
+    fn batch_result_with_materialized_frame(
+        &self,
+        success: bool,
+        output: serde_json::Value,
+        confidence: f64,
+    ) -> BatchStepExecutionResult {
+        let batch_frame = extract_materializable_rows(&output)
+            .and_then(|rows| BatchFrame::from_json_values(&rows).ok());
+
+        match batch_frame {
+            Some(frame) => BatchStepExecutionResult::with_frame(success, output, confidence, frame),
+            None => BatchStepExecutionResult::without_frame(success, output, confidence),
+        }
+    }
+
     /// Execute single workflow step
     pub(super) async fn execute_step(
         &self,
@@ -89,9 +105,7 @@ impl WorkflowExecutor {
             (StepType::CsvSource, StepConfig::CsvSource(config)) => {
                 let (success, output, confidence) =
                     self.execute_csv_source(config, context).await?;
-                Ok(BatchStepExecutionResult::without_frame(
-                    success, output, confidence,
-                ))
+                Ok(self.batch_result_with_materialized_frame(success, output, confidence))
             }
             (StepType::Deduplicator, StepConfig::Deduplicator(config)) => {
                 self.execute_deduplicator(config, context).await
@@ -139,9 +153,7 @@ impl WorkflowExecutor {
                     );
                 }
                 let (success, output, confidence) = result?;
-                Ok(BatchStepExecutionResult::without_frame(
-                    success, output, confidence,
-                ))
+                Ok(self.batch_result_with_materialized_frame(success, output, confidence))
             }
             (StepType::RdfLoader, StepConfig::RdfLoader(config)) => {
                 let (success, output, confidence) =

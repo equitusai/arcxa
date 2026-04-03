@@ -10,17 +10,8 @@ impl WorkflowExecutor {
         config: &crate::orchestration::workflow::definition::FieldTransformerConfig,
         context: &ExecutionContext,
     ) -> Result<BatchStepExecutionResult> {
-        if matches!(context.working_data, serde_json::Value::Array(_))
-            || context
-                .working_data
-                .get("_rows")
-                .and_then(|value| value.as_array())
-                .is_some()
-        {
-            let rows = self.get_rows_from_context(context)?;
-            if let Some(batch_result) =
-                self.try_execute_field_transformer_batch(context, config, &rows)?
-            {
+        if self.context_has_row_payload(context) {
+            if let Some(batch_result) = self.try_execute_field_transformer_batch(context, config)? {
                 return Ok(batch_result);
             }
         }

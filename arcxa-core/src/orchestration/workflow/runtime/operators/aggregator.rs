@@ -2,7 +2,7 @@ use crate::orchestration::workflow::definition::{AggFunction, AggregatorConfig};
 use crate::orchestration::workflow::error::Result;
 use crate::orchestration::workflow::runtime::frame::BatchFrame;
 use arrow2::array::{BooleanArray, PrimitiveArray, Utf8Array};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 use super::RuntimeOperator;
@@ -47,7 +47,7 @@ impl AggregatorBatchOperator {
             groups.entry(key).or_default().push(row_index);
         }
 
-        let mut result_rows = Vec::with_capacity(groups.len());
+        let mut result_rows: Vec<Map<String, Value>> = Vec::with_capacity(groups.len());
         for (key_str, group_rows) in groups {
             let mut result_row = serde_json::Map::new();
 
@@ -93,11 +93,10 @@ impl AggregatorBatchOperator {
                 });
                 result_row.insert(field_name, json!(aggregate_value));
             }
-
-            result_rows.push(Value::Object(result_row));
+            result_rows.push(result_row);
         }
 
-        Ok(BatchFrame::from_json_values(&result_rows)?.with_metadata(frame.metadata().clone()))
+        Ok(BatchFrame::from_object_rows(&result_rows)?.with_metadata(frame.metadata().clone()))
     }
 }
 

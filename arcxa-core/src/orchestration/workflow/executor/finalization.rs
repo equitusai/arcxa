@@ -61,7 +61,7 @@ impl WorkflowExecutor {
         // For large datasets, build stripped output WITHOUT cloning _rows.
         // This prevents expensive clone operations on multi-GB datasets.
         if let Some(row_count) = output.get("_row_count").and_then(|v| v.as_u64()) {
-            if row_count > 10000 {
+            if row_count > super::LARGE_ROW_PAYLOAD_THRESHOLD {
                 tracing::info!(
                     "EXECUTE_LOOP: Step '{}' has {} rows, creating metadata-only output for storage (keeping _rows in working_data)",
                     step_id,

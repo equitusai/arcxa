@@ -15,6 +15,7 @@ use std::time::Instant;
 use rocksdb::DB;
 
 use super::error::{Result, WorkflowError};
+use super::runtime::frame::BatchFrame;
 #[cfg(feature = "workflow-storage")]
 pub use super::runtime::spill::StorageManager;
 use super::runtime::spill::{parquet as parquet_backend, store_inline_rows, StorageTieringPolicy};
@@ -334,6 +335,28 @@ impl RowAccessor {
         BatchIterator::new(self.storage.clone(), batch_size)
     }
 
+    /// Clone the underlying storage handle without materializing rows.
+    pub fn clone_storage(&self) -> RowStorage {
+        self.storage.clone()
+    }
+
+    /// Build a batch-oriented frame, using direct Parquet decoding when available.
+    pub fn to_batch_frame(&self) -> Result<BatchFrame> {
+        match &self.storage {
+            RowStorage::InMemory { rows } => BatchFrame::from_json_values(rows.as_slice()),
+            RowStorage::Shared { rows, .. } => {
+                let guard = rows.read();
+                BatchFrame::from_json_values(guard.as_slice())
+            }
+            #[cfg(feature = "workflow-storage")]
+            RowStorage::RocksDB { .. } => {
+                let rows = self.to_vec()?;
+                BatchFrame::from_json_values(&rows)
+            }
+            RowStorage::Parquet { path, .. } => parquet_backend::read_parquet_batch_frame(path),
+        }
+    }
+
     /// Get all rows (materializes if needed - for backwards compatibility)
     pub fn to_vec(&self) -> Result<Vec<serde_json::Value>> {
         match &self.storage {
@@ -478,5 +501,45 @@ mod tests {
         assert_eq!(batches.len(), 4); // 3 + 3 + 3 + 1
         assert_eq!(batches[0].len(), 3);
         assert_eq!(batches[3].len(), 1);
+    }
+
+    #[test]
+    fn test_row_accessor_to_batch_frame() {
+        let rows = vec![
+            json!({"id": 1, "name": "Alice", "active": true}),
+            json!({"id": 2, "name": "Bob", "active": false}),
+        ];
+
+        let storage = RowStorage::from_rows(rows.clone()).unwrap();
+        let accessor = RowAccessor::new(storage);
+
+        let round_tripped = accessor.to_batch_frame().unwrap().to_json_values().unwrap();
+
+        assert_eq!(round_tripped, rows);
+    }
+
+    #[cfg(feature = "workflow-storage")]
+    #[test]
+    fn test_row_accessor_clone_storage_preserves_parquet_backend() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = StorageManager::new(
+            &temp_dir.path().join("rocks"),
+            &temp_dir.path().join("spill"),
+        )
+        .unwrap();
+        let rows = vec![
+            json!({"id": 1, "name": "Alice"}),
+            json!({"id": 2, "name": "Bob"}),
+        ];
+        let frame = BatchFrame::from_json_values(&rows).unwrap();
+        let placement = manager
+            .create_parquet_storage_from_batch_frame_with_details("exec_rows", "step_rows", &frame)
+            .unwrap();
+
+        let accessor = RowAccessor::new(placement.storage);
+        let cloned = accessor.clone_storage();
+
+        assert_eq!(cloned.storage_type(), StorageType::Parquet);
+        assert_eq!(cloned.len(), rows.len());
     }
 }

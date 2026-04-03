@@ -8,10 +8,11 @@ use super::row_lineage_context::RowLineageContext;
 #[cfg(feature = "workflow-storage")]
 use super::row_storage::StorageManager;
 use super::row_storage::{estimate_memory_size, RowAccessor, RowStorage, StorageType};
-use super::runtime::frame::BatchFrame;
+use super::runtime::frame::{object_rows_to_json_values, BatchFrame};
 use super::runtime::metrics::{RuntimeStepMetrics, StorageDecisionMetric, StorageDecisionReason};
 use super::runtime::spill::StorageTieringPlan;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 #[cfg(feature = "workflow-storage")]
 use std::sync::Arc;
@@ -61,6 +62,9 @@ pub struct ExecutionContextV2 {
 
     /// Row storage per step (for intermediate results)
     pub step_row_storage: HashMap<String, RowStorage>,
+
+    /// Cached batch-oriented view per stored step result when available.
+    pub step_batch_frames: HashMap<String, BatchFrame>,
 
     /// User-provided metadata
     pub metadata: HashMap<String, String>,
@@ -115,6 +119,7 @@ impl ExecutionContextV2 {
             batch_frame: None,
             step_outputs: HashMap::new(),
             step_row_storage: HashMap::new(),
+            step_batch_frames: HashMap::new(),
             metadata: HashMap::new(),
             row_lineage: None,
             workflow_id: None,
@@ -182,13 +187,28 @@ impl ExecutionContextV2 {
             return Ok(frame.clone());
         }
 
-        let rows = self.get_rows()?.to_vec()?;
-        BatchFrame::from_json_values(&rows)
+        self.get_rows()?.to_batch_frame()
     }
 
     /// Set rows with automatic tiering based on size
     pub fn set_rows(&mut self, rows: Vec<serde_json::Value>) -> Result<()> {
         self.set_rows_with_batch_frame(rows, None)
+    }
+
+    /// Set object rows while preserving a prebuilt batch-oriented view.
+    pub fn set_object_rows(&mut self, rows: Vec<Map<String, Value>>) -> Result<()> {
+        let frame = BatchFrame::from_object_rows(&rows)?;
+        let json_rows = object_rows_to_json_values(rows);
+        self.set_rows_with_batch_frame(json_rows, Some(frame))
+    }
+
+    /// Set JSON rows while preserving a batch-oriented view when the payload is
+    /// already object-row compatible.
+    pub fn set_json_rows_preserving_batch(&mut self, rows: Vec<Value>) -> Result<()> {
+        match json_values_into_object_rows(rows) {
+            Ok(object_rows) => self.set_object_rows(object_rows),
+            Err(rows) => self.set_rows(rows),
+        }
     }
 
     fn set_rows_with_batch_frame(
@@ -213,6 +233,51 @@ impl ExecutionContextV2 {
         self.metrics.total_rows_processed += row_count;
         self.metrics.memory_high_water_mark =
             self.metrics.memory_high_water_mark.max(estimated_size);
+
+        #[cfg(feature = "workflow-storage")]
+        if matches!(planned_tier, StorageTieringPlan::Parquet) {
+            if let Some(ref manager) = self.storage_manager {
+                let direct_frame = match batch_frame.as_ref() {
+                    Some(frame) => frame.clone(),
+                    None => BatchFrame::from_json_values(&rows)?,
+                };
+                let step_id = self.current_step_id.as_deref().unwrap_or("unknown");
+
+                match manager.create_parquet_storage_from_batch_frame_with_details(
+                    &self.execution_id,
+                    step_id,
+                    &direct_frame,
+                ) {
+                    Ok(outcome) => {
+                        let storage_type = outcome.storage.storage_type();
+                        self.row_storage = Some(outcome.storage);
+                        self.batch_frame = Some(direct_frame);
+                        self.record_storage_operation("set_rows", storage_type);
+                        self.record_storage_decision(
+                            "set_rows",
+                            planned_tier,
+                            storage_type,
+                            row_count,
+                            estimated_size,
+                            StorageDecisionReason::Planned,
+                            outcome.reserved_spill_bytes,
+                            outcome.execution_reserved_spill_bytes,
+                            outcome.total_reserved_spill_bytes,
+                            outcome.storage_location,
+                        );
+                        self.update_working_data_storage_metadata(row_count);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            row_count,
+                            "Direct set_rows Parquet storage failed; falling back to row-oriented storage path"
+                        );
+                    }
+                }
+            }
+        }
 
         // Choose storage backend
         #[cfg(feature = "workflow-storage")]
@@ -294,38 +359,145 @@ impl ExecutionContextV2 {
             total_reserved_spill_bytes,
             storage_location,
         );
-
-        // Update working_data metadata
-        if let serde_json::Value::Object(ref mut obj) = self.working_data {
-            obj.insert("_row_count".to_string(), serde_json::json!(row_count));
-            obj.insert(
-                "_storage_type".to_string(),
-                serde_json::json!(self
-                    .row_storage
-                    .as_ref()
-                    .unwrap()
-                    .storage_type()
-                    .to_string()),
-            );
-            // Remove old _rows field to save memory
-            obj.remove("_rows");
-        }
+        self.update_working_data_storage_metadata(row_count);
 
         Ok(())
     }
 
     /// Store a batch-oriented frame using the existing row storage path.
     pub fn set_batch_frame(&mut self, frame: BatchFrame) -> Result<()> {
+        let row_count = frame.row_count();
+        let estimated_size = frame.estimated_size_bytes();
+        let planned_tier =
+            super::runtime::spill::StorageTieringPolicy::default().plan(row_count, estimated_size);
+
+        if row_count > self.resource_limits.max_row_count {
+            return Err(WorkflowError::ResourceLimit(format!(
+                "Row count {} exceeds limit {}",
+                row_count, self.resource_limits.max_row_count
+            )));
+        }
+
+        #[cfg(feature = "workflow-storage")]
+        if matches!(planned_tier, StorageTieringPlan::Parquet) {
+            if let Some(ref manager) = self.storage_manager {
+                let step_id = self.current_step_id.as_deref().unwrap_or("unknown");
+                match manager.create_parquet_storage_from_batch_frame_with_details(
+                    &self.execution_id,
+                    step_id,
+                    &frame,
+                ) {
+                    Ok(outcome) => {
+                        let storage_type = outcome.storage.storage_type();
+                        self.metrics.total_rows_processed += row_count;
+                        self.metrics.memory_high_water_mark =
+                            self.metrics.memory_high_water_mark.max(estimated_size);
+                        self.row_storage = Some(outcome.storage);
+                        self.batch_frame = Some(frame);
+                        self.record_storage_operation("set_rows", storage_type);
+                        self.record_storage_decision(
+                            "set_rows",
+                            planned_tier,
+                            storage_type,
+                            row_count,
+                            estimated_size,
+                            StorageDecisionReason::Planned,
+                            outcome.reserved_spill_bytes,
+                            outcome.execution_reserved_spill_bytes,
+                            outcome.total_reserved_spill_bytes,
+                            outcome.storage_location,
+                        );
+                        self.update_working_data_storage_metadata(row_count);
+
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            row_count,
+                            "Direct batch-frame Parquet storage failed; falling back to JSON-compatible storage path"
+                        );
+                    }
+                }
+            }
+        }
+
         let rows = frame.to_json_values()?;
         self.set_rows_with_batch_frame(rows, Some(frame))
     }
 
     /// Store intermediate results for a step
     pub fn store_step_rows(&mut self, step_id: String, rows: Vec<serde_json::Value>) -> Result<()> {
+        match json_values_into_object_rows(rows) {
+            Ok(object_rows) => self.store_step_object_rows(step_id, object_rows),
+            Err(rows) => self.store_step_rows_with_batch_frame(step_id, rows, None),
+        }
+    }
+
+    /// Store intermediate object rows for a step while preserving a prebuilt
+    /// batch-oriented view for re-entry.
+    pub fn store_step_object_rows(
+        &mut self,
+        step_id: String,
+        rows: Vec<Map<String, Value>>,
+    ) -> Result<()> {
+        let frame = BatchFrame::from_object_rows(&rows)?;
+        let json_rows = object_rows_to_json_values(rows);
+        self.store_step_rows_with_batch_frame(step_id, json_rows, Some(frame))
+    }
+
+    fn store_step_rows_with_batch_frame(
+        &mut self,
+        step_id: String,
+        rows: Vec<serde_json::Value>,
+        batch_frame: Option<BatchFrame>,
+    ) -> Result<()> {
         let row_count = rows.len();
         let estimated_size = estimate_memory_size(&rows);
         let planned_tier =
             super::runtime::spill::StorageTieringPolicy::default().plan(row_count, estimated_size);
+
+        #[cfg(feature = "workflow-storage")]
+        if matches!(planned_tier, StorageTieringPlan::Parquet) {
+            if let Some(ref manager) = self.storage_manager {
+                if let Some(ref direct_frame) = batch_frame {
+                    match manager.create_parquet_storage_from_batch_frame_with_details(
+                        &self.execution_id,
+                        &step_id,
+                        direct_frame,
+                    ) {
+                        Ok(outcome) => {
+                            let storage_type = outcome.storage.storage_type();
+                            self.record_storage_operation("store_step", storage_type);
+                            self.record_storage_decision(
+                                "store_step",
+                                planned_tier,
+                                storage_type,
+                                row_count,
+                                estimated_size,
+                                StorageDecisionReason::Planned,
+                                outcome.reserved_spill_bytes,
+                                outcome.execution_reserved_spill_bytes,
+                                outcome.total_reserved_spill_bytes,
+                                outcome.storage_location,
+                            );
+                            self.step_row_storage
+                                .insert(step_id.clone(), outcome.storage);
+                            self.step_batch_frames.insert(step_id, direct_frame.clone());
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                row_count,
+                                step_id,
+                                "Direct store_step Parquet storage failed; falling back to row-oriented storage path"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         #[cfg(feature = "workflow-storage")]
         let (
@@ -386,11 +558,12 @@ impl ExecutionContextV2 {
             (storage, reason, 0, 0, 0, None)
         };
 
-        self.record_storage_operation("store_step", storage.storage_type());
+        let storage_type = storage.storage_type();
+        self.record_storage_operation("store_step", storage_type);
         self.record_storage_decision(
             "store_step",
             planned_tier,
-            storage.storage_type(),
+            storage_type,
             row_count,
             estimated_size,
             storage_reason,
@@ -399,7 +572,12 @@ impl ExecutionContextV2 {
             total_reserved_spill_bytes,
             storage_location,
         );
-        self.step_row_storage.insert(step_id, storage);
+        self.step_row_storage.insert(step_id.clone(), storage);
+        if let Some(frame) = batch_frame {
+            self.step_batch_frames.insert(step_id, frame);
+        } else {
+            self.step_batch_frames.remove(&step_id);
+        }
         Ok(())
     }
 
@@ -410,8 +588,19 @@ impl ExecutionContextV2 {
             .map(|storage| RowAccessor::new(storage.clone()))
     }
 
+    /// Get a batch-oriented view from a specific step if it exists.
+    pub fn get_step_batch_frame(&self, step_id: &str) -> Result<Option<BatchFrame>> {
+        if let Some(frame) = self.step_batch_frames.get(step_id) {
+            return Ok(Some(frame.clone()));
+        }
+
+        self.get_step_rows(step_id)
+            .map(|accessor| accessor.to_batch_frame())
+            .transpose()
+    }
+
     /// Merge step output into working data (optimized version)
-    pub fn merge_step_output(&mut self, step_id: String, output: serde_json::Value) -> Result<()> {
+    pub fn merge_step_output(&mut self, _step_id: String, output: serde_json::Value) -> Result<()> {
         // Extract rows if present
         let (metadata, rows) = if let serde_json::Value::Object(mut obj) = output {
             let rows = obj.remove("_rows").and_then(|v| v.as_array().cloned());
@@ -422,7 +611,7 @@ impl ExecutionContextV2 {
 
         // Store rows separately if present
         if let Some(rows) = rows {
-            self.set_rows(rows)?;
+            self.set_json_rows_preserving_batch(rows)?;
         }
 
         // Merge metadata into working_data
@@ -521,6 +710,21 @@ impl ExecutionContextV2 {
             }
         }
         None
+    }
+
+    fn update_working_data_storage_metadata(&mut self, row_count: usize) {
+        if let serde_json::Value::Object(ref mut obj) = self.working_data {
+            obj.insert("_row_count".to_string(), serde_json::json!(row_count));
+            obj.insert(
+                "_storage_type".to_string(),
+                serde_json::json!(self
+                    .row_storage
+                    .as_ref()
+                    .map(|storage| storage.storage_type().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())),
+            );
+            obj.remove("_rows");
+        }
     }
 
     /// Record storage operation for metrics
@@ -691,6 +895,30 @@ impl ExecutionContextV2 {
     }
 }
 
+fn json_values_into_object_rows(
+    rows: Vec<Value>,
+) -> std::result::Result<Vec<Map<String, Value>>, Vec<Value>> {
+    let mut object_rows = Vec::with_capacity(rows.len());
+    let mut iter = rows.into_iter();
+
+    while let Some(row) = iter.next() {
+        match row {
+            Value::Object(map) => object_rows.push(map),
+            other => {
+                let mut original_rows = object_rows
+                    .into_iter()
+                    .map(Value::Object)
+                    .collect::<Vec<_>>();
+                original_rows.push(other);
+                original_rows.extend(iter);
+                return Err(original_rows);
+            }
+        }
+    }
+
+    Ok(object_rows)
+}
+
 /// Migration helper to convert old context to new
 impl From<super::executor::ExecutionContext> for ExecutionContextV2 {
     fn from(old: super::executor::ExecutionContext) -> Self {
@@ -758,6 +986,8 @@ mod tests {
         // Rows should be in row_storage
         assert!(ctx.row_storage.is_some());
         assert_eq!(ctx.get_rows().unwrap().len(), 2);
+        assert!(ctx.batch_frame.is_some());
+        assert_eq!(ctx.get_batch_frame().unwrap().row_count(), 2);
 
         // Metadata should be in working_data
         assert_eq!(ctx.working_data["step_metadata"], "test");
@@ -765,6 +995,36 @@ mod tests {
 
         // _rows should not be in working_data
         assert!(ctx.working_data.get("_rows").is_none());
+    }
+
+    #[test]
+    fn test_store_step_rows_caches_step_batch_frame_for_object_rows() {
+        let mut ctx = ExecutionContextV2::new(json!({}));
+        let rows = (0..20_000)
+            .map(|id| json!({"id": id, "status": "active"}))
+            .collect::<Vec<_>>();
+
+        ctx.store_step_rows("transform_1".to_string(), rows)
+            .expect("step rows to store");
+
+        assert_eq!(
+            ctx.step_row_storage
+                .get("transform_1")
+                .expect("step storage")
+                .storage_type(),
+            StorageType::Shared
+        );
+        assert_eq!(
+            ctx.get_step_rows("transform_1").expect("step rows").len(),
+            20_000
+        );
+        assert_eq!(
+            ctx.get_step_batch_frame("transform_1")
+                .expect("step frame result")
+                .expect("step frame")
+                .row_count(),
+            20_000
+        );
     }
 
     #[test]
@@ -797,6 +1057,32 @@ mod tests {
             .expect("frame to convert");
 
         assert_eq!(round_tripped, rows);
+    }
+
+    #[test]
+    fn test_set_object_rows_caches_batch_frame_for_reentry() {
+        let mut ctx = ExecutionContextV2::new(json!({}));
+        let rows = (0..20_000)
+            .map(|id| {
+                let mut row = Map::new();
+                row.insert("id".to_string(), json!(id));
+                row.insert("status".to_string(), json!("active"));
+                row
+            })
+            .collect::<Vec<_>>();
+
+        ctx.set_object_rows(rows).expect("object rows to store");
+
+        assert_eq!(
+            ctx.row_storage.as_ref().unwrap().storage_type(),
+            StorageType::Shared
+        );
+        assert!(ctx.batch_frame.is_some());
+        assert_eq!(ctx.batch_frame.as_ref().unwrap().row_count(), 20_000);
+        assert_eq!(
+            ctx.get_batch_frame().expect("batch frame").row_count(),
+            20_000
+        );
     }
 
     #[test]
@@ -950,6 +1236,44 @@ mod tests {
         assert!(decision.execution_reserved_spill_bytes > 0);
         assert!(decision.total_reserved_spill_bytes > 0);
         assert!(decision.storage_location.is_some());
+    }
+
+    #[cfg(feature = "workflow-storage")]
+    #[test]
+    fn test_set_rows_parquet_path_caches_batch_frame_for_reentry() {
+        use tempfile::tempdir;
+
+        let rocks_dir = tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let manager = Arc::new(
+            StorageManager::new(rocks_dir.path(), temp_dir.path()).expect("storage manager"),
+        );
+
+        let mut ctx = ExecutionContextV2::with_storage_manager(json!({}), manager);
+        ctx.resource_limits.max_row_count = 1_500_000;
+        ctx.set_current_step("parquet_direct_rows".to_string());
+
+        let rows = vec![json!({"id": 1, "status": "active"}); 1_000_000];
+        ctx.set_rows(rows).expect("rows to be stored");
+
+        assert_eq!(
+            ctx.row_storage.as_ref().unwrap().storage_type(),
+            StorageType::Parquet
+        );
+        assert!(ctx.batch_frame.is_some());
+        assert_eq!(ctx.batch_frame.as_ref().unwrap().row_count(), 1_000_000);
+
+        let round_tripped = ctx.get_batch_frame().expect("batch frame");
+        assert_eq!(round_tripped.row_count(), 1_000_000);
+
+        let decision = ctx
+            .metrics
+            .recent_storage_decisions
+            .last()
+            .expect("storage decision to be recorded");
+        assert_eq!(decision.planned_tier, StorageTieringPlan::Parquet);
+        assert_eq!(decision.actual_storage_type, StorageType::Parquet);
+        assert_eq!(decision.reason, StorageDecisionReason::Planned);
     }
 
     #[cfg(feature = "workflow-storage")]

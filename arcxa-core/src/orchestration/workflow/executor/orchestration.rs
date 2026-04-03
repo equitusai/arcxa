@@ -34,12 +34,9 @@ impl WorkflowExecutor {
                 context,
                 step_results,
             } => {
-                self.complete_successful_workflow_execution(
-                    run_state,
-                    step_results,
-                    context.working_data.clone(),
-                )
-                .await
+                let final_output = context.materialize_working_output()?;
+                self.complete_successful_workflow_execution(run_state, step_results, final_output)
+                    .await
             }
         }
     }

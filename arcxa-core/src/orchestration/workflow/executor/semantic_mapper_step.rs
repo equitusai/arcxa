@@ -134,7 +134,16 @@ impl WorkflowExecutor {
                     tracing::info!(
                         "TRACE: Semantic mapper executed via transformer callback successfully"
                     );
-                    let mapped_rows = data.get("rows").cloned().unwrap_or(serde_json::json!([]));
+                    let (mapped_rows, ontology_mapping, modifications) =
+                        if let Some(data_object) = data.as_object_mut() {
+                            (
+                                data_object.remove("rows").unwrap_or(serde_json::json!([])),
+                                data_object.remove("ontology_mapping"),
+                                data_object.remove("_modifications"),
+                            )
+                        } else {
+                            (serde_json::json!([]), None, None)
+                        };
                     let row_count = mapped_rows.as_array().map(|a| a.len()).unwrap_or(0);
 
                     let memory_bytes = Self::estimate_json_memory(&mapped_rows);
@@ -180,15 +189,15 @@ impl WorkflowExecutor {
                                 .and_then(parse_row_id_key)
                         };
 
-                        let modifications = data
-                            .get("_modifications")
+                        let modification_count = modifications
+                            .as_ref()
                             .and_then(|m| m.as_array())
-                            .cloned()
-                            .unwrap_or_default();
+                            .map(|items| items.len())
+                            .unwrap_or(0);
 
                         tracing::info!(
                             "Semantic mapper: Found {} field modifications for row lineage",
-                            modifications.len()
+                            modification_count
                         );
 
                         if let Some(rows_array) = mapped_rows.as_array() {
@@ -226,7 +235,7 @@ impl WorkflowExecutor {
                                         "Row lineage: Added summary transformation for {} (ontology: {}, {} field mappings tracked in RDF)",
                                         event.row_id,
                                         config.target_ontology.join(","),
-                                        modifications.len()
+                                        modification_count
                                     );
 
                                     lineage_events.push(event);
@@ -265,8 +274,8 @@ impl WorkflowExecutor {
                         serde_json::json!({
                             "_rows": mapped_rows,
                             "_row_count": row_count,
-                            "ontology_mapping": data.get("ontology_mapping").cloned(),
-                            "_modifications": data.get("_modifications").cloned(),
+                            "ontology_mapping": ontology_mapping,
+                            "_modifications": modifications,
                         }),
                         1.0,
                     ));

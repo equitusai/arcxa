@@ -17,7 +17,11 @@ import {
   WorkflowExecutionSummary,
   PaginationParams,
 } from './types';
-import { adaptWorkflowDefinition } from '@/lib/workflow-api-adapter';
+import {
+  adaptWorkflowDefinition,
+  adaptWorkflowResponse,
+  adaptWorkflowStepForBackend,
+} from '@/lib/workflow-api-adapter';
 
 interface BackendExecutionResultDto {
   execution_id: string;
@@ -234,16 +238,18 @@ function adaptExecutionDetails(
 }
 
 function adaptWorkflowDetails(response: BackendWorkflowDetailsResponse): Workflow {
+  const adaptedResponse = adaptWorkflowResponse(response);
+
   return {
-    id: response.workflow_id,
-    name: response.name,
-    description: response.description,
-    tags: response.tags,
-    definition: response.definition,
-    created_at: response.created_at,
-    version: response.version,
-    execution_count: response.execution_count,
-    last_executed_at: response.last_executed_at,
+    id: adaptedResponse.workflow_id,
+    name: adaptedResponse.name,
+    description: adaptedResponse.description,
+    tags: adaptedResponse.tags,
+    definition: adaptedResponse.definition,
+    created_at: adaptedResponse.created_at,
+    version: adaptedResponse.version,
+    execution_count: adaptedResponse.execution_count,
+    last_executed_at: adaptedResponse.last_executed_at,
   };
 }
 
@@ -535,7 +541,8 @@ export async function abortExecution(
 export async function validateWorkflowDefinition(
   definition: WorkflowDefinition
 ): Promise<ValidateWorkflowResponse> {
-  return api.post(`/workflows/validate`, definition);
+  const adaptedDefinition = adaptWorkflowDefinition(definition);
+  return api.post(`/workflows/validate`, adaptedDefinition);
 }
 
 /**
@@ -547,7 +554,10 @@ export async function validateWorkflowDefinition(
 export async function testWorkflowStep(
   request: import('./types').TestStepRequest
 ): Promise<import('./types').TestStepResponse> {
-  return api.post(`/workflows/test-step`, request);
+  return api.post(`/workflows/test-step`, {
+    ...request,
+    step: adaptWorkflowStepForBackend(request.step),
+  });
 }
 
 /**

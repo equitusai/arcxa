@@ -29,6 +29,28 @@ export interface DataValidatorNodeBodyProps {
   onEditRule?: (index: number) => void;
 }
 
+function formatRuleType(ruleType: unknown): string {
+  if (typeof ruleType === 'string') {
+    return ruleType.replace(/_/g, ' ');
+  }
+
+  if (!ruleType || typeof ruleType !== 'object') {
+    return 'CUSTOM';
+  }
+
+  const entries = Object.entries(ruleType as Record<string, unknown>);
+  if (entries.length === 1) {
+    const [type, params] = entries[0];
+    if (params && typeof params === 'object' && 'pattern' in (params as Record<string, unknown>)) {
+      return `${type} (${String((params as Record<string, unknown>).pattern)})`;
+    }
+
+    return type.replace(/_/g, ' ');
+  }
+
+  return 'CUSTOM';
+}
+
 export function DataValidatorNodeBody({
   config,
   status = 'idle',
@@ -151,7 +173,7 @@ export function DataValidatorNodeBody({
                       <span className="font-medium text-foreground">{rule.field}</span>
                     </div>
                     <div className="text-muted-foreground pl-4.5">
-                      {rule.rule_type}
+                      {formatRuleType(rule.rule_type)}
                     </div>
                   </div>
                   <ChevronRight className="w-3 h-3 text-neutral-400" />
@@ -268,7 +290,7 @@ export function DataValidatorNodeBody({
                       <span className="font-medium text-foreground">{rule.field}</span>
                     </div>
                     <div className="text-muted-foreground pl-4.5">
-                      {rule.rule_type}
+                      {formatRuleType(rule.rule_type)}
                     </div>
                   </div>
                   <ChevronRight className="w-3 h-3 text-neutral-400" />

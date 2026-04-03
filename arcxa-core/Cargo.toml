@@ -41,7 +41,7 @@ differential-dataflow = "0.12"
 rdkafka = { version = "0.36", features = ["cmake-build"] }
 
 # Columnar & Serialization
-arrow2 = { version = "0.17", features = ["io_parquet", "io_json"] }
+arrow2 = { version = "0.17", features = ["compute_concatenate", "io_parquet", "io_json"] }
 parquet2 = "0.17"
 
 # Performance

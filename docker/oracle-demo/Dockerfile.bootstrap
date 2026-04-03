@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY graphica/docker/oracle-demo/bootstrap_oracle_demo.py /app/bootstrap_oracle_demo.py
+
+ENTRYPOINT ["python", "/app/bootstrap_oracle_demo.py"]

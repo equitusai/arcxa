@@ -375,7 +375,7 @@ export interface SemanticMapperConfig {
 export interface FieldTransformation {
   field: string;
   operations: Array<{
-    type: 'TRIM' | 'LOWER' | 'UPPER' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM';
+    type: 'TRIM' | 'LOWER' | 'UPPER' | 'ROUND' | 'REGEX' | 'CONCAT' | 'SPLIT' | 'CUSTOM';
     params?: Record<string, any>;
   }>;
 }

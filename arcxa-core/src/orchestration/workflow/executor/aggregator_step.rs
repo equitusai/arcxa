@@ -2,7 +2,10 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::{build_rows_output, BatchStepExecutionResult, ExecutionContext, WorkflowExecutor};
+use super::{
+    build_materialized_rows_step_result, BatchStepExecutionResult, ExecutionContext,
+    WorkflowExecutor,
+};
 
 impl WorkflowExecutor {
     /// Execute aggregator step - aggregate data by groups
@@ -19,11 +22,11 @@ impl WorkflowExecutor {
             config.aggregations.len()
         );
 
-        let rows = self.get_rows_from_context(context)?;
-
-        if let Some(batch_result) = self.try_execute_aggregator_batch(context, config, &rows)? {
+        if let Some(batch_result) = self.try_execute_aggregator_batch(context, config)? {
             return Ok(batch_result);
         }
+
+        let rows = self.get_rows_from_context(context)?;
 
         let mut groups: HashMap<String, Vec<&serde_json::Value>> = HashMap::new();
         for row in &rows {
@@ -87,13 +90,12 @@ impl WorkflowExecutor {
             rows.len()
         );
 
-        let aggregated_count = result_rows.len();
-
-        Ok(BatchStepExecutionResult::success(build_rows_output(
+        Ok(build_materialized_rows_step_result(
             result_rows,
-            aggregated_count,
             vec![("_original_count".to_string(), serde_json::json!(rows.len()))],
-        )))
+            true,
+            1.0,
+        ))
     }
 }
 

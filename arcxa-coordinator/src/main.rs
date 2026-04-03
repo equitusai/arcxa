@@ -56,6 +56,52 @@ struct Args {
     shard_count: usize,
 }
 
+fn persist_setup_token_output(token: Option<&str>) {
+    let output_path = match std::env::var("SETUP_TOKEN_OUTPUT_PATH") {
+        Ok(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+        _ => return,
+    };
+
+    if let Some(parent) = output_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            warn!(
+                "WARNING: Failed to create setup token output directory '{}': {}",
+                parent.display(),
+                err
+            );
+            return;
+        }
+    }
+
+    match token {
+        Some(value) => {
+            if let Err(err) = std::fs::write(&output_path, format!("{value}\n")) {
+                warn!(
+                    "WARNING: Failed to write setup token to '{}': {}",
+                    output_path.display(),
+                    err
+                );
+            } else {
+                info!(
+                    "Security: Setup token also written to '{}'",
+                    output_path.display()
+                );
+            }
+        }
+        None => {
+            if output_path.exists() {
+                if let Err(err) = std::fs::remove_file(&output_path) {
+                    warn!(
+                        "WARNING: Failed to clear stale setup token file '{}': {}",
+                        output_path.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -529,9 +575,11 @@ async fn main() -> Result<()> {
             info!("Security: Setup token generated (expires in 1 hour):");
             info!("   Token: {}", token.token);
             info!("   Use this token to create the initial admin user via POST /auth/setup");
+            persist_setup_token_output(Some(&token.token));
         }
         Err(_) => {
             info!("INFO:  Setup token not generated (admin user may already exist)");
+            persist_setup_token_output(None);
         }
     }
 

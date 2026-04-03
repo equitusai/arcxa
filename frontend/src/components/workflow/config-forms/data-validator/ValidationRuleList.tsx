@@ -36,6 +36,36 @@ export interface ValidationRuleListProps {
   onToggleSeverity: (index: number) => void;
 }
 
+function normalizeRuleTypeLabel(ruleType: unknown): string {
+  if (typeof ruleType === 'string') {
+    return ruleType.replace(/_/g, ' ');
+  }
+
+  if (!ruleType || typeof ruleType !== 'object') {
+    return 'CUSTOM';
+  }
+
+  const entries = Object.entries(ruleType as Record<string, unknown>);
+  if (entries.length === 1) {
+    return entries[0][0].replace(/_/g, ' ');
+  }
+
+  return 'CUSTOM';
+}
+
+function normalizeRuleTypeKey(ruleType: unknown): string {
+  if (typeof ruleType === 'string') {
+    return ruleType;
+  }
+
+  if (!ruleType || typeof ruleType !== 'object') {
+    return 'CUSTOM';
+  }
+
+  const entries = Object.entries(ruleType as Record<string, unknown>);
+  return entries.length === 1 ? entries[0][0] : 'CUSTOM';
+}
+
 // Icon map for rule types
 const RULE_ICONS: Record<string, any> = {
   NOT_NULL: CheckCircle,
@@ -81,7 +111,9 @@ export function ValidationRuleList({
   return (
     <div className="space-y-1.5">
       {rules.map((rule, index) => {
-        const Icon = RULE_ICONS[rule.rule_type] || AlertCircle;
+        const ruleTypeKey = normalizeRuleTypeKey(rule.rule_type);
+        const ruleTypeLabel = normalizeRuleTypeLabel(rule.rule_type);
+        const Icon = RULE_ICONS[ruleTypeKey] || AlertCircle;
         const isSelected = selectedIndex === index;
         const isError = rule.severity === 'error';
 
@@ -178,10 +210,10 @@ export function ValidationRuleList({
                 {/* Rule type badge */}
                 <Badge
                   variant="outline"
-                  className={`${RULE_COLORS[rule.rule_type]} bg-white dark:bg-neutral-900 flex items-center gap-1`}
+                  className={`${RULE_COLORS[ruleTypeKey] || 'text-neutral-600'} bg-white dark:bg-neutral-900 flex items-center gap-1`}
                 >
                   <Icon className="w-3 h-3" />
-                  {rule.rule_type}
+                  {ruleTypeLabel}
                 </Badge>
 
                 {/* Severity badge */}
@@ -193,19 +225,19 @@ export function ValidationRuleList({
                 </Badge>
 
                 {/* Rule-specific preview */}
-                {rule.rule_type === 'REGEX' && rule.params?.pattern && (
+                {ruleTypeKey === 'REGEX' && rule.params?.pattern && (
                   <span className="text-muted-foreground font-mono truncate max-w-[200px]">
                     /{rule.params.pattern.substring(0, 30)}{rule.params.pattern.length > 30 ? '...' : ''}/
                   </span>
                 )}
-                {rule.rule_type === 'RANGE' && (
+                {ruleTypeKey === 'RANGE' && (
                   <span className="text-muted-foreground">
                     {rule.params?.min !== undefined ? `≥ ${rule.params.min}` : ''}
                     {rule.params?.min !== undefined && rule.params?.max !== undefined ? ' & ' : ''}
                     {rule.params?.max !== undefined ? `≤ ${rule.params.max}` : ''}
                   </span>
                 )}
-                {rule.rule_type === 'IN_SET' && rule.params?.allowed_values && (
+                {ruleTypeKey === 'IN_SET' && rule.params?.allowed_values && (
                   <span className="text-muted-foreground">
                     {rule.params.allowed_values.length} value{rule.params.allowed_values.length !== 1 ? 's' : ''}
                   </span>
