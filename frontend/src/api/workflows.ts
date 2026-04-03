@@ -110,7 +110,9 @@ function isPersistedExecutionOutput(
 }
 
 function buildExecutionPayload(request: WorkflowExecutionRequest) {
-  const payload: Record<string, unknown> = {};
+  const payload: Record<string, unknown> = {
+    input: request.input,
+  };
 
   if (request.context) {
     payload.context = request.context;
@@ -118,15 +120,6 @@ function buildExecutionPayload(request: WorkflowExecutionRequest) {
 
   if (request.output_dataset) {
     payload.output_dataset = request.output_dataset;
-  }
-
-  if (isJsonWorkflowInput(request.input)) {
-    payload.type = 'json';
-    payload.data = request.input.data;
-  } else if (isGraphInput(request.input)) {
-    Object.assign(payload, request.input);
-  } else {
-    payload.input = request.input;
   }
 
   return payload;

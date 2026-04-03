@@ -163,9 +163,9 @@ export function ExecuteWorkflowDialog({
         <DialogHeader>
           <DialogTitle>Execute Workflow</DialogTitle>
           <DialogDescription>
-            Run {workflowName || 'this workflow'} from source-driven execution, a JSON payload,
-            or a materialized dataset, and optionally write the final rows back into the
-            catalogue.
+            Run {workflowName || 'this workflow'} from its configured source steps, a JSON
+            payload, or a materialized dataset, and optionally write the final rows back into
+            the catalogue.
           </DialogDescription>
         </DialogHeader>
 
@@ -174,8 +174,9 @@ export function ExecuteWorkflowDialog({
             <CardHeader className="pb-4">
               <CardTitle className="text-base">Input Source</CardTitle>
               <CardDescription>
-                JSON is best for ad hoc testing. Dataset mode reuses a materialized catalogue
-                dataset as the workflow input stream.
+                {supportsInputlessExecution
+                  ? 'This workflow can run directly from its configured source steps, such as an Oracle database extract. Use JSON only if you want to override the normal input, or choose a dataset to replay materialized data.'
+                  : 'JSON is best for ad hoc testing. Dataset mode reuses a materialized catalogue dataset as the workflow input stream.'}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -190,7 +191,7 @@ export function ExecuteWorkflowDialog({
                   </SelectTrigger>
                   <SelectContent>
                     {supportsInputlessExecution && (
-                      <SelectItem value="none">No external input</SelectItem>
+                      <SelectItem value="none">Use workflow source steps</SelectItem>
                     )}
                     <SelectItem value="json">JSON payload</SelectItem>
                     <SelectItem value="dataset">Materialized dataset</SelectItem>
@@ -202,11 +203,12 @@ export function ExecuteWorkflowDialog({
                 <div className="rounded-sm border border-border bg-muted/30 p-4 space-y-2">
                   <div className="flex items-center gap-2">
                     <Database className="h-4 w-4 text-muted-foreground" />
-                    <span className="text-sm font-medium">Source-driven execution</span>
+                    <span className="text-sm font-medium">Use configured source steps</span>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    This workflow includes source steps that fetch their own data, so ARCXA will
-                    execute it without requiring an external JSON payload.
+                    ARCXA will execute this workflow using its configured source steps. For the
+                    Oracle demo workflow, this means it will read directly from the saved Oracle
+                    datasource without requiring any extra input payload from you.
                   </p>
                 </div>
               ) : inputMode === 'json' ? (
