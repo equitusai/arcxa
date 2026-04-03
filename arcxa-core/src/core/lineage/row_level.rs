@@ -92,6 +92,92 @@ impl RowId {
             }
         }
     }
+
+    /// Parse a row key back into a [`RowId`].
+    ///
+    /// This is the inverse of [`RowId::to_key`] for the supported source types.
+    pub fn from_key(key: &str) -> anyhow::Result<Self> {
+        let first_colon = key
+            .find(':')
+            .ok_or_else(|| anyhow::anyhow!("Missing source type prefix"))?;
+
+        let source_type = &key[..first_colon];
+        let rest = &key[first_colon + 1..];
+
+        match source_type {
+            "csv" => {
+                let last_colon = rest
+                    .rfind(':')
+                    .ok_or_else(|| anyhow::anyhow!("Missing row number in CSV key"))?;
+                let path = &rest[..last_colon];
+                let row_number = rest[last_colon + 1..].parse::<u64>()?;
+                Ok(Self::csv(path.to_string(), row_number))
+            }
+            "db2" | "postgres" | "oracle" | "hana" | "saphana" | "mysql" | "snowflake"
+            | "databricks" => {
+                let (table, pk_part) = rest
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("Invalid database key format"))?;
+
+                let mut pk = BTreeMap::new();
+                for pair in pk_part.split(',') {
+                    let (key, value) = pair
+                        .split_once('=')
+                        .ok_or_else(|| anyhow::anyhow!("Invalid primary key segment"))?;
+                    pk.insert(key.to_string(), value.to_string());
+                }
+
+                let db_type = match source_type {
+                    "db2" => DatabaseType::DB2,
+                    "postgres" => DatabaseType::Postgres,
+                    "oracle" => DatabaseType::Oracle,
+                    "hana" | "saphana" => DatabaseType::SAPHANA,
+                    "mysql" => DatabaseType::MySQL,
+                    "snowflake" => DatabaseType::Snowflake,
+                    "databricks" => DatabaseType::Databricks,
+                    _ => unreachable!(),
+                };
+
+                Ok(Self::database(db_type, table.to_string(), pk))
+            }
+            "kafka" => {
+                let mut parts = rest.splitn(3, ':');
+                let topic = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Missing Kafka topic"))?;
+                let partition = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Missing Kafka partition"))?
+                    .trim_start_matches('p')
+                    .parse::<i32>()?;
+                let offset = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Missing Kafka offset"))?
+                    .trim_start_matches('o')
+                    .parse::<i64>()?;
+                Ok(Self::kafka(topic.to_string(), partition, offset))
+            }
+            "s3" => {
+                let last_colon = rest
+                    .rfind(':')
+                    .ok_or_else(|| anyhow::anyhow!("Missing row index in S3 key"))?;
+                let bucket_key = &rest[..last_colon];
+                let row_index = rest[last_colon + 1..]
+                    .trim_start_matches('r')
+                    .parse::<u64>()?;
+                let (bucket, object_key) = bucket_key
+                    .split_once('/')
+                    .ok_or_else(|| anyhow::anyhow!("Invalid S3 path (missing bucket/key)"))?;
+
+                Ok(Self::s3(
+                    bucket.to_string(),
+                    object_key.to_string(),
+                    row_index,
+                ))
+            }
+            _ => Err(anyhow::anyhow!("Unsupported source type: {}", source_type)),
+        }
+    }
 }
 
 impl fmt::Display for RowId {
@@ -388,6 +474,9 @@ pub trait RowLevelLineageSink: Send + Sync {
     /// Trace complete journey of a row from source to destination
     async fn trace_row_journey(&self, row_id: &RowId) -> anyhow::Result<RowJourney>;
 
+    /// Search indexed row keys for lineage-aware autocomplete.
+    async fn search_row_keys(&self, query: &str, limit: usize) -> anyhow::Result<Vec<RowId>>;
+
     /// Get statistics for a job
     async fn get_job_stats(&self, job_id: &str) -> anyhow::Result<JobStatistics>;
 
@@ -490,6 +579,25 @@ mod tests {
     fn test_row_id_kafka() {
         let row_id = RowId::kafka("orders-topic", 5, 987654);
         assert_eq!(row_id.to_key(), "kafka:orders-topic:p5:o987654");
+    }
+
+    #[test]
+    fn test_row_id_round_trip_from_key_for_oracle() {
+        let mut pk = BTreeMap::new();
+        pk.insert("STAGE_ROW_ID".to_string(), "FEED001".to_string());
+
+        let row_id = RowId::database(DatabaseType::Oracle, "CUSTOMER_FEED", pk);
+        let parsed = RowId::from_key(&row_id.to_key()).expect("row key should parse");
+
+        assert_eq!(parsed, row_id);
+    }
+
+    #[test]
+    fn test_row_id_round_trip_from_key_for_csv_with_colon_in_path() {
+        let row_id = RowId::csv("/tmp/demo:feed.csv", 42);
+        let parsed = RowId::from_key(&row_id.to_key()).expect("row key should parse");
+
+        assert_eq!(parsed, row_id);
     }
 
     #[test]

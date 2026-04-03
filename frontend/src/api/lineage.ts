@@ -13,6 +13,7 @@ import {
   ImpactAnalysisRequest,
   ImpactAnalysisResponse,
   RowLineageResponse,
+  RowKeySearchResponse,
   RowJourneyResponse,
   BatchLineageResponse,
   JobStatsResponse,
@@ -206,6 +207,23 @@ export async function simulateChangeImpact(
  */
 export async function getRowLineage(rowKey: string): Promise<RowLineageResponse> {
   return api.get<RowLineageResponse>(`/lineage/row/${rowKey}`);
+}
+
+/**
+ * Search row keys
+ *
+ * Returns indexed row-key matches for autocomplete and discovery.
+ */
+export async function searchRowKeys(
+  query: string,
+  params?: { limit?: number }
+): Promise<RowKeySearchResponse> {
+  return api.get<RowKeySearchResponse>('/lineage/rows/search', {
+    params: {
+      q: query,
+      ...params,
+    },
+  });
 }
 
 /**

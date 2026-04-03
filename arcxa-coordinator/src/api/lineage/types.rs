@@ -249,6 +249,37 @@ pub struct RowLineageResponse {
     pub total_count: usize,
 }
 
+/// Row key search query parameters
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RowKeySearchQuery {
+    /// Partial row key or datasource/table prefix
+    pub q: String,
+    /// Maximum number of matches to return
+    pub limit: Option<usize>,
+}
+
+/// Single row-key autocomplete match
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RowKeySearchMatch {
+    /// Full row key suitable for lineage lookup
+    pub row_key: String,
+    /// Source type portion of the row key (for example `oracle` or `csv`)
+    pub source_type: String,
+    /// Source identifier portion of the row key (for example table or file path)
+    pub source_id: String,
+}
+
+/// Row-key autocomplete response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RowKeySearchResponse {
+    /// Original query string
+    pub query: String,
+    /// Matching row keys ordered by match strength
+    pub matches: Vec<RowKeySearchMatch>,
+    /// Total matches returned in this response
+    pub total_count: usize,
+}
+
 /// Batch lineage response (all rows in a batch)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchLineageResponse {

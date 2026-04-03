@@ -20,6 +20,7 @@
 //! ### Row-Level Lineage (Query Endpoints - Production Safe)
 //! - `GET /api/v1/lineage/row/:row_key` - Get lineage for a specific row
 //! - `GET /api/v1/lineage/row/:row_key/journey` - Get complete row journey
+//! - `GET /api/v1/lineage/rows/search` - Search row keys for autocomplete
 //! - `GET /api/v1/lineage/batch/:batch_id` - Get lineage for all rows in a batch
 //! - `GET /api/v1/lineage/job/:job_id/stats` - Get job statistics
 //! - `GET /api/v1/lineage/job/:job_id/filtered` - Get filtered rows for a job
@@ -86,6 +87,7 @@ pub fn create_lineage_router() -> Router<Arc<ApiState>> {
             post(handlers::query_lineage_by_time_range),
         )
         // Row-level lineage routes (READ-ONLY for production)
+        .route("/lineage/rows/search", get(row_handlers::search_row_keys))
         .route("/lineage/row/:row_key", get(row_handlers::get_row_lineage))
         .route(
             "/lineage/row/:row_key/journey",

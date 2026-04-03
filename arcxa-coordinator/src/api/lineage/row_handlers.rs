@@ -11,11 +11,13 @@ use axum::{
     Json,
 };
 use graphica_core::core::lineage::row_level::{
-    JobStatistics, RowId, RowJourney, RowLevelLineageSink, RowLineageEvent,
+    JobStatistics, RowId, RowJourney,
 };
+#[cfg(feature = "test-endpoints")]
+use graphica_core::core::lineage::row_level::RowLineageEvent;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
 /// API error response
 #[derive(Debug)]
@@ -101,6 +103,61 @@ pub async fn get_row_lineage(
     Ok(Json(RowLineageResponse {
         row_key,
         events,
+        total_count,
+    }))
+}
+
+/// Search indexed row keys for row-journey autocomplete.
+///
+/// Query: GET /api/v1/lineage/rows/search?q=...&limit=...
+#[utoipa::path(
+    get,
+    path = "/api/v1/lineage/rows/search",
+    params(
+        ("q" = String, Query, description = "Partial row key or datasource/table prefix"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of matches to return"),
+    ),
+    responses(
+        (status = 200, description = "Matching row keys found", body = RowKeySearchResponse),
+        (status = 400, description = "Invalid search query"),
+        (status = 500, description = "Row lineage store not available"),
+    ),
+    tag = "Row-Level Lineage"
+)]
+pub async fn search_row_keys(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<RowKeySearchQuery>,
+) -> Result<Json<RowKeySearchResponse>, RowLineageApiError> {
+    let query = params.q.trim();
+    if query.is_empty() {
+        return Err(RowLineageApiError::InvalidInput(
+            "Search query must not be empty".to_string(),
+        ));
+    }
+
+    let limit = params.limit.unwrap_or(10).clamp(1, 25);
+    info!("Searching row lineage keys for query='{}' limit={}", query, limit);
+
+    let row_lineage_store = state.row_lineage_store.as_ref().ok_or_else(|| {
+        RowLineageApiError::InternalError("Row lineage store not available".to_string())
+    })?;
+
+    let matches = row_lineage_store
+        .search_row_keys(query, limit)
+        .await
+        .map_err(|e| RowLineageApiError::QueryFailed(format!("Row key search failed: {}", e)))?;
+
+    let total_count = matches.len();
+    Ok(Json(RowKeySearchResponse {
+        query: query.to_string(),
+        matches: matches
+            .into_iter()
+            .map(|row_id| RowKeySearchMatch {
+                row_key: row_id.to_key(),
+                source_type: row_id.source_type.to_string(),
+                source_id: row_id.source_id,
+            })
+            .collect(),
         total_count,
     }))
 }
@@ -441,90 +498,7 @@ fn is_test_lineage_api_enabled() -> bool {
 /// - `kafka:orders:p5:o987654` (Kafka)
 /// - `s3:bucket/key.parquet:r45678` (S3)
 pub fn parse_row_key(key: &str) -> anyhow::Result<RowId> {
-    use graphica_core::core::lineage::row_level::{DatabaseType, RowPosition, SourceType};
-    use std::collections::BTreeMap;
-
-    // Find the source type prefix
-    let first_colon = key
-        .find(':')
-        .ok_or_else(|| anyhow::anyhow!("Missing source type prefix"))?;
-
-    let source_type = &key[..first_colon];
-    let rest = &key[first_colon + 1..];
-
-    match source_type {
-        "csv" => {
-            // For CSV, the format is csv:<path>:<row_number>
-            // The path can contain colons (e.g., /tmp/foo:bar.csv), so find last colon for row number
-            let last_colon = rest
-                .rfind(':')
-                .ok_or_else(|| anyhow::anyhow!("Missing row number in CSV key"))?;
-            let path = &rest[..last_colon];
-            let row_num = &rest[last_colon + 1..];
-            let row_number = row_num.parse::<u64>()?;
-            Ok(RowId::csv(path.to_string(), row_number))
-        }
-        "db2" | "postgres" | "oracle" | "hana" | "saphana" | "mysql" | "snowflake"
-        | "databricks" => {
-            // For database, format is db_type:table:pk_part
-            let parts: Vec<&str> = rest.split(':').collect();
-            if parts.len() < 2 {
-                return Err(anyhow::anyhow!("Invalid database key format"));
-            }
-            let table = parts[0];
-            let pk_part = parts[1];
-
-            let mut pk = BTreeMap::new();
-            for pair in pk_part.split(',') {
-                let kv: Vec<&str> = pair.split('=').collect();
-                if kv.len() == 2 {
-                    pk.insert(kv[0].to_string(), kv[1].to_string());
-                }
-            }
-
-            let db_type = match source_type {
-                "db2" => DatabaseType::DB2,
-                "postgres" => DatabaseType::Postgres,
-                "oracle" => DatabaseType::Oracle,
-                "hana" | "saphana" => DatabaseType::SAPHANA,
-                "mysql" => DatabaseType::MySQL,
-                "snowflake" => DatabaseType::Snowflake,
-                "databricks" => DatabaseType::Databricks,
-                _ => unreachable!(),
-            };
-
-            Ok(RowId::database(db_type, table.to_string(), pk))
-        }
-        "kafka" => {
-            // For Kafka, format is kafka:topic:pN:oN
-            let parts: Vec<&str> = rest.split(':').collect();
-            if parts.len() < 3 {
-                return Err(anyhow::anyhow!("Invalid Kafka key format"));
-            }
-            let topic = parts[0];
-            let partition = parts[1].trim_start_matches('p').parse::<i32>()?;
-            let offset = parts[2].trim_start_matches('o').parse::<i64>()?;
-            Ok(RowId::kafka(topic.to_string(), partition, offset))
-        }
-        "s3" => {
-            // For S3, format is s3:bucket/key:rN
-            let last_colon = rest
-                .rfind(':')
-                .ok_or_else(|| anyhow::anyhow!("Missing row index in S3 key"))?;
-            let bucket_key = &rest[..last_colon];
-            let row_idx = &rest[last_colon + 1..];
-            let idx = row_idx.trim_start_matches('r').parse::<u64>()?;
-
-            let slash_pos = bucket_key
-                .find('/')
-                .ok_or_else(|| anyhow::anyhow!("Invalid S3 path (missing bucket/key separator)"))?;
-            let bucket = &bucket_key[..slash_pos];
-            let s3_key = &bucket_key[slash_pos + 1..];
-
-            Ok(RowId::s3(bucket.to_string(), s3_key.to_string(), idx))
-        }
-        _ => Err(anyhow::anyhow!("Unsupported source type: {}", source_type)),
-    }
+    RowId::from_key(key)
 }
 
 #[cfg(test)]

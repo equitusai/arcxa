@@ -8,6 +8,7 @@ use utoipa::OpenApi;
 #[openapi(
     paths(
         // Row-level lineage endpoints
+        crate::api::lineage::row_handlers::search_row_keys,
         crate::api::lineage::row_handlers::get_row_lineage,
         crate::api::lineage::row_handlers::get_row_journey,
         crate::api::lineage::row_handlers::get_batch_lineage,
@@ -36,6 +37,9 @@ use utoipa::OpenApi;
     components(
         schemas(
             // Row-level lineage types
+            crate::api::lineage::types::RowKeySearchQuery,
+            crate::api::lineage::types::RowKeySearchMatch,
+            crate::api::lineage::types::RowKeySearchResponse,
             crate::api::lineage::types::RowLineageResponse,
             crate::api::lineage::types::BatchLineageResponse,
             crate::api::lineage::types::FilteredRowsQuery,

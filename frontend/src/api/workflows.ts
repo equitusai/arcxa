@@ -55,6 +55,19 @@ interface BackendExecutionDetailsResponse {
   duration_ms?: number;
 }
 
+interface BackendExecutionSummaryDto {
+  execution_id: string;
+  workflow_id: string;
+  workflow_name?: string;
+  status?: string;
+  started_at: string;
+  updated_at?: string;
+  completed_at?: string;
+  duration_ms?: number;
+  confidence?: number;
+  actions_executed?: number;
+}
+
 interface BackendWorkflowDetailsResponse {
   workflow_id: string;
   name: string;
@@ -182,11 +195,30 @@ function adaptExecutionResponse(
   return response;
 }
 
-function adaptExecutionSummary(summary: WorkflowExecutionSummary): WorkflowExecutionSummary {
-  const completedAt = summary.completed_at || summary.started_at;
+function adaptExecutionSummary(
+  summary: WorkflowExecutionSummary | BackendExecutionSummaryDto
+): WorkflowExecutionSummary {
+  const completedAt =
+    summary.completed_at || summary.updated_at || summary.started_at;
+  const status =
+    'status' in summary && typeof summary.status === 'string'
+      ? summary.status.toLowerCase()
+      : undefined;
+  const success =
+    'success' in summary && typeof summary.success === 'boolean'
+      ? summary.success
+      : status === 'completed';
+  const confidence =
+    'confidence' in summary && typeof summary.confidence === 'number'
+      ? summary.confidence
+      : success
+        ? 1
+        : 0;
 
   return {
     ...summary,
+    success,
+    confidence,
     completed_at: completedAt,
     duration_ms:
       summary.duration_ms ?? calculateDurationMs(summary.started_at, completedAt),
@@ -409,7 +441,7 @@ export async function listWorkflowExecutions(
   workflowId: string,
   params?: PaginationParams
 ): Promise<WorkflowExecutionSummary[]> {
-  const response = await api.get<WorkflowExecutionSummary[]>(
+  const response = await api.get<Array<WorkflowExecutionSummary | BackendExecutionSummaryDto>>(
     `/workflows/${workflowId}/executions`,
     { params: toLimitOffsetParams(params) }
   );
@@ -431,7 +463,17 @@ export async function listExecutions(
   limit: number;
   offset: number;
 }> {
-  return api.get('/executions', { params });
+  const response = await api.get<{
+    executions: BackendExecutionSummaryDto[];
+    total: number;
+    limit: number;
+    offset: number;
+  }>('/executions', { params });
+
+  return {
+    ...response,
+    executions: response.executions.map(adaptExecutionSummary),
+  };
 }
 
 /**

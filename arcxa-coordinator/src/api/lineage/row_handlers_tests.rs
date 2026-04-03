@@ -110,6 +110,32 @@ mod tests {
             })
         }
 
+        async fn search_row_keys(&self, query: &str, limit: usize) -> anyhow::Result<Vec<RowId>> {
+            let normalized_query = query.trim().to_ascii_lowercase();
+            if normalized_query.is_empty() || limit == 0 {
+                return Ok(Vec::new());
+            }
+
+            let events = self.events.lock().await;
+            let mut row_ids = Vec::new();
+
+            for row_id in events
+                .iter()
+                .map(|event| event.row_id.clone())
+                .filter(|row_id| row_id.to_key().to_ascii_lowercase().contains(&normalized_query))
+            {
+                if row_ids.iter().any(|existing: &RowId| existing == &row_id) {
+                    continue;
+                }
+                row_ids.push(row_id);
+                if row_ids.len() >= limit {
+                    break;
+                }
+            }
+
+            Ok(row_ids)
+        }
+
         async fn get_job_stats(&self, job_id: &str) -> anyhow::Result<JobStatistics> {
             let events = self.events.lock().await;
             let job_events: Vec<_> = events.iter().filter(|e| e.job_id == job_id).collect();
@@ -310,6 +336,46 @@ mod tests {
         assert!(response.is_ok());
         let lineage = response.unwrap();
         assert_eq!(lineage.0.total_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn test_search_row_keys_success() {
+        let state = create_test_api_state();
+
+        if let Some(ref store) = state.row_lineage_store {
+            store
+                .write_row(RowLineageEvent::success(
+                    RowId::database(
+                        DatabaseType::Oracle,
+                        "CUSTOMER_FEED",
+                        std::collections::BTreeMap::from([(
+                            "STAGE_ROW_ID".to_string(),
+                            "FEED001".to_string(),
+                        )]),
+                    ),
+                    "batch-1".to_string(),
+                    "job-1".to_string(),
+                    "/output/test.csv".to_string(),
+                    "tenant-a".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let response = row_handlers::search_row_keys(
+            axum::extract::State(state),
+            axum::extract::Query(crate::api::lineage::types::RowKeySearchQuery {
+                q: "oracle:customer".to_string(),
+                limit: Some(5),
+            }),
+        )
+        .await;
+
+        assert!(response.is_ok());
+        let search = response.unwrap();
+        assert_eq!(search.0.total_count, 1);
+        assert_eq!(search.0.matches[0].source_type, "oracle");
+        assert_eq!(search.0.matches[0].source_id, "CUSTOMER_FEED");
     }
 
     #[tokio::test]

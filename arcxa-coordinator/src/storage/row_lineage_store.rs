@@ -245,15 +245,10 @@ impl RowLineageStore {
         Ok(())
     }
 
-    /// Decode row ID from bytes
+    /// Decode row ID from index bytes
     fn decode_row_id(bytes: &[u8]) -> Result<RowId> {
-        let s = String::from_utf8(bytes.to_vec())?;
-        // For now, store the string representation
-        // In production, implement proper deserialization
-        Ok(serde_json::from_str(&format!(
-            r#"{{"source_type":"Csv","source_id":"{}","position":{{"RowNumber":1}}}}"#,
-            s
-        ))?)
+        let key = String::from_utf8(bytes.to_vec())?;
+        RowId::from_key(&key)
     }
 
     /// Write events to RocksDB
@@ -556,6 +551,71 @@ impl RowLevelLineageSink for RowLineageStore {
             destination,
             total_duration_ms,
         })
+    }
+
+    async fn search_row_keys(&self, query: &str, limit: usize) -> Result<Vec<RowId>> {
+        let normalized_query = query.trim().to_ascii_lowercase();
+        if normalized_query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cf_by_row = self.cf(cf::BY_ROW)?;
+        let iter = self.db.iterator_cf(&cf_by_row, rocksdb::IteratorMode::Start);
+
+        let mut exact_matches = Vec::new();
+        let mut prefix_matches = Vec::new();
+        let mut contains_matches = Vec::new();
+        let mut total_matches = 0usize;
+        let mut seen = HashSet::new();
+
+        for item in iter {
+            let (key, _) = item.context("Failed to iterate row lineage index")?;
+            let row_key = String::from_utf8_lossy(&key).to_string();
+            let row_key_lower = row_key.to_ascii_lowercase();
+
+            let match_rank = if row_key_lower == normalized_query {
+                Some(0u8)
+            } else if row_key_lower.starts_with(&normalized_query) {
+                Some(1u8)
+            } else if row_key_lower.contains(&normalized_query) {
+                Some(2u8)
+            } else {
+                None
+            };
+
+            let Some(match_rank) = match_rank else {
+                continue;
+            };
+
+            total_matches += 1;
+
+            let within_limit =
+                seen.insert(row_key.clone())
+                    && exact_matches.len() + prefix_matches.len() + contains_matches.len() < limit;
+
+            if within_limit {
+                match Self::decode_row_id(row_key.as_bytes()) {
+                    Ok(row_id) => match match_rank {
+                        0 => exact_matches.push(row_id),
+                        1 => prefix_matches.push(row_id),
+                        _ => contains_matches.push(row_id),
+                    },
+                    Err(error) => tracing::warn!(
+                        row_key = %row_key,
+                        error = %error,
+                        "Skipping malformed row key while searching lineage index"
+                    ),
+                }
+            }
+        }
+
+        let mut matches = Vec::with_capacity(limit.min(total_matches));
+        matches.extend(exact_matches);
+        matches.extend(prefix_matches);
+        matches.extend(contains_matches);
+        matches.truncate(limit);
+
+        Ok(matches)
     }
 
     async fn get_job_stats(&self, job_id: &str) -> Result<JobStatistics> {
@@ -1239,6 +1299,50 @@ mod tests {
 
         let row_ids = store.get_tenant_row_ids("tenant-abc")?;
         assert_eq!(row_ids.len(), 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_row_keys_prioritizes_prefix_matches() -> Result<()> {
+        let dir = tempdir()?;
+        let store = RowLineageStore::new(dir.path())?;
+
+        let oracle_row = RowId::database(
+            DatabaseType::Oracle,
+            "CUSTOMER_FEED",
+            BTreeMap::from([("STAGE_ROW_ID".to_string(), "FEED001".to_string())]),
+        );
+        let db2_row = RowId::database(
+            DatabaseType::DB2,
+            "CUSTOMER_FEED_CURATED",
+            BTreeMap::from([("STAGE_ROW_ID".to_string(), "FEED001".to_string())]),
+        );
+
+        store
+            .write_rows_batch(vec![
+                RowLineageEvent::success(
+                    oracle_row.clone(),
+                    "batch-search".to_string(),
+                    "job-search".to_string(),
+                    "/output/oracle".to_string(),
+                    "tenant-search".to_string(),
+                ),
+                RowLineageEvent::success(
+                    db2_row.clone(),
+                    "batch-search".to_string(),
+                    "job-search".to_string(),
+                    "/output/db2".to_string(),
+                    "tenant-search".to_string(),
+                ),
+            ])
+            .await?;
+
+        let matches = store.search_row_keys("oracle:customer", 10).await?;
+
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].to_key(), oracle_row.to_key());
+        assert!(matches.iter().all(|row_id| row_id.to_key().contains("CUSTOMER")));
 
         Ok(())
     }

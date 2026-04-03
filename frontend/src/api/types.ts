@@ -129,38 +129,55 @@ export interface ImpactAnalysisResponse {
 // Row-Level Lineage Types
 
 export interface RowLineageEvent {
-  event_id: string;
-  timestamp: string;
-  operation: string;
-  source_dataset?: string;
-  target_dataset?: string;
+  row_id: {
+    source_type?: Record<string, string>;
+    source_id: string;
+    position?: Record<string, JsonValue>;
+  };
+  batch_id: string;
   job_id: string;
-  batch_id?: string;
-  status: 'SUCCESS' | 'FAILED' | 'PARTIAL';
-  rows_processed: number;
-  quality_score?: number;
-  entity_uri?: string;
-  transformations_applied?: Array<{
-    type: string;
-    field?: string;
-    rule?: string;
-    result?: string;
-    ontology?: string;
-    mapped_class?: string;
-    confidence?: number;
+  step_id?: string;
+  timestamp: string;
+  outcome: Record<string, JsonValue>;
+  transformations: Array<{
+    transform_type: string;
+    fields: string[];
+    before_values?: Record<string, JsonValue> | null;
+    after_values?: Record<string, JsonValue> | null;
+    applied_at: string;
   }>;
+  output_row_id?: {
+    source_type?: Record<string, string>;
+    source_id: string;
+    position?: Record<string, JsonValue>;
+  } | null;
+  tenant_id: string;
+  correlation_id?: string | null;
 }
 
 export interface RowLineageResponse {
   row_key: string;
   events: RowLineageEvent[];
-  metadata: {
-    total_events: number;
-    total_transformations: number;
+  total_count?: number;
+  metadata?: {
+    total_events?: number;
+    total_transformations?: number;
     data_quality_score?: number;
     processing_duration_ms?: number;
-    current_status: string;
+    current_status?: string;
   };
+}
+
+export interface RowKeySearchMatch {
+  row_key: string;
+  source_type: string;
+  source_id: string;
+}
+
+export interface RowKeySearchResponse {
+  query: string;
+  matches: RowKeySearchMatch[];
+  total_count: number;
 }
 
 export interface RowJourneyNode {
@@ -184,18 +201,35 @@ export interface RowJourneyEdge {
 }
 
 export interface RowJourneyResponse {
-  row_key: string;
-  journey: {
+  source?: {
+    source_type?: Record<string, string>;
+    source_id: string;
+    position?: Record<string, JsonValue>;
+  };
+  steps?: Array<{
+    activity: string;
+    timestamp: string;
+    duration_ms: number;
+    outcome: Record<string, JsonValue>;
+  }>;
+  destination?: {
+    source_type?: Record<string, string>;
+    source_id: string;
+    position?: Record<string, JsonValue>;
+  } | null;
+  total_duration_ms?: number;
+  row_key?: string;
+  journey?: {
     nodes: RowJourneyNode[];
     edges: RowJourneyEdge[];
   };
-  metadata: {
-    total_nodes: number;
-    total_edges: number;
-    journey_duration_ms: number;
-    first_seen: string;
-    last_updated: string;
-    current_status: string;
+  metadata?: {
+    total_nodes?: number;
+    total_edges?: number;
+    journey_duration_ms?: number;
+    first_seen?: string;
+    last_updated?: string;
+    current_status?: string;
   };
 }
 
@@ -303,52 +337,76 @@ export interface FilteredRowsResponse {
   };
 }
 
-export interface RunLineageArtifact {
-  artifact_id: string;
-  type: string;
-  name: string;
-  location?: string;
-  rows?: number;
-  size_bytes?: number;
-  quality_score?: number;
-  triple_count?: number;
-  entity_count?: number;
-}
-
-export interface RunLineageStep {
-  step_id: string;
-  step_name: string;
-  step_type: string;
-  started_at: string;
-  completed_at: string;
-  status: 'SUCCESS' | 'FAILED' | 'RUNNING';
-  input_artifacts: RunLineageArtifact[];
-  output_artifacts: RunLineageArtifact[];
-  metrics: Record<string, number>;
-}
-
 export interface RunLineageResponse {
   run_id: string;
-  workflow_id: string;
-  workflow_name: string;
-  started_at: string;
-  completed_at: string;
-  status: 'SUCCESS' | 'FAILED' | 'RUNNING' | 'CANCELLED';
-  triggered_by: string;
-  steps: RunLineageStep[];
-  summary: {
-    total_steps: number;
-    successful_steps: number;
-    failed_steps: number;
-    total_duration_ms: number;
-    total_rows_processed: number;
-    final_rows: number;
-    data_quality_score?: number;
-  };
-  lineage_graph?: {
-    nodes: Array<{ id: string; type: string; name: string }>;
-    edges: Array<{ source: string; target: string; step: string }>;
-  };
+  total_records?: number;
+  events?: Array<{
+    record_id: string;
+    dataset: string;
+    run_id: string;
+    tenant_id: string;
+    timestamp: string;
+    sources: Array<{
+      system: string;
+      path: string;
+      version?: string | null;
+      extracted_at: string;
+      cdc_position?: {
+        topic: string;
+        partition: number;
+        offset: number;
+        lsn?: string | null;
+      } | null;
+    }>;
+    transforms: Array<{
+      id: string;
+      transform_type: string;
+      rule_id: string;
+      version: string;
+      parameters: Record<string, JsonValue>;
+      applied_at: string;
+      fields_modified: string[];
+    }>;
+    models: Array<{
+      model_id: string;
+      version: string;
+      model_type: string;
+      params_hash: string;
+      training_data: Array<{
+        system: string;
+        path: string;
+        version?: string | null;
+        extracted_at: string;
+      }>;
+      metrics: Record<string, JsonValue>;
+      registry_uri: string;
+      inference_at: string;
+      features_used: string[];
+      outputs: string[];
+    }>;
+    output: {
+      system: string;
+      path: string;
+      version?: string | null;
+      extracted_at: string;
+      cdc_position?: {
+        topic: string;
+        partition: number;
+        offset: number;
+        lsn?: string | null;
+      } | null;
+    };
+    metadata: Record<string, string>;
+  }>;
+  datasets?: string[];
+  start_time?: string | null;
+  end_time?: string | null;
+  workflow_id?: string;
+  workflow_name?: string;
+  started_at?: string;
+  completed_at?: string;
+  status?: 'SUCCESS' | 'FAILED' | 'RUNNING' | 'CANCELLED';
+  triggered_by?: string;
 }
 
 // Time Range Lineage Types
@@ -1207,11 +1265,15 @@ export interface WorkflowExecutionResult {
 export interface WorkflowExecutionSummary {
   execution_id: string;
   workflow_id: string;
+  workflow_name?: string;
   success: boolean;
   confidence: number;
+  status?: string;
   started_at: string;
+  updated_at?: string;
   completed_at: string;
   duration_ms: number;
+  actions_executed?: number;
 }
 
 // ============================================================================
@@ -1419,11 +1481,15 @@ export interface WorkflowExecutionResult {
 export interface WorkflowExecutionSummary {
   execution_id: string;
   workflow_id: string;
+  workflow_name?: string;
   success: boolean;
   confidence: number;
+  status?: string;
   started_at: string;
+  updated_at?: string;
   completed_at: string;
   duration_ms: number;
+  actions_executed?: number;
 }
 
 // ============================================================================

@@ -113,6 +113,32 @@ impl RowLevelLineageSink for MockRowLineageStore {
         })
     }
 
+    async fn search_row_keys(&self, query: &str, limit: usize) -> Result<Vec<RowId>> {
+        let normalized_query = query.trim().to_ascii_lowercase();
+        if normalized_query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let events = self.events.lock().await;
+        let mut row_ids = Vec::new();
+
+        for row_id in events
+            .iter()
+            .map(|event| event.row_id.clone())
+            .filter(|row_id| row_id.to_key().to_ascii_lowercase().contains(&normalized_query))
+        {
+            if row_ids.iter().any(|existing: &RowId| existing == &row_id) {
+                continue;
+            }
+            row_ids.push(row_id);
+            if row_ids.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(row_ids)
+    }
+
     async fn get_batch_lineage(&self, batch_id: &str) -> Result<Vec<RowLineageEvent>> {
         let events = self.events.lock().await;
         Ok(events

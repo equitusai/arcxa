@@ -216,6 +216,22 @@ export function useRowLineage(rowKey: string | undefined, enabled = true) {
 }
 
 /**
+ * Search row keys for lineage-aware autocomplete.
+ */
+export function useRowKeySearch(
+  query: string | undefined,
+  params?: { limit?: number },
+  enabled = true
+) {
+  return useQuery({
+    queryKey: ['lineage', 'row-search', query, params],
+    queryFn: () => lineageApi.searchRowKeys(query!, params),
+    enabled: enabled && !!query,
+    staleTime: 30 * 1000,
+  });
+}
+
+/**
  * Get row journey query hook
  *
  * @param rowKey - Unique row identifier
