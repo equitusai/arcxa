@@ -93,7 +93,8 @@ RUN getent group db2iadm1 >/dev/null 2>&1 || groupadd -o -g 1000 db2iadm1 \
 WORKDIR /app
 
 COPY docker/oracle-e2e/start-arcxa-coordinator-db2.sh /usr/local/bin/start-arcxa-coordinator-db2.sh
-RUN chmod 0755 /usr/local/bin/start-arcxa-coordinator-db2.sh
+RUN sed -i 's/\r$//' /usr/local/bin/start-arcxa-coordinator-db2.sh \
+    && chmod 0755 /usr/local/bin/start-arcxa-coordinator-db2.sh
 
 COPY --from=rust-builder /tmp/arcxa-coordinator /app/arcxa-coordinator
 
