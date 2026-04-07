@@ -2,12 +2,37 @@ FROM node:20-bookworm AS build
 
 ARG VITE_API_BASE_URL=http://localhost:18898/api/v1
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /sources
+COPY . /sources
+
+RUN set -eux; \
+    if [ -f /sources/graphica-frontend/package-lock.json ]; then \
+      frontend_src=/sources/graphica-frontend; \
+    elif [ -f /sources/arcxa/frontend/package-lock.json ]; then \
+      frontend_src=/sources/arcxa/frontend; \
+    elif [ -f /sources/graphica/frontend/package-lock.json ]; then \
+      frontend_src=/sources/graphica/frontend; \
+    else \
+      git clone --depth=1 https://github.com/equitusai/arcxa.git /tmp/arcxa-public; \
+      frontend_src=/tmp/arcxa-public/frontend; \
+    fi; \
+    printf '%s\n' "${frontend_src}" > /tmp/frontend-src
+
 WORKDIR /workspace
+RUN set -eux; \
+    frontend_src="$(cat /tmp/frontend-src)"; \
+    cp "${frontend_src}/package.json" "${frontend_src}/package-lock.json" ./; \
+    npm ci
 
-COPY graphica-frontend/package.json graphica-frontend/package-lock.json ./
-RUN npm ci
+RUN set -eux; \
+    frontend_src="$(cat /tmp/frontend-src)"; \
+    cp -a "${frontend_src}/." ./; \
+    rm -rf .git
 
-COPY graphica-frontend/ ./
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
