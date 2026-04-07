@@ -182,8 +182,8 @@ services:
 
   bootstrap:
     build:
-      context: ../../..
-      dockerfile: graphica/docker/oracle-demo/Dockerfile.bootstrap
+      context: ../..
+      dockerfile: docker/oracle-demo/Dockerfile.bootstrap
     image: arcxa-oracle-demo-bootstrap:latest
     container_name: arcxa-oracle-demo-bootstrap
     depends_on:
@@ -224,8 +224,8 @@ services:
 
   frontend:
     build:
-      context: ../../..
-      dockerfile: graphica/docker/oracle-demo/Dockerfile.frontend-demo
+      context: ../..
+      dockerfile: docker/oracle-demo/Dockerfile.frontend-demo
       args:
         VITE_API_BASE_URL: http://localhost:18898/api/v1
     image: arcxa-frontend-oracle-demo:latest

@@ -10,7 +10,9 @@ WORKDIR /sources
 COPY . /sources
 
 RUN set -eux; \
-    if [ -f /sources/graphica-frontend/package-lock.json ]; then \
+    if [ -f /sources/frontend/package-lock.json ]; then \
+      frontend_src=/sources/frontend; \
+    elif [ -f /sources/graphica-frontend/package-lock.json ]; then \
       frontend_src=/sources/graphica-frontend; \
     elif [ -f /sources/arcxa/frontend/package-lock.json ]; then \
       frontend_src=/sources/arcxa/frontend; \
@@ -38,7 +40,7 @@ RUN npm run build
 
 FROM nginx:1.27-alpine
 
-COPY graphica/docker/oracle-demo/nginx.frontend.conf /etc/nginx/conf.d/default.conf
+COPY docker/oracle-demo/nginx.frontend.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /workspace/dist/ /usr/share/nginx/html/
 
 EXPOSE 80
