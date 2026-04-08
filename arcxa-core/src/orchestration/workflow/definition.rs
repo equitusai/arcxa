@@ -865,6 +865,12 @@ pub struct SemanticMapperConfig {
     pub mapping_mode: MappingMode,
     #[serde(default)]
     pub mapping_session_id: Option<String>,
+    /// Preserve the source field names alongside ontology-aligned aliases.
+    ///
+    /// This is useful when downstream steps still load into a canonical table
+    /// schema but we also want ontology mapping and lineage in the same run.
+    #[serde(default)]
+    pub preserve_original_fields: bool,
     /// Optional datasource ID for lineage and mapping context
     #[serde(default)]
     pub source_id: Option<String>,

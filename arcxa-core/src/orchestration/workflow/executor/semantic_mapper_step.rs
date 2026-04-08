@@ -86,6 +86,7 @@ impl WorkflowExecutor {
             "auto_approve_threshold": config.auto_approve_threshold,
             "mapping_mode": format!("{:?}", config.mapping_mode),
             "entity_uri": config.entity_uri,
+            "preserve_original_fields": config.preserve_original_fields,
         });
 
         if let Some(ref session_id) = config.mapping_session_id {

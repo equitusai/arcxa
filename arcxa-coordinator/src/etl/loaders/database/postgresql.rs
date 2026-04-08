@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use super::common::{
     flatten_rows_to_params, generate_csv_for_copy, generate_insert_sql, generate_upsert_sql,
+    quote_postgres_columns, quote_postgres_table_name,
 };
 use super::postgres_pool::{
     create_postgres_pool, PostgresConfig, PostgresPool, PostgresPoolConfig,
@@ -123,11 +124,14 @@ impl PostgreSQLLoader {
         columns: &[String],
         rows: &[HashMap<String, Option<String>>],
     ) -> Result<u64> {
+        let quoted_table = quote_postgres_table_name(table_name)?;
+        let quoted_columns = quote_postgres_columns(columns)?;
+
         // Build COPY command
         let copy_sql = format!(
             "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', NULL '')",
-            table_name,
-            columns.join(", ")
+            quoted_table,
+            quoted_columns.join(", ")
         );
 
         // Generate CSV data
@@ -252,6 +256,9 @@ impl PostgreSQLLoader {
         columns: &[String],
         rows: &[HashMap<String, Option<String>>],
     ) -> Result<u64> {
+        let quoted_table = quote_postgres_table_name(table_name)?;
+        let quoted_columns = quote_postgres_columns(columns)?;
+
         // Get connection from pool
         let mut client = self
             .pool
@@ -266,7 +273,7 @@ impl PostgreSQLLoader {
             .context("Failed to start transaction")?;
 
         // Truncate table
-        let truncate_sql = format!("TRUNCATE TABLE {}", table_name);
+        let truncate_sql = format!("TRUNCATE TABLE {}", quoted_table);
         transaction
             .execute(&truncate_sql, &[])
             .await
@@ -277,8 +284,8 @@ impl PostgreSQLLoader {
         // Use COPY for bulk insert after truncate
         let copy_sql = format!(
             "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', NULL '')",
-            table_name,
-            columns.join(", ")
+            quoted_table,
+            quoted_columns.join(", ")
         );
 
         let csv_data = generate_csv_for_copy(columns, rows, ',', '"', "")?;

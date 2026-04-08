@@ -508,9 +508,10 @@ impl InputAdapter for DatasetInputAdapter {
                     .await
                     .with_context(|| format!("Failed to load dataset {}", dataset_id))?;
 
+                let effective_batch_size = batch_size.unwrap_or_else(|| rows.len().max(1));
                 contexts_from_row_batches_with_metadata(
                     &rows,
-                    batch_size.unwrap_or(1000),
+                    effective_batch_size,
                     input_batch_metadata("dataset_input", Some(dataset_id.clone())),
                 )
             }
@@ -1203,6 +1204,37 @@ mod tests {
         assert_eq!(
             frame.metadata().source_id.as_deref(),
             Some("ds_datasource_123")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dataset_adapter_without_batch_size_uses_single_context() {
+        let adapter = DatasetInputAdapter::new(Arc::new(MockDatasetResolver {
+            rows: vec![
+                serde_json::json!({"id": 1}),
+                serde_json::json!({"id": 2}),
+                serde_json::json!({"id": 3}),
+            ],
+        }));
+        let input = WorkflowInput::Dataset {
+            dataset_id: "ds_datasource_full".to_string(),
+            batch_size: None,
+            limit: None,
+        };
+
+        let contexts = adapter.prepare_context(&input).await.unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].input_data.as_array().unwrap().len(), 3);
+
+        let frame = contexts[0].get_batch_frame().unwrap();
+        assert_eq!(frame.row_count(), 3);
+        assert_eq!(
+            frame.metadata().source_kind.as_deref(),
+            Some("dataset_input")
+        );
+        assert_eq!(
+            frame.metadata().source_id.as_deref(),
+            Some("ds_datasource_full")
         );
     }
 

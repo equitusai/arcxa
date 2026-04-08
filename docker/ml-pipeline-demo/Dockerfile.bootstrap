@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY docker/ml-pipeline-demo/bootstrap_ml_pipeline_demo.py /app/bootstrap_ml_pipeline_demo.py
+
+ENTRYPOINT ["python", "/app/bootstrap_ml_pipeline_demo.py"]

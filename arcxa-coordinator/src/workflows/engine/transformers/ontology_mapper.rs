@@ -229,12 +229,17 @@ impl OntologyMapperTransformer {
         rows: &[JsonValue],
         field_mapping: &HashMap<String, String>,
         entity_uri: Option<&str>,
+        preserve_original_fields: bool,
     ) -> Vec<JsonValue> {
         let mut mapped_rows = Vec::new();
 
         for row in rows {
             if let Some(obj) = row.as_object() {
-                let mut mapped_obj = serde_json::Map::new();
+                let mut mapped_obj = if preserve_original_fields {
+                    obj.clone()
+                } else {
+                    serde_json::Map::new()
+                };
 
                 for (source_field, value) in obj.iter() {
                     let target_field = field_mapping
@@ -314,6 +319,10 @@ impl Transformer for OntologyMapperTransformer {
             .get("entity_uri")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let preserve_original_fields = config
+            .get("preserve_original_fields")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if let Some(ref uri) = entity_uri {
             info!(
@@ -322,6 +331,10 @@ impl Transformer for OntologyMapperTransformer {
             );
         } else {
             info!("✗ No entity URI configured - ontology-driven loading will NOT be triggered");
+        }
+
+        if preserve_original_fields {
+            info!("✓ Preserving original fields alongside ontology-aligned aliases");
         }
 
         // Validate configuration parameters
@@ -642,7 +655,12 @@ impl Transformer for OntologyMapperTransformer {
         // Transform rows using field mapping
         if let Some(rows) = data.get("rows").and_then(|r| r.as_array()) {
             let row_count = rows.len();
-            let mapped_rows = self.map_rows(rows, &field_mapping, entity_uri.as_deref());
+            let mapped_rows = self.map_rows(
+                rows,
+                &field_mapping,
+                entity_uri.as_deref(),
+                preserve_original_fields,
+            );
             data["rows"] = JsonValue::Array(mapped_rows);
             debug!("Mapped {} rows to ontological fields", row_count);
             if let Some(ref uri) = entity_uri {

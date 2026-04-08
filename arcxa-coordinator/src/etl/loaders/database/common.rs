@@ -5,6 +5,48 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
+fn validate_postgres_identifier(identifier: &str, identifier_type: &str) -> Result<()> {
+    use graphica_core::security::validate_identifier;
+
+    validate_identifier(identifier).map_err(|e| {
+        anyhow::anyhow!("Invalid PostgreSQL {} '{}': {}", identifier_type, identifier, e)
+    })?;
+    Ok(())
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+pub fn quote_postgres_table_name(table_name: &str) -> Result<String> {
+    let parts: Vec<&str> = table_name.split('.').collect();
+    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+        anyhow::bail!("Invalid PostgreSQL table name '{}'", table_name);
+    }
+
+    let mut quoted_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        validate_postgres_identifier(part, "table name")?;
+        quoted_parts.push(quote_postgres_identifier(part));
+    }
+
+    Ok(quoted_parts.join("."))
+}
+
+pub fn quote_postgres_columns(columns: &[String]) -> Result<Vec<String>> {
+    if columns.is_empty() {
+        anyhow::bail!("No columns specified");
+    }
+
+    columns
+        .iter()
+        .map(|column| {
+            validate_postgres_identifier(column, "column name")?;
+            Ok(quote_postgres_identifier(column))
+        })
+        .collect()
+}
+
 /// Generate INSERT SQL for batch loading
 ///
 /// Creates parameterized INSERT statement for efficient bulk loading.
@@ -19,25 +61,15 @@ pub fn generate_insert_sql(
     columns: &[String],
     row_count: usize,
 ) -> Result<String> {
-    use graphica_core::security::validate_identifier;
-
     if columns.is_empty() {
         anyhow::bail!("No columns specified for INSERT");
     }
 
-    // Validate table name to prevent SQL injection
-    validate_identifier(table_name)
-        .map_err(|e| anyhow::anyhow!("Invalid table name for common INSERT: {}", e))?;
+    let quoted_table = quote_postgres_table_name(table_name)?;
+    let quoted_columns = quote_postgres_columns(columns)?;
 
-    // Validate all column names to prevent SQL injection
-    for column in columns {
-        validate_identifier(column).map_err(|e| {
-            anyhow::anyhow!("Invalid column name '{}' for common INSERT: {}", column, e)
-        })?;
-    }
-
-    let mut sql = format!("INSERT INTO {} (", table_name);
-    sql.push_str(&columns.join(", "));
+    let mut sql = format!("INSERT INTO {} (", quoted_table);
+    sql.push_str(&quoted_columns.join(", "));
     sql.push_str(") VALUES\n");
 
     let mut value_clauses = Vec::new();
@@ -71,8 +103,6 @@ pub fn generate_upsert_sql(
     key_fields: &[String],
     row_count: usize,
 ) -> Result<String> {
-    use graphica_core::security::validate_identifier;
-
     if columns.is_empty() {
         anyhow::bail!("No columns specified for UPSERT");
     }
@@ -81,26 +111,12 @@ pub fn generate_upsert_sql(
         anyhow::bail!("No key fields specified for UPSERT");
     }
 
-    // Validate table name to prevent SQL injection
-    validate_identifier(table_name)
-        .map_err(|e| anyhow::anyhow!("Invalid table name for common UPSERT: {}", e))?;
+    let quoted_table = quote_postgres_table_name(table_name)?;
+    let quoted_columns = quote_postgres_columns(columns)?;
+    let quoted_key_fields = quote_postgres_columns(key_fields)?;
 
-    // Validate all column names to prevent SQL injection
-    for column in columns {
-        validate_identifier(column).map_err(|e| {
-            anyhow::anyhow!("Invalid column name '{}' for common UPSERT: {}", column, e)
-        })?;
-    }
-
-    // Validate all key field names to prevent SQL injection
-    for key_field in key_fields {
-        validate_identifier(key_field).map_err(|e| {
-            anyhow::anyhow!("Invalid key field '{}' for common UPSERT: {}", key_field, e)
-        })?;
-    }
-
-    let mut sql = format!("INSERT INTO {} (", table_name);
-    sql.push_str(&columns.join(", "));
+    let mut sql = format!("INSERT INTO {} (", quoted_table);
+    sql.push_str(&quoted_columns.join(", "));
     sql.push_str(") VALUES\n");
 
     let mut value_clauses = Vec::new();
@@ -118,14 +134,17 @@ pub fn generate_upsert_sql(
     // Add ON CONFLICT clause
     sql.push_str(&format!(
         "\nON CONFLICT ({}) DO UPDATE SET\n",
-        key_fields.join(", ")
+        quoted_key_fields.join(", ")
     ));
 
     // Generate UPDATE SET clause for non-key columns
     let update_columns: Vec<String> = columns
         .iter()
         .filter(|col| !key_fields.contains(col))
-        .map(|col| format!("    {} = EXCLUDED.{}", col, col))
+        .map(|col| {
+            let quoted = quote_postgres_identifier(col);
+            format!("    {} = EXCLUDED.{}", quoted, quoted)
+        })
         .collect();
 
     if update_columns.is_empty() {
@@ -216,8 +235,8 @@ mod tests {
         let columns = vec!["id".to_string(), "name".to_string()];
         let sql = generate_insert_sql("users", &columns, 2).unwrap();
 
-        assert!(sql.contains("INSERT INTO users"));
-        assert!(sql.contains("(id, name)"));
+        assert!(sql.contains("INSERT INTO \"users\""));
+        assert!(sql.contains("(\"id\", \"name\")"));
         assert!(sql.contains("($1, $2)"));
         assert!(sql.contains("($3, $4)"));
     }
@@ -228,11 +247,17 @@ mod tests {
         let key_fields = vec!["id".to_string()];
         let sql = generate_upsert_sql("users", &columns, &key_fields, 1).unwrap();
 
-        assert!(sql.contains("INSERT INTO users"));
-        assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
-        assert!(sql.contains("name = EXCLUDED.name"));
-        assert!(sql.contains("email = EXCLUDED.email"));
-        assert!(!sql.contains("id = EXCLUDED.id")); // Key field shouldn't be in UPDATE
+        assert!(sql.contains("INSERT INTO \"users\""));
+        assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET"));
+        assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
+        assert!(sql.contains("\"email\" = EXCLUDED.\"email\""));
+        assert!(!sql.contains("\"id\" = EXCLUDED.\"id\"")); // Key field shouldn't be in UPDATE
+    }
+
+    #[test]
+    fn test_quote_postgres_table_name_supports_schema_qualified_names() {
+        let quoted = quote_postgres_table_name("ml_demo.customer_training_features").unwrap();
+        assert_eq!(quoted, "\"ml_demo\".\"customer_training_features\"");
     }
 
     #[test]

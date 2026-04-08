@@ -1,0 +1,182 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: arcxa-ml-demo-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo stat | nc localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: arcxa-ml-demo-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:19113
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "19113:19113"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "nc -z localhost 29092 && nc -z localhost 19113",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: arcxa-ml-demo-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: curl -f http://localhost:8081/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: on-failure
+
+  postgres:
+    image: postgres:16
+    container_name: arcxa-ml-demo-postgres
+    environment:
+      POSTGRES_DB: arcxa_ml_demo
+      POSTGRES_USER: arcxa_demo
+      POSTGRES_PASSWORD: arcxa_demo
+    ports:
+      - "15444:5432"
+    volumes:
+      - postgres-ml-demo-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arcxa_demo -d arcxa_ml_demo"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.coordinator
+      args:
+        ENABLE_ODBC: "false"
+        CARGO_PROFILE: "bench-quick"
+    image: arcxa-coordinator-ml-demo:latest
+    container_name: arcxa-ml-demo-coordinator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      REST_PORT: "8080"
+      GRPC_PORT: "9090"
+      REST_BIND_ADDRESS: "0.0.0.0"
+      GRPC_BIND_ADDRESS: "0.0.0.0"
+      ROCKSDB_PATH: /app/data/rocksdb
+      PARQUET_PATH: /app/data/parquet
+      ARCHIVE_PATH: /app/data/archive
+      ROW_LINEAGE_DB_PATH: /app/data/row-lineage-db
+      AUDIT_CHAIN_PATH: /app/data/audit
+      DATASOURCE_DB_PATH: /app/data/datasources
+      KAFKA_MODE: durable
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CONSUMER_GROUP: arcxa-ml-demo
+      KAFKA_LINEAGE_TOPIC: graphica.lineage
+      KAFKA_QUALITY_TOPIC: graphica.quality
+      ENABLE_AUTH: "true"
+      JWT_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+      CORS_ALLOWED_ORIGINS: "http://localhost:13020,http://localhost:3000,http://localhost:5173"
+      ENABLE_METRICS: "true"
+      METRICS_PORT: "9091"
+      GRAPHICA_SECRET_STORE_TYPE: file
+      GRAPHICA_SECRET_STORE_DIR: /app/data/secrets
+      SETUP_TOKEN_OUTPUT_PATH: /app/data/bootstrap/setup-token.txt
+      RUST_LOG: info
+    ports:
+      - "18928:8080"
+      - "19116:9090"
+    volumes:
+      - coordinator-ml-demo-data:/app/data
+      - ./data:/demo-data:ro
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  bootstrap:
+    build:
+      context: ../..
+      dockerfile: docker/ml-pipeline-demo/Dockerfile.bootstrap
+    image: arcxa-ml-demo-bootstrap:latest
+    container_name: arcxa-ml-demo-bootstrap
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: GraphicaDemoAdmin123!
+      SETUP_TOKEN_PATH: /coordinator-data/bootstrap/setup-token.txt
+      BOOTSTRAP_SUMMARY_PATH: /coordinator-data/bootstrap/ml-pipeline-demo-bootstrap-summary.json
+      POSTGRES_DATASOURCE_TITLE: postgres-ml-feature-demo
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: arcxa_ml_demo
+      POSTGRES_SCHEMA: ml_demo
+      POSTGRES_USERNAME: arcxa_demo
+      POSTGRES_PASSWORD: arcxa_demo
+      PARQUET_DATASET_NAME: product_usage_signals
+      PARQUET_DATASET_FILE: /demo-data/product_usage.parquet
+    volumes:
+      - coordinator-ml-demo-data:/coordinator-data
+      - ./data:/demo-data:ro
+    restart: "no"
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: docker/oracle-demo/Dockerfile.frontend-demo
+      args:
+        VITE_API_BASE_URL: http://localhost:18928/api/v1
+    image: arcxa-frontend-ml-demo:latest
+    container_name: arcxa-ml-demo-frontend
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    ports:
+      - "13020:80"
+
+volumes:
+  postgres-ml-demo-data:
+  coordinator-ml-demo-data:

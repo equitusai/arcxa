@@ -1,18 +1,23 @@
+# syntax=docker/dockerfile:1.7
+
 # Dockerfile for ARCXA Coordinator
 # Multi-stage build for optimal image size
 
 # Stage 1: Build
-FROM rust:1.75-slim as builder
+FROM rust:1.91.1-slim as builder
 
 ARG ENABLE_ODBC=true
+ARG CARGO_PROFILE=release
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    libcurl4-openssl-dev \
     protobuf-compiler \
     cmake \
     clang \
+    make \
     && if [ "$ENABLE_ODBC" = "true" ]; then \
          apt-get install -y unixodbc-dev; \
        fi \
@@ -22,20 +27,27 @@ WORKDIR /build
 
 # Copy workspace files (proto files needed for graphica_core build.rs)
 COPY Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY proto ./proto
 COPY arcxa-core ./arcxa-core
 COPY arcxa-coordinator ./arcxa-coordinator
+COPY arcxa-migrations ./arcxa-migrations
+COPY arcxa-model-service ./arcxa-model-service
+COPY arcxa-cli ./arcxa-cli
 
 # Build coordinator (release mode)
 WORKDIR /build/arcxa-coordinator
-RUN if [ "$ENABLE_ODBC" = "true" ]; then \
-      cargo build --release --bin arcxa-coordinator --features odbc; \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    if [ "$ENABLE_ODBC" = "true" ]; then \
+      cargo build --profile "${CARGO_PROFILE}" --bin arcxa-coordinator --features odbc; \
     else \
-      cargo build --release --bin arcxa-coordinator; \
-    fi
+      cargo build --profile "${CARGO_PROFILE}" --bin arcxa-coordinator; \
+    fi \
+    && cp "/build/target/${CARGO_PROFILE}/arcxa-coordinator" /tmp/arcxa-coordinator
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG ENABLE_ODBC=true
 
@@ -57,10 +69,10 @@ RUN useradd -m -u 1000 graphica && \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/arcxa-coordinator/target/release/arcxa-coordinator /app/arcxa-coordinator
+COPY --from=builder /tmp/arcxa-coordinator /app/arcxa-coordinator
 
-# Copy configuration files if they exist
-COPY --chown=graphica:graphica arcxa-coordinator/config* /app/config/ 2>/dev/null || true
+# Reserve a config directory for local/demo mounts without relying on optional COPY patterns.
+RUN mkdir -p /app/config && chown -R graphica:graphica /app/config
 
 USER graphica
 

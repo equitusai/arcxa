@@ -89,11 +89,7 @@ class WorkflowsAPI:
             inputs: Input parameters (if None or empty, sends empty object)
             async_mode: If True, return immediately with execution ID
         """
-        # Note: Coordinator expects "input" (singular), not "inputs" (plural)
-        # Always send input field with empty object if not provided (untagged enum needs explicit empty object)
-        data: Dict[str, Any] = {
-            "input": inputs if inputs else {}
-        }
+        data = self._build_execute_payload(inputs)
 
         endpoint = f"{self._base}/{workflow_id}/execute"
         if async_mode:
@@ -105,6 +101,44 @@ class WorkflowsAPI:
                 return self._adapt_sync_execution_as_async(sync_result, workflow_id)
 
         return self._client.post(endpoint, json=data)
+
+    def _build_execute_payload(
+        self,
+        inputs: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Encode workflow execution input for the coordinator request contract.
+
+        The coordinator supports two shapes:
+        - legacy JSON input: {"input": {...}}
+        - graph-native input: {"type": "dataset", ...}
+
+        Keep source-driven / JSON execution on the legacy path, but flatten
+        graph-native inputs so Dataset / DataSourceQuery / SparqlQuery requests
+        are not accidentally deserialized as plain JSON.
+        """
+
+        if not inputs:
+            return {"input": {}}
+
+        if self._is_graph_native_input(inputs):
+            return dict(inputs)
+
+        return {"input": inputs}
+
+    @staticmethod
+    def _is_graph_native_input(inputs: Dict[str, Any]) -> bool:
+        input_type = inputs.get("type")
+        if not isinstance(input_type, str):
+            return False
+
+        return input_type in {
+            "json",
+            "dataset",
+            "data_source_query",
+            "sparql_query",
+            "entity_filter",
+            "graph_stream",
+        }
 
     def _adapt_sync_execution_as_async(
         self,

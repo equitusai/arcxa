@@ -31,13 +31,14 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    --default-toolchain 1.90.0
+    --default-toolchain 1.91.1
 RUN rustc --version
 
 WORKDIR /usr/src/arcxa
 
 # Copy root Cargo.toml first (needed for path dependencies)
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 
 # Copy proto files (needed by build.rs files)
 COPY proto ./proto
@@ -56,28 +57,27 @@ ENV CARGO_TARGET_DIR=/usr/src/arcxa/target
 # Build all binaries (cd into each directory like build.sh does)
 # Build arcxa-core first (shared library)
 WORKDIR /usr/src/arcxa/arcxa-core
-RUN cargo update && cargo build --release --lib
+RUN cargo build --locked --release --lib
 
 WORKDIR /usr/src/arcxa/arcxa-migrations
-RUN cargo update && cargo build --release --lib
+RUN cargo build --locked --release --lib
 
 
 # Build arcxa-model-service (with clean environment for OpenSSL)
 WORKDIR /usr/src/arcxa/arcxa-model-service
-RUN cargo update && \
-    env -u CC -u CFLAGS -u CPPFLAGS -u LDFLAGS \
+RUN env -u CC -u CFLAGS -u CPPFLAGS -u LDFLAGS \
         -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u LIBRARY_PATH \
         PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig \
         RUSTFLAGS="" \
-        cargo build --release
+        cargo build --locked --release
 
 # Build arcxa-shard (depends on root proto files)
 WORKDIR /usr/src/arcxa/arcxa-shard
-RUN cargo update && cargo build --release
+RUN cargo build --locked --release
 
 # Build arcxa-coordinator (depends on root proto files)
 WORKDIR /usr/src/arcxa/arcxa-coordinator
-RUN cargo update && cargo build --release
+RUN cargo build --locked --release
 
 
 FROM redhat/ubi9-minimal AS packages
