@@ -1,33 +1,193 @@
-# Rust
-/target/
-/arcxa-shard/target/
+/.VSCodeCounter
+/.claude
+# Rust Build Artifacts
+/target
 **/target/
+Cargo.lock
+!Cargo.lock
+*.rlib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
 
-# Frontend
-/frontend/node_modules/
-/frontend/dist/
-/frontend/coverage/
-/frontend/.vite/
+# Backup files
+*.backup
+*.bak
+*.tmp
+*.swp
+*.swo
+*~
 
-# Local runtime state
+# RocksDB Data Directories
 /data/
+**/data/
+/rocksdb/
+**/rocksdb/
+*.sst
+*.log
+
+# Coordinator Runtime Data
+/data/coordinator/
+/data/coordinator/rocksdb/
+/data/coordinator/shard_registry/
+/data/coordinator/governance/
+/data/coordinator/users/
+/data/coordinator/audit/
+
+# Storage Layers
+/data/parquet/
+/data/archive/
+/data/shards/
+
+# Test Data
+/test_rocks/
+**/test_rocks/
+/testing/
+**/testing/
+
+# Logs
+*.log
 /logs/
-/tmp/
-/arcxa-coordinator/:memory:/
-/arcxa-coordinator/data/
-/arcxa-coordinator/test_rocks/
+**/logs/
+server.log
+example.log
+build.log
+build2.log
 
-# Python
-**/__pycache__/
-**/*.pyc
-**/.pytest_cache/
-**/.venv/
-
-# Local env files
-.env
-.env.*
-!.env.example
-
-# OS/editor noise
+# IDE / Editor Files
+.vscode/
+.idea/
+*.iml
+.vs/
+.fleet/
+*.swp
+*.swo
+*~
 .DS_Store
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+
+# Windows
 Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment Files
+.env
+.env.local
+.env.*.local
+
+# WASM Build
+*.wasm
+**/pkg/
+
+# Documentation Build Artifacts
+/book/
+/mdbook/
+
+# Profiling / Benchmarking
+/criterion/
+flamegraph.svg
+perf.data*
+*.profdata
+
+# Test Coverage
+/coverage/
+*.profraw
+tarpaulin-report.html
+
+# Temporary Python Files (if using Python tooling)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Node Modules (if any JS tooling)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Certificates and Keys (security)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials.json
+
+# Jupyter Notebooks Checkpoints
+.ipynb_checkpoints/
+
+# Kubernetes / Docker
+*.kubeconfig
+.kube/
+
+# Cargo Vendor (if using vendored dependencies)
+/vendor/
+
+# ONNX Runtime (downloaded at runtime)
+/onnxruntime/
+
+# Generated Protocol Buffers (keep proto definitions, ignore generated)
+# Note: We keep the generated files in this project, but you may want to ignore them
+# **/proto/*.rs (commented out - we check in generated proto files)
+
+# Local development databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Monorepo artifacts
+libasync_config.rlib
+
+# Markdown Documentation (session artifacts)
+# Ignore all .md files by default, then whitelist important ones below
+*.md
+
+# Old/backup configuration files
+Cargo.toml.backup
+Cargo.toml.monolithic
+Cargo.toml.workspace-failed
+*.backup
+*.old
+
+# Scripts generated during development
+*SCRIPT.sh
+
+# Test files generated during development
+test_*.rs
+!tests/
+!**/tests/
+
+# Test imports
+test_import
+
+# Example artifacts
+examples/
+
+# Exception: Keep Python examples and important architecture docs (whitelist)
+!arcxa-core/examples/
+!arcxa-core/examples/workflow_storage_profile.rs
+!graphica-python/examples/
+!CLAUDE.md
+!README.md
+!README_*.md
+!GETTING_STARTED.md
+!DOCKER_DEPLOYMENT.md
+!LOCAL_DEVELOPMENT_SETUP.md
+!WORKSPACE_ARCHITECTURE.md
+!API_GUIDE.md
+!DEPLOYMENT_GUIDE.md
+!CODEMAP_MCP_REFERENCE.md
+!SOS_*.md
