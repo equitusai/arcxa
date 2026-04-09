@@ -179,19 +179,22 @@ export function LineageGraph({
 
   // Transform graph data for D3 Sankey
   const sankeyData = useMemo<SankeyGraph<LineageNode, LineageEdge>>(() => {
-    // D3 Sankey expects nodes with numeric indices
-    const nodeMap = new Map<string, number>();
-    activeGraph.nodes.forEach((node, idx) => {
-      nodeMap.set(node.id, idx);
+    const nodeIds = new Set<string>();
+    activeGraph.nodes.forEach((node) => {
+      nodeIds.add(node.id);
     });
 
     const nodes: LineageNode[] = [...activeGraph.nodes];
-    const links: LineageEdge[] = activeGraph.edges.map((edge) => ({
-      ...edge,
-      source: nodeMap.get(edge.source)!,
-      target: nodeMap.get(edge.target)!,
-      value: edge.value || 1,
-    })) as any;
+    const links: LineageEdge[] = activeGraph.edges
+      .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+      .map((edge) => ({
+        ...edge,
+        // When nodeId() resolves links by string node IDs, source/target must
+        // remain those IDs rather than numeric indices.
+        source: edge.source,
+        target: edge.target,
+        value: edge.value || 1,
+      })) as any;
 
     return { nodes, links };
   }, [activeGraph]);
