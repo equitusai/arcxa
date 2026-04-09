@@ -1604,6 +1604,58 @@ async fn main() -> Result<()> {
         }
     };
 
+    if let Some(ref engine) = workflow_engine {
+        use graphica_coordinator::workflows::storage::{
+            restore_persisted_workflows, WorkflowDefinitionStore,
+        };
+        use graphica_core::orchestration::WorkflowPersistenceEvent;
+
+        let workflow_definition_db_path = std::env::var("WORKFLOW_DEFINITION_DB_PATH")
+            .unwrap_or_else(|_| format!("{}/workflow-definitions", args.rocksdb_path));
+
+        match WorkflowDefinitionStore::open(&workflow_definition_db_path) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                info!(
+                    "SUCCESS: Workflow definition store initialized at {}",
+                    workflow_definition_db_path
+                );
+
+                let persistence_store = store.clone();
+                engine.set_workflow_persistence_callback(move |event| match event {
+                    WorkflowPersistenceEvent::Upsert(metadata) => persistence_store.save(&metadata),
+                    WorkflowPersistenceEvent::Delete(workflow_id) => {
+                        persistence_store.delete(&workflow_id)
+                    }
+                });
+
+                match restore_persisted_workflows(engine.as_ref(), store.as_ref()).await {
+                    Ok(restored_count) => {
+                        if restored_count > 0 {
+                            info!(
+                                "SUCCESS: Restored {} persisted workflow definition(s)",
+                                restored_count
+                            );
+                        } else {
+                            info!("INFO: No persisted workflow definitions found to restore");
+                        }
+                    }
+                    Err(error) => {
+                        warn!("WARNING: Failed to restore persisted workflows: {}", error);
+                        warn!("   Previously registered workflows may need to be reloaded");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "WARNING: Failed to initialize workflow definition store: {}",
+                    error
+                );
+                warn!("   Workflow definitions will remain in-memory only");
+            }
+        }
+    }
+
     let schedule_store = Arc::new(graphica_coordinator::workflows::storage::ScheduleStore::new());
     let workflow_store = Arc::new(graphica_coordinator::workflows::storage::WorkflowStore::new());
     let workflow_metrics = {

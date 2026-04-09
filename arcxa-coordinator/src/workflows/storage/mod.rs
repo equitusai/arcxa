@@ -6,6 +6,7 @@ mod approval_store;
 mod batch_job_store;
 mod execution_store;
 mod schedule_store;
+mod workflow_definition_store;
 mod workflow_store;
 
 // Production-grade persistence components
@@ -27,6 +28,7 @@ pub use approval_store::ApprovalStore;
 pub use batch_job_store::BatchJobStore;
 pub use execution_store::ExecutionStore;
 pub use schedule_store::ScheduleStore;
+pub use workflow_definition_store::{restore_persisted_workflows, WorkflowDefinitionStore};
 pub use workflow_store::WorkflowStore;
 
 // Export production components

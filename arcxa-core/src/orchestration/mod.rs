@@ -49,7 +49,7 @@ pub mod workflow;
 // Re-export core types
 pub use workflow::{
     ExecutionContext, Workflow, WorkflowDefinition, WorkflowEngine, WorkflowExecutor,
-    WorkflowResult, WorkflowStep,
+    WorkflowMetadata, WorkflowPersistenceEvent, WorkflowResult, WorkflowStep,
 };
 
 pub use ml::{ModelCache, ModelInvoker, ModelMetadata, ModelRegistry, ModelRequest, ModelResponse};

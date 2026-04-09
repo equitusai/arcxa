@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -21,6 +21,8 @@ use crate::orchestration::rules::RuleExecutor;
 pub struct WorkflowEngine {
     /// Registered workflows by ID
     workflows: Arc<RwLock<HashMap<String, RegisteredWorkflow>>>,
+    /// Optional durable workflow metadata persistence callback
+    workflow_persistence_callback: Arc<StdRwLock<Option<Arc<WorkflowPersistenceCallback>>>>,
     /// ML model invoker for workflow execution
     model_invoker: Option<Arc<ModelInvoker>>,
     /// Rule executor for workflow execution
@@ -68,10 +70,24 @@ impl RegisteredWorkflow {
             last_executed_at: self.last_executed_at,
         }
     }
+
+    fn from_metadata(metadata: WorkflowMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            name: metadata.name,
+            description: metadata.description,
+            tags: metadata.tags,
+            definition: metadata.definition,
+            version: metadata.version,
+            created_at: metadata.created_at,
+            execution_count: metadata.execution_count,
+            last_executed_at: metadata.last_executed_at,
+        }
+    }
 }
 
 /// Public workflow metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowMetadata {
     pub id: String,
     pub name: String,
@@ -84,11 +100,21 @@ pub struct WorkflowMetadata {
     pub last_executed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Durable workflow metadata change emitted by the workflow engine.
+#[derive(Debug, Clone)]
+pub enum WorkflowPersistenceEvent {
+    Upsert(WorkflowMetadata),
+    Delete(String),
+}
+
+type WorkflowPersistenceCallback = dyn Fn(WorkflowPersistenceEvent) -> Result<()> + Send + Sync;
+
 impl WorkflowEngine {
     /// Create new workflow engine without execution capabilities
     pub fn new() -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
+            workflow_persistence_callback: Arc::new(StdRwLock::new(None)),
             model_invoker: None,
             rule_executor: None,
             rdf_persistence_callback: None,
@@ -106,6 +132,7 @@ impl WorkflowEngine {
     ) -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
+            workflow_persistence_callback: Arc::new(StdRwLock::new(None)),
             model_invoker: Some(model_invoker),
             rule_executor: Some(rule_executor),
             rdf_persistence_callback: None,
@@ -123,6 +150,40 @@ impl WorkflowEngine {
     {
         self.rdf_persistence_callback = Some(Arc::new(callback));
         self
+    }
+
+    /// Set durable workflow metadata persistence callback.
+    pub fn with_workflow_persistence<F>(self, callback: F) -> Self
+    where
+        F: Fn(WorkflowPersistenceEvent) -> Result<()> + Send + Sync + 'static,
+    {
+        self.set_workflow_persistence_callback(callback);
+        self
+    }
+
+    /// Set or replace the durable workflow metadata persistence callback.
+    pub fn set_workflow_persistence_callback<F>(&self, callback: F)
+    where
+        F: Fn(WorkflowPersistenceEvent) -> Result<()> + Send + Sync + 'static,
+    {
+        *self
+            .workflow_persistence_callback
+            .write()
+            .expect("workflow persistence callback lock poisoned") = Some(Arc::new(callback));
+    }
+
+    fn persist_workflow_metadata_change(&self, event: WorkflowPersistenceEvent) -> Result<()> {
+        let callback = self
+            .workflow_persistence_callback
+            .read()
+            .expect("workflow persistence callback lock poisoned")
+            .clone();
+
+        if let Some(callback) = callback {
+            callback(event)?;
+        }
+
+        Ok(())
     }
 
     /// Set lineage tracker for field-level and row-level provenance tracking
@@ -193,9 +254,42 @@ impl WorkflowEngine {
             last_executed_at: None,
         };
 
-        workflows.insert(workflow_id.clone(), workflow);
+        workflows.insert(workflow_id.clone(), workflow.clone());
+        drop(workflows);
+
+        if let Err(error) = self.persist_workflow_metadata_change(WorkflowPersistenceEvent::Upsert(
+            workflow.to_metadata(),
+        )) {
+            let mut workflows = self.workflows.write().await;
+            workflows.remove(&workflow_id);
+            return Err(error.context("Failed to persist workflow metadata"));
+        }
 
         Ok(workflow_id)
+    }
+
+    /// Restore a previously persisted workflow definition and metadata without
+    /// re-emitting persistence writes.
+    pub async fn hydrate_workflow(&self, metadata: WorkflowMetadata) -> Result<()> {
+        metadata
+            .definition
+            .validate()
+            .context("Invalid workflow definition")?;
+
+        DagExecutor::from_workflow(&metadata.definition)
+            .context("Failed to build DAG from persisted workflow")?;
+
+        let mut workflows = self.workflows.write().await;
+        if workflows.contains_key(&metadata.id) {
+            anyhow::bail!("Workflow already exists: {}", metadata.id);
+        }
+
+        workflows.insert(
+            metadata.id.clone(),
+            RegisteredWorkflow::from_metadata(metadata),
+        );
+
+        Ok(())
     }
 
     /// Get workflow by ID (returns full metadata)
@@ -244,9 +338,18 @@ impl WorkflowEngine {
     /// Delete workflow
     pub async fn delete_workflow(&self, workflow_id: &str) -> Result<()> {
         let mut workflows = self.workflows.write().await;
-        workflows
+        let deleted_workflow = workflows
             .remove(workflow_id)
             .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))?;
+        drop(workflows);
+
+        if let Err(error) = self.persist_workflow_metadata_change(WorkflowPersistenceEvent::Delete(
+            workflow_id.to_string(),
+        )) {
+            let mut workflows = self.workflows.write().await;
+            workflows.insert(workflow_id.to_string(), deleted_workflow);
+            return Err(error.context("Failed to delete persisted workflow metadata"));
+        }
         Ok(())
     }
 
@@ -270,6 +373,7 @@ impl WorkflowEngine {
         let workflow = workflows
             .get_mut(workflow_id)
             .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))?;
+        let original_workflow = workflow.clone();
 
         // Increment version
         let version_parts: Vec<&str> = workflow.version.split('.').collect();
@@ -281,8 +385,18 @@ impl WorkflowEngine {
         workflow.tags = tags;
         workflow.definition = definition;
         workflow.version = new_version;
+        let updated_metadata = workflow.to_metadata();
+        drop(workflows);
 
-        Ok(workflow.to_metadata())
+        if let Err(error) = self.persist_workflow_metadata_change(WorkflowPersistenceEvent::Upsert(
+            updated_metadata.clone(),
+        )) {
+            let mut workflows = self.workflows.write().await;
+            workflows.insert(workflow_id.to_string(), original_workflow);
+            return Err(error.context("Failed to persist updated workflow metadata"));
+        }
+
+        Ok(updated_metadata)
     }
 
     /// Record a workflow execution (increment count and update timestamp)
@@ -292,8 +406,23 @@ impl WorkflowEngine {
             .get_mut(workflow_id)
             .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", workflow_id))?;
 
+        let previous_execution_count = workflow.execution_count;
+        let previous_last_executed_at = workflow.last_executed_at;
         workflow.execution_count += 1;
         workflow.last_executed_at = Some(chrono::Utc::now());
+        let updated_metadata = workflow.to_metadata();
+        drop(workflows);
+
+        if let Err(error) = self
+            .persist_workflow_metadata_change(WorkflowPersistenceEvent::Upsert(updated_metadata))
+        {
+            let mut workflows = self.workflows.write().await;
+            if let Some(workflow) = workflows.get_mut(workflow_id) {
+                workflow.execution_count = previous_execution_count;
+                workflow.last_executed_at = previous_last_executed_at;
+            }
+            return Err(error.context("Failed to persist workflow execution metadata"));
+        }
 
         Ok(())
     }
@@ -363,8 +492,16 @@ impl WorkflowEngine {
             .await
             .context("Workflow execution failed")?;
 
-        // Record execution
-        self.record_execution(workflow_id).await?;
+        // Record execution metadata. The workflow has already executed at this point,
+        // so a metadata persistence miss should not flip a successful run into a
+        // failed one.
+        if let Err(error) = self.record_execution(workflow_id).await {
+            tracing::warn!(
+                workflow_id = workflow_id,
+                "Failed to persist workflow execution metadata: {}",
+                error
+            );
+        }
 
         // Persist to RDF if callback is set
         if let Some(ref callback) = self.rdf_persistence_callback {
@@ -494,8 +631,15 @@ impl WorkflowEngine {
             results.push(result);
         }
 
-        // Record execution once (not per batch)
-        self.record_execution(workflow_id).await?;
+        // Record execution once (not per batch). See execute_workflow() for why
+        // persistence failures are logged instead of bubbling after work completes.
+        if let Err(error) = self.record_execution(workflow_id).await {
+            tracing::warn!(
+                workflow_id = workflow_id,
+                "Failed to persist workflow execution metadata: {}",
+                error
+            );
+        }
 
         Ok(results)
     }
@@ -824,6 +968,50 @@ mod tests {
         assert_eq!(updated.tags, vec!["production".to_string()]);
         assert_eq!(updated_metadata.name, updated.name);
         assert_eq!(updated_metadata.created_at, updated.created_at);
+    }
+
+    #[tokio::test]
+    async fn test_hydrate_workflow_restores_metadata() {
+        let engine = WorkflowEngine::new();
+        let metadata = WorkflowMetadata {
+            id: format!("wf_{}", Uuid::new_v4()),
+            name: "restored_workflow".to_string(),
+            description: Some("Recovered after restart".to_string()),
+            tags: vec!["demo".to_string(), "restored".to_string()],
+            definition: create_test_definition(),
+            version: "3.0.0".to_string(),
+            created_at: chrono::Utc::now(),
+            execution_count: 7,
+            last_executed_at: Some(chrono::Utc::now()),
+        };
+
+        engine.hydrate_workflow(metadata.clone()).await.unwrap();
+
+        let restored = engine.get_workflow(&metadata.id).await.unwrap().unwrap();
+        assert_eq!(restored.name, metadata.name);
+        assert_eq!(restored.version, metadata.version);
+        assert_eq!(restored.execution_count, metadata.execution_count);
+        assert_eq!(restored.tags, metadata.tags);
+    }
+
+    #[tokio::test]
+    async fn test_register_workflow_rolls_back_when_persistence_fails() {
+        let engine = WorkflowEngine::new()
+            .with_workflow_persistence(|_| anyhow::bail!("simulated persistence failure"));
+        let workflow_id = format!("wf_{}", Uuid::new_v4());
+
+        let result = engine
+            .register_workflow(
+                workflow_id.clone(),
+                "persistent_workflow".to_string(),
+                create_test_definition(),
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(engine.get_workflow(&workflow_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

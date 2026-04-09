@@ -110,7 +110,7 @@ pub use traits::{
 pub use cancellation::CancellationToken;
 pub use config::{ExecutionTimeout, ExecutionTimeoutBuilder, RetryPolicy};
 pub use dag::DagExecutor;
-pub use engine::{WorkflowEngine, WorkflowMetadata};
+pub use engine::{WorkflowEngine, WorkflowMetadata, WorkflowPersistenceEvent};
 pub use error::WorkflowErrorCategory;
 pub use execution_context_v2::{ExecutionContextV2, ResourceLimits as ResourceLimitsV2};
 pub use executor::{
