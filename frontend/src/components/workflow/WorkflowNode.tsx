@@ -1,10 +1,10 @@
 /**
  * Professional Enterprise Workflow Node Component
  * Beautiful design with refined shadows, gradients, and polish
- * Phase 2.3: Dark mode support with dynamic theming
+ * Phase 2.3: Theme-safe styling for light and dark modes
  */
 
-import React, { useMemo } from 'react';
+import React from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
 import { AlertTriangle, CheckCircle, Loader2, XCircle, Copy, Trash2, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -53,12 +53,6 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
   // Map execution status for node bodies ('executing' -> 'running')
   const nodeBodyStatus = data.executionStatus === 'executing' ? 'running' : data.executionStatus;
 
-  // Phase 2.3: Dark mode detection
-  const isDark = useMemo(
-    () => document.documentElement.classList.contains('dark'),
-    []
-  );
-
   // Node action handlers
   const handleConfigure = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -81,56 +75,44 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
     }
   };
 
-  // State-specific styling with dark mode support
+  // State-specific styling with theme-safe tokens
   const getStateStyles = () => {
+    const baseHeaderBg = `linear-gradient(135deg, ${stepConfig.color.surface} 0%, ${stepConfig.color.subtle} 100%)`;
     const base = {
-      borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.12)',
-      headerBg: stepConfig.color.subtle,
-      boxShadow: isDark
-        ? '0 1px 2px rgba(0,0,0,0.25)'
-        : '0 1px 2px rgba(0,0,0,0.06)',
+      borderColor: 'hsl(var(--border))',
+      headerBg: baseHeaderBg,
+      boxShadow: '0 10px 24px hsl(var(--foreground) / 0.08), 0 2px 6px hsl(var(--foreground) / 0.04)',
     };
 
     if (selected) {
       return {
         ...base,
-        borderColor: '#0078D4',
-        boxShadow: isDark
-          ? '0 0 0 1px rgba(255,255,255,0.1), 0 0 0 3px #0078D4, 0 2px 8px rgba(0,120,212,0.30)'
-          : '0 0 0 1px #FFFFFF, 0 0 0 3px #0078D4, 0 2px 8px rgba(0,120,212,0.20)',
+        borderColor: 'hsl(var(--accent))',
+        boxShadow: '0 0 0 1px hsl(var(--background)), 0 0 0 3px hsl(var(--accent) / 0.34), 0 18px 36px hsl(var(--accent) / 0.18)',
       };
     }
 
     switch (data.executionStatus) {
       case 'executing':
         return {
-          borderColor: '#0078D4',
-          headerBg: isDark
-            ? 'linear-gradient(135deg, rgba(0,120,212,0.2) 0%, rgba(0,120,212,0.3) 100%)'
-            : 'linear-gradient(135deg, #E3F2FD 0%, #BBDEFB 100%)',
-          boxShadow: isDark
-            ? '0 0 12px rgba(0,120,212,0.4), 0 2px 6px rgba(0,0,0,0.3)'
-            : '0 0 12px rgba(0,120,212,0.3), 0 2px 6px rgba(0,0,0,0.1)',
+          ...base,
+          borderColor: 'hsl(var(--accent))',
+          headerBg: 'linear-gradient(135deg, hsl(var(--accent) / 0.12) 0%, hsl(var(--accent) / 0.22) 100%)',
+          boxShadow: '0 14px 30px hsl(var(--accent) / 0.16), 0 4px 10px hsl(var(--foreground) / 0.06)',
         };
       case 'success':
         return {
-          borderColor: '#107C10',
-          headerBg: isDark
-            ? 'linear-gradient(135deg, rgba(16,124,16,0.2) 0%, rgba(16,124,16,0.3) 100%)'
-            : 'linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%)',
-          boxShadow: isDark
-            ? '0 1px 4px rgba(16,124,16,0.25), 0 1px 2px rgba(0,0,0,0.25)'
-            : '0 1px 4px rgba(16,124,16,0.15), 0 1px 2px rgba(0,0,0,0.06)',
+          ...base,
+          borderColor: 'hsl(var(--success))',
+          headerBg: 'linear-gradient(135deg, hsl(var(--success) / 0.12) 0%, hsl(var(--success) / 0.22) 100%)',
+          boxShadow: '0 14px 30px hsl(var(--success) / 0.14), 0 4px 10px hsl(var(--foreground) / 0.06)',
         };
       case 'error':
         return {
-          borderColor: '#D13438',
-          headerBg: isDark
-            ? 'linear-gradient(135deg, rgba(209,52,56,0.2) 0%, rgba(209,52,56,0.3) 100%)'
-            : 'linear-gradient(135deg, #FFEBEE 0%, #FFCDD2 100%)',
-          boxShadow: isDark
-            ? '0 1px 4px rgba(209,52,56,0.25), 0 1px 2px rgba(0,0,0,0.25)'
-            : '0 1px 4px rgba(209,52,56,0.15), 0 1px 2px rgba(0,0,0,0.06)',
+          ...base,
+          borderColor: 'hsl(var(--error))',
+          headerBg: 'linear-gradient(135deg, hsl(var(--error) / 0.12) 0%, hsl(var(--error) / 0.22) 100%)',
+          boxShadow: '0 14px 30px hsl(var(--error) / 0.16), 0 4px 10px hsl(var(--foreground) / 0.06)',
         };
       default:
         return base;
@@ -206,7 +188,7 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
           className="flex items-center gap-2 px-2.5 py-2 border-b"
           style={{
             background: stateStyles.headerBg,
-            borderColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+            borderColor: 'hsl(var(--border-subtle))',
           }}
         >
           <StepIcon
@@ -368,7 +350,14 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
 
             {/* Validation Error */}
             {data.validationError && (
-              <div className="mt-2 flex items-center gap-1.5 px-2 py-1 bg-red-50 dark:bg-red-950/30 border border-red-500 dark:border-red-800 rounded text-[11px] font-medium text-red-600 dark:text-red-400">
+              <div
+                className="mt-2 flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium"
+                style={{
+                  backgroundColor: 'hsl(var(--error) / 0.08)',
+                  border: '1px solid hsl(var(--error) / 0.22)',
+                  color: 'hsl(var(--error))',
+                }}
+              >
                 <AlertTriangle className="h-3 w-3" />
                 Configuration required
               </div>
@@ -380,13 +369,13 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
         {data.executionStatus && data.executionStatus !== 'idle' && (
           <div className="absolute -top-2 -right-2 bg-card rounded-full p-1.5 shadow-lg border-2 border-card">
             {data.executionStatus === 'executing' && (
-              <Loader2 className="h-4 w-4 animate-spin text-blue-600 dark:text-blue-400" strokeWidth={2.5} />
+              <Loader2 className="h-4 w-4 animate-spin text-accent" strokeWidth={2.5} />
             )}
             {data.executionStatus === 'success' && (
-              <CheckCircle className="h-4 w-4 text-green-600 dark:text-green-500" strokeWidth={2.5} />
+              <CheckCircle className="h-4 w-4 text-success" strokeWidth={2.5} />
             )}
             {data.executionStatus === 'error' && (
-              <XCircle className="h-4 w-4 text-red-600 dark:text-red-500" strokeWidth={2.5} />
+              <XCircle className="h-4 w-4 text-error" strokeWidth={2.5} />
             )}
           </div>
         )}
@@ -398,13 +387,8 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
         <Handle
           type="target"
           position={Position.Left}
-          className={cn(
-            '!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!w-3.5 hover:!h-3.5',
-            isDark
-              ? '!border-slate-700 !bg-slate-600 hover:!bg-blue-500'
-              : '!border-white !bg-slate-400 hover:!bg-blue-600'
-          )}
-          style={{ left: -5 }}
+          className="!w-2.5 !h-2.5 !border-2 !shadow-sm !bg-background-tertiary transition-all hover:!scale-110"
+          style={{ left: -5, borderColor: 'hsl(var(--background))' }}
         />
       )}
 
@@ -413,13 +397,8 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
         <Handle
           type="source"
           position={Position.Right}
-          className={cn(
-            '!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!w-3.5 hover:!h-3.5',
-            isDark
-              ? '!border-slate-700 !bg-slate-600 hover:!bg-blue-500'
-              : '!border-white !bg-slate-400 hover:!bg-blue-600'
-          )}
-          style={{ right: -5 }}
+          className="!w-2.5 !h-2.5 !border-2 !shadow-sm !bg-background-tertiary transition-all hover:!scale-110"
+          style={{ right: -5, borderColor: 'hsl(var(--background))' }}
         />
       )}
 
@@ -438,12 +417,12 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7 hover:bg-blue-50 dark:hover:bg-blue-950/30"
+            className="h-7 w-7 hover:bg-background-secondary"
             onClick={handleConfigure}
             title="Configure (Double-click)"
             aria-label="Configure node"
           >
-            <Settings className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+            <Settings className="h-3.5 w-3.5" style={{ color: stepConfig.color.text }} />
           </Button>
           <Button
             variant="ghost"
@@ -458,12 +437,12 @@ export function WorkflowNode({ data, selected, id }: NodeProps<WorkflowNodeData>
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7 hover:bg-red-50 dark:hover:bg-red-950/30"
+            className="h-7 w-7 hover:bg-background-secondary"
             onClick={handleDelete}
             title="Delete (Del)"
             aria-label="Delete node"
           >
-            <Trash2 className="h-3.5 w-3.5 text-red-600 dark:text-red-500" />
+            <Trash2 className="h-3.5 w-3.5 text-error" />
           </Button>
         </div>
       </div>

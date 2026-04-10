@@ -1,15 +1,15 @@
 /**
  * Professional Enterprise Conditional Router Node Component
  * Diamond-shaped node for if-then-else branching logic with beautiful design
- * Phase 2.3: Dark mode support with SVG gradients
+ * Phase 2.3: Theme-safe styling for light and dark modes
  */
 
-import React, { useMemo } from 'react';
+import React from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
-import { Badge } from '@/components/ui/badge';
 import { GitBranch, CheckCircle, Loader2, XCircle, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { ConditionalRouterConfig } from '@/api/types';
+import { getWorkflowCategoryColor } from '@/lib/workflow-colors';
 
 export interface ConditionalRouterNodeData {
   label: string;
@@ -20,64 +20,40 @@ export interface ConditionalRouterNodeData {
   validationError?: string;
 }
 
-export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalRouterNodeData>) {
-  // Phase 2.3: Dark mode detection
-  const isDark = useMemo(
-    () => document.documentElement.classList.contains('dark'),
-    []
-  );
+export function ConditionalRouterNode({ data, selected, id }: NodeProps<ConditionalRouterNodeData>) {
+  const routingColor = getWorkflowCategoryColor('routing');
+  const gradientPrefix = `conditional-router-${String(id).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
 
   const getStateColor = () => {
-    if (data.executionStatus === 'executing') return '#0078D4';
-    if (data.executionStatus === 'success') return '#107C10';
-    if (data.executionStatus === 'error') return '#D13438';
-    if (data.validationError) return '#D13438';
-    if (selected) return '#0078D4';
-    return '#8764B8'; // Purple for conditional
+    if (data.executionStatus === 'executing') return 'hsl(var(--accent))';
+    if (data.executionStatus === 'success') return 'hsl(var(--success))';
+    if (data.executionStatus === 'error') return 'hsl(var(--error))';
+    if (data.validationError) return 'hsl(var(--error))';
+    if (selected) return 'hsl(var(--accent))';
+    return routingColor.border;
   };
 
   const getFillGradient = () => {
-    const prefix = isDark ? 'dark-' : '';
-
-    if (data.executionStatus === 'executing') {
-      return `url(#${prefix}gradient-executing)`;
-    }
-    if (data.executionStatus === 'success') {
-      return `url(#${prefix}gradient-success)`;
-    }
-    if (data.executionStatus === 'error') {
-      return `url(#${prefix}gradient-error)`;
-    }
-    if (data.validationError) {
-      return `url(#${prefix}gradient-error)`;
-    }
-    return `url(#${prefix}gradient-idle)`;
+    if (data.executionStatus === 'executing') return `url(#${gradientPrefix}-executing)`;
+    if (data.executionStatus === 'success') return `url(#${gradientPrefix}-success)`;
+    if (data.executionStatus === 'error' || data.validationError) return `url(#${gradientPrefix}-error)`;
+    return `url(#${gradientPrefix}-idle)`;
   };
 
   const getShadowFilter = () => {
     if (selected) {
-      return isDark
-        ? 'drop-shadow(0 0 0 1px rgba(255,255,255,0.1)) drop-shadow(0 0 0 3px #0078D4) drop-shadow(0 2px 8px rgba(0,120,212,0.30))'
-        : 'drop-shadow(0 0 0 1px white) drop-shadow(0 0 0 3px #0078D4) drop-shadow(0 2px 8px rgba(0,120,212,0.20))';
+      return 'drop-shadow(0 0 14px hsl(var(--accent) / 0.22)) drop-shadow(0 12px 24px hsl(var(--accent) / 0.12))';
     }
     if (data.executionStatus === 'executing') {
-      return isDark
-        ? 'drop-shadow(0 0 12px rgba(0,120,212,0.4)) drop-shadow(0 2px 6px rgba(0,0,0,0.3))'
-        : 'drop-shadow(0 0 12px rgba(0,120,212,0.3)) drop-shadow(0 2px 6px rgba(0,0,0,0.1))';
+      return 'drop-shadow(0 0 14px hsl(var(--accent) / 0.18)) drop-shadow(0 10px 20px hsl(var(--foreground) / 0.08))';
     }
     if (data.executionStatus === 'success') {
-      return isDark
-        ? 'drop-shadow(0 1px 4px rgba(16,124,16,0.25)) drop-shadow(0 1px 2px rgba(0,0,0,0.25))'
-        : 'drop-shadow(0 1px 4px rgba(16,124,16,0.15)) drop-shadow(0 1px 2px rgba(0,0,0,0.06))';
+      return 'drop-shadow(0 0 12px hsl(var(--success) / 0.16)) drop-shadow(0 10px 20px hsl(var(--foreground) / 0.08))';
     }
     if (data.executionStatus === 'error') {
-      return isDark
-        ? 'drop-shadow(0 1px 4px rgba(209,52,56,0.25)) drop-shadow(0 1px 2px rgba(0,0,0,0.25))'
-        : 'drop-shadow(0 1px 4px rgba(209,52,56,0.15)) drop-shadow(0 1px 2px rgba(0,0,0,0.06))';
+      return 'drop-shadow(0 0 12px hsl(var(--error) / 0.18)) drop-shadow(0 10px 20px hsl(var(--foreground) / 0.08))';
     }
-    return isDark
-      ? 'drop-shadow(0 1px 2px rgba(0,0,0,0.25))'
-      : 'drop-shadow(0 1px 2px rgba(0,0,0,0.06))';
+    return 'drop-shadow(0 8px 18px hsl(var(--foreground) / 0.08))';
   };
 
   const conditionText = data.config?.condition || 'No condition set';
@@ -112,41 +88,22 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
             filter: getShadowFilter(),
           }}
         >
-          {/* Gradient Definitions - Light Mode */}
           <defs>
-            <linearGradient id="gradient-idle" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#F3E8FF" />
-              <stop offset="100%" stopColor="#E9D5FF" />
+            <linearGradient id={`${gradientPrefix}-idle`} x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor={routingColor.surface} />
+              <stop offset="100%" stopColor={routingColor.subtle} />
             </linearGradient>
-            <linearGradient id="gradient-executing" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#E3F2FD" />
-              <stop offset="100%" stopColor="#BBDEFB" />
+            <linearGradient id={`${gradientPrefix}-executing`} x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="hsl(var(--accent))" stopOpacity="0.12" />
+              <stop offset="100%" stopColor="hsl(var(--accent))" stopOpacity="0.22" />
             </linearGradient>
-            <linearGradient id="gradient-success" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#E8F5E9" />
-              <stop offset="100%" stopColor="#C8E6C9" />
+            <linearGradient id={`${gradientPrefix}-success`} x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="hsl(var(--success))" stopOpacity="0.12" />
+              <stop offset="100%" stopColor="hsl(var(--success))" stopOpacity="0.22" />
             </linearGradient>
-            <linearGradient id="gradient-error" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#FFEBEE" />
-              <stop offset="100%" stopColor="#FFCDD2" />
-            </linearGradient>
-
-            {/* Dark Mode Gradients */}
-            <linearGradient id="dark-gradient-idle" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="rgba(135,100,184,0.2)" />
-              <stop offset="100%" stopColor="rgba(135,100,184,0.3)" />
-            </linearGradient>
-            <linearGradient id="dark-gradient-executing" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="rgba(0,120,212,0.2)" />
-              <stop offset="100%" stopColor="rgba(0,120,212,0.3)" />
-            </linearGradient>
-            <linearGradient id="dark-gradient-success" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="rgba(16,124,16,0.2)" />
-              <stop offset="100%" stopColor="rgba(16,124,16,0.3)" />
-            </linearGradient>
-            <linearGradient id="dark-gradient-error" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="rgba(209,52,56,0.2)" />
-              <stop offset="100%" stopColor="rgba(209,52,56,0.3)" />
+            <linearGradient id={`${gradientPrefix}-error`} x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="hsl(var(--error))" stopOpacity="0.12" />
+              <stop offset="100%" stopColor="hsl(var(--error))" stopOpacity="0.22" />
             </linearGradient>
           </defs>
 
@@ -162,7 +119,8 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
           <path
             d="M 80 10 L 146 50 L 80 90 L 14 50 Z"
             fill="none"
-            stroke={isDark ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.6)"}
+            stroke="hsl(var(--background))"
+            strokeOpacity="0.72"
             strokeWidth="1"
           />
 
@@ -172,8 +130,8 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
               cx="150"
               cy="50"
               r="5"
-              fill="#107C10"
-              stroke={isDark ? "rgba(255,255,255,0.2)" : "white"}
+              fill="hsl(var(--success))"
+              stroke="hsl(var(--background))"
               strokeWidth="2"
             />
           )}
@@ -182,8 +140,8 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
               cx="10"
               cy="50"
               r="5"
-              fill="#D13438"
-              stroke={isDark ? "rgba(255,255,255,0.2)" : "white"}
+              fill="hsl(var(--error))"
+              stroke="hsl(var(--background))"
               strokeWidth="2"
             />
           )}
@@ -192,10 +150,10 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
         {/* Content Overlay */}
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none px-6">
           {/* Icon */}
-          <GitBranch className="h-5 w-5 text-purple-600 dark:text-purple-400 mb-1.5" strokeWidth={2.5} />
+          <GitBranch className="h-5 w-5 mb-1.5" style={{ color: routingColor.text }} strokeWidth={2.5} />
 
           {/* IF Label */}
-          <div className="text-[10px] font-bold text-purple-600 dark:text-purple-400 uppercase tracking-wider mb-1">
+          <div className="text-[10px] font-bold uppercase tracking-wider mb-1" style={{ color: routingColor.text }}>
             IF
           </div>
 
@@ -227,7 +185,14 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
 
           {/* Validation Error Badge */}
           {data.validationError && (
-            <div className="mt-1.5 flex items-center gap-0.5 px-1.5 py-0.5 bg-card border border-red-600 dark:border-red-500 rounded text-[9px] font-medium text-red-600 dark:text-red-500 pointer-events-auto">
+            <div
+              className="mt-1.5 flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-medium pointer-events-auto"
+              style={{
+                backgroundColor: 'hsl(var(--error) / 0.08)',
+                border: '1px solid hsl(var(--error) / 0.25)',
+                color: 'hsl(var(--error))',
+              }}
+            >
               <AlertTriangle className="h-2.5 w-2.5" />
               Invalid
             </div>
@@ -238,13 +203,13 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
         {data.executionStatus && data.executionStatus !== 'idle' && (
           <div className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-card rounded-full p-1 shadow-md border-2 border-card">
             {data.executionStatus === 'executing' && (
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600 dark:text-blue-400" strokeWidth={2.5} />
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" strokeWidth={2.5} />
             )}
             {data.executionStatus === 'success' && (
-              <CheckCircle className="h-3.5 w-3.5 text-green-600 dark:text-green-500" strokeWidth={2.5} />
+              <CheckCircle className="h-3.5 w-3.5 text-success" strokeWidth={2.5} />
             )}
             {data.executionStatus === 'error' && (
-              <XCircle className="h-3.5 w-3.5 text-red-600 dark:text-red-500" strokeWidth={2.5} />
+              <XCircle className="h-3.5 w-3.5 text-error" strokeWidth={2.5} />
             )}
           </div>
         )}
@@ -255,13 +220,8 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
       <Handle
         type="target"
         position={Position.Top}
-        className={cn(
-          '!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!w-3.5 hover:!h-3.5',
-          isDark
-            ? '!border-slate-700 !bg-slate-600 hover:!bg-purple-500'
-            : '!border-white !bg-slate-400 hover:!bg-purple-600'
-        )}
-        style={{ top: 3 }}
+        className="!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!scale-110"
+        style={{ top: 3, backgroundColor: routingColor.base, borderColor: 'hsl(var(--background))' }}
       />
 
       {/* Right Handle (Source - TRUE) */}
@@ -269,13 +229,8 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
         type="source"
         position={Position.Right}
         id="true"
-        className={cn(
-          '!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!w-3.5 hover:!h-3.5',
-          isDark
-            ? '!border-slate-700 !bg-slate-600 hover:!bg-green-500'
-            : '!border-white !bg-slate-400 hover:!bg-green-600'
-        )}
-        style={{ right: 6 }}
+        className="!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!scale-110"
+        style={{ right: 6, backgroundColor: 'hsl(var(--success))', borderColor: 'hsl(var(--background))' }}
       />
 
       {/* Left Handle (Source - FALSE) */}
@@ -283,13 +238,8 @@ export function ConditionalRouterNode({ data, selected }: NodeProps<ConditionalR
         type="source"
         position={Position.Left}
         id="false"
-        className={cn(
-          '!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!w-3.5 hover:!h-3.5',
-          isDark
-            ? '!border-slate-700 !bg-slate-600 hover:!bg-red-500'
-            : '!border-white !bg-slate-400 hover:!bg-red-600'
-        )}
-        style={{ left: 6 }}
+        className="!w-2.5 !h-2.5 !border-2 !shadow-sm transition-all hover:!scale-110"
+        style={{ left: 6, backgroundColor: 'hsl(var(--error))', borderColor: 'hsl(var(--background))' }}
       />
 
       {/* Branch Labels (on hover) */}

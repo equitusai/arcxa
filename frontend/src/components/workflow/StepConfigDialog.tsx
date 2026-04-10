@@ -38,6 +38,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getStepTypeConfig } from '@/lib/workflow-step-config';
+import { getETLStepTypeConfig, isETLStepType } from '@/lib/workflow-etl-config';
 import { useTestWorkflowStep } from '@/hooks/useWorkflows';
 import { toast } from 'sonner';
 import type { StepType } from '@/api/types';
@@ -189,7 +190,9 @@ export function StepConfigDialog({
 
   if (!selectedNode) return null;
 
-  const stepConfig = getStepTypeConfig(selectedNode.data.step_type as StepType);
+  const stepConfig = isETLStepType(selectedNode.data.step_type as StepType)
+    ? getETLStepTypeConfig(selectedNode.data.step_type as any)
+    : getStepTypeConfig(selectedNode.data.step_type as StepType);
   const StepIcon = stepConfig.icon;
 
   const generateSampleInput = () => {
@@ -426,28 +429,13 @@ export function StepConfigDialog({
             <div className="flex-1">
               <div className="flex items-center gap-3 mb-2">
                 <div
-                  className={cn(
-                    'p-2 rounded-lg',
-                    selectedNode.data.step_type === 'field_transformer' ||
-                      selectedNode.data.step_type === 'semantic_mapper' ||
-                      selectedNode.data.step_type === 'data_joiner' ||
-                      selectedNode.data.step_type === 'aggregator'
-                      ? 'bg-green-100 dark:bg-green-950/30'
-                      : selectedNode.data.step_type === 'csv_source' ||
-                        selectedNode.data.step_type === 'db_extract' ||
-                        selectedNode.data.step_type === 'multi_source_input'
-                      ? 'bg-blue-100 dark:bg-blue-950/30'
-                      : selectedNode.data.step_type === 'data_validator' ||
-                        selectedNode.data.step_type === 'deduplicator'
-                      ? 'bg-red-100 dark:bg-red-950/30'
-                      : selectedNode.data.step_type === 'rdf_loader' ||
-                        selectedNode.data.step_type === 'db_loader' ||
-                        selectedNode.data.step_type === 'csv_exporter'
-                      ? 'bg-purple-100 dark:bg-purple-950/30'
-                      : 'bg-neutral-100 dark:bg-neutral-800'
-                  )}
+                  className="p-2 rounded-lg border"
+                  style={{
+                    background: `linear-gradient(135deg, ${stepConfig.color.surface} 0%, ${stepConfig.color.subtle} 100%)`,
+                    borderColor: stepConfig.color.border,
+                  }}
                 >
-                  <StepIcon className="h-5 w-5" />
+                  <StepIcon className="h-5 w-5" style={{ color: stepConfig.color.text }} />
                 </div>
                 <div>
                   <DialogTitle className="text-xl font-semibold">{selectedNode.data.label}</DialogTitle>
@@ -599,8 +587,8 @@ export function StepConfigDialog({
                     className={cn(
                       'p-4 rounded-md mt-2 border-2',
                       testResult.success
-                        ? 'bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800'
-                        : 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800'
+                        ? 'bg-green-50 dark:bg-green-950/15 border-green-200 dark:border-green-800'
+                        : 'bg-red-50 dark:bg-red-950/15 border-red-200 dark:border-red-800'
                     )}
                   >
                     <div className="flex items-center gap-2 mb-2">
@@ -613,7 +601,7 @@ export function StepConfigDialog({
                     </div>
 
                     {testResult.error && (
-                      <div className="mt-2 text-sm text-red-700">
+                      <div className="mt-2 text-sm text-error">
                         <strong>Error:</strong> {testResult.error}
                       </div>
                     )}
@@ -621,7 +609,7 @@ export function StepConfigDialog({
                     {testResult.output && (
                       <div className="mt-2">
                         <div className="text-xs font-semibold mb-1">Output:</div>
-                        <pre className="text-xs bg-white p-2 rounded border overflow-auto max-h-40">
+                        <pre className="text-xs bg-card p-2 rounded border overflow-auto max-h-40">
                           {JSON.stringify(testResult.output, null, 2)}
                         </pre>
                       </div>

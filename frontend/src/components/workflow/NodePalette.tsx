@@ -49,7 +49,10 @@ function CompactStepCard({ step, onDragStart }: CompactStepCardProps) {
           'hover:border-border hover:shadow-sm hover:translate-x-0.5',
           'active:opacity-60 active:scale-[0.98]'
         )}
-        style={{ backgroundColor: step.color.subtle }}
+        style={{
+          background: `linear-gradient(135deg, ${step.color.surface} 0%, ${step.color.subtle} 100%)`,
+          borderColor: step.color.border,
+        }}
       >
         {/* Icon with color */}
         <StepIcon
@@ -59,7 +62,10 @@ function CompactStepCard({ step, onDragStart }: CompactStepCardProps) {
         />
 
         {/* Label (truncate) */}
-        <span className="text-sm font-medium text-foreground truncate flex-1">
+        <span
+          className="text-sm font-medium truncate flex-1"
+          style={{ color: step.color.text }}
+        >
           {step.label}
         </span>
 
@@ -67,7 +73,7 @@ function CompactStepCard({ step, onDragStart }: CompactStepCardProps) {
         <HoverCard openDelay={200}>
           <HoverCardTrigger asChild>
             <button
-              className="flex-shrink-0 p-0.5 hover:bg-black/5 rounded transition-colors"
+              className="flex-shrink-0 p-0.5 hover:bg-background-secondary rounded transition-colors"
               onClick={(e) => e.stopPropagation()}
               tabIndex={-1}
             >

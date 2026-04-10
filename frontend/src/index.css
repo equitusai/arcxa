@@ -60,6 +60,79 @@
     --entity: 208 98% 42%;                /* Oracle Blue */
     --model: 270 50% 40%;                 /* Purple (kept) */
 
+    /* Workflow palette - tuned for lighter surfaces and better step readability */
+    --workflow-extract-base: 208 88% 42%;
+    --workflow-extract-surface: 204 100% 97%;
+    --workflow-extract-subtle: 206 90% 92%;
+    --workflow-extract-border: 206 62% 78%;
+    --workflow-extract-text: 210 95% 28%;
+    --workflow-extract-contrast: 0 0% 100%;
+
+    --workflow-transform-base: 158 68% 34%;
+    --workflow-transform-surface: 154 52% 96%;
+    --workflow-transform-subtle: 156 52% 91%;
+    --workflow-transform-border: 158 34% 76%;
+    --workflow-transform-text: 160 84% 22%;
+    --workflow-transform-contrast: 0 0% 100%;
+
+    --workflow-quality-base: 6 69% 49%;
+    --workflow-quality-surface: 8 100% 97%;
+    --workflow-quality-subtle: 8 86% 92%;
+    --workflow-quality-border: 6 65% 79%;
+    --workflow-quality-text: 6 76% 34%;
+    --workflow-quality-contrast: 0 0% 100%;
+
+    --workflow-load-base: 263 42% 47%;
+    --workflow-load-surface: 270 52% 97%;
+    --workflow-load-subtle: 268 52% 92%;
+    --workflow-load-border: 266 34% 79%;
+    --workflow-load-text: 266 58% 34%;
+    --workflow-load-contrast: 0 0% 100%;
+
+    --workflow-orchestration-base: 31 88% 44%;
+    --workflow-orchestration-surface: 40 100% 96%;
+    --workflow-orchestration-subtle: 36 100% 90%;
+    --workflow-orchestration-border: 34 80% 77%;
+    --workflow-orchestration-text: 28 88% 32%;
+    --workflow-orchestration-contrast: 0 0% 100%;
+
+    --workflow-prediction-base: 208 88% 42%;
+    --workflow-prediction-surface: 206 100% 97%;
+    --workflow-prediction-subtle: 206 92% 92%;
+    --workflow-prediction-border: 206 62% 78%;
+    --workflow-prediction-text: 210 95% 28%;
+    --workflow-prediction-contrast: 0 0% 100%;
+
+    --workflow-logic-base: 43 92% 42%;
+    --workflow-logic-surface: 46 100% 96%;
+    --workflow-logic-subtle: 46 100% 90%;
+    --workflow-logic-border: 43 82% 76%;
+    --workflow-logic-text: 35 92% 28%;
+    --workflow-logic-contrast: 0 0% 100%;
+
+    --workflow-aggregation-base: 191 79% 39%;
+    --workflow-aggregation-surface: 190 84% 96%;
+    --workflow-aggregation-subtle: 190 76% 90%;
+    --workflow-aggregation-border: 191 56% 76%;
+    --workflow-aggregation-text: 192 92% 27%;
+    --workflow-aggregation-contrast: 0 0% 100%;
+
+    --workflow-routing-base: 262 50% 52%;
+    --workflow-routing-surface: 262 76% 97%;
+    --workflow-routing-subtle: 264 68% 93%;
+    --workflow-routing-border: 264 50% 79%;
+    --workflow-routing-text: 264 58% 36%;
+    --workflow-routing-contrast: 0 0% 100%;
+
+    --workflow-transformation-base: 152 66% 35%;
+    --workflow-transformation-surface: 152 56% 96%;
+    --workflow-transformation-subtle: 152 56% 91%;
+    --workflow-transformation-border: 152 36% 77%;
+    --workflow-transformation-text: 154 82% 23%;
+    --workflow-transformation-contrast: 0 0% 100%;
+
+    --workflow-node-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), 0 10px 26px rgba(15, 23, 42, 0.05);
+
     --radius: 0.125rem;                   /* 2px - Minimal radius (Oracle style) */
   }
 
@@ -88,6 +161,78 @@
     --border: 0 0% 33%;
     --input: 0 0% 33%;
     --ring: 208 98% 55% / 0.4;
+
+    --workflow-extract-base: 208 84% 58%;
+    --workflow-extract-surface: 208 32% 19%;
+    --workflow-extract-subtle: 208 34% 24%;
+    --workflow-extract-border: 208 30% 42%;
+    --workflow-extract-text: 207 92% 78%;
+    --workflow-extract-contrast: 0 0% 100%;
+
+    --workflow-transform-base: 158 58% 46%;
+    --workflow-transform-surface: 158 22% 19%;
+    --workflow-transform-subtle: 158 24% 24%;
+    --workflow-transform-border: 158 24% 41%;
+    --workflow-transform-text: 156 68% 76%;
+    --workflow-transform-contrast: 0 0% 100%;
+
+    --workflow-quality-base: 6 72% 60%;
+    --workflow-quality-surface: 6 24% 19%;
+    --workflow-quality-subtle: 6 28% 24%;
+    --workflow-quality-border: 6 28% 42%;
+    --workflow-quality-text: 6 86% 77%;
+    --workflow-quality-contrast: 0 0% 100%;
+
+    --workflow-load-base: 264 60% 66%;
+    --workflow-load-surface: 264 22% 19%;
+    --workflow-load-subtle: 264 24% 24%;
+    --workflow-load-border: 264 24% 42%;
+    --workflow-load-text: 264 88% 82%;
+    --workflow-load-contrast: 0 0% 100%;
+
+    --workflow-orchestration-base: 33 92% 60%;
+    --workflow-orchestration-surface: 34 28% 19%;
+    --workflow-orchestration-subtle: 34 30% 24%;
+    --workflow-orchestration-border: 34 32% 44%;
+    --workflow-orchestration-text: 39 96% 80%;
+    --workflow-orchestration-contrast: 0 0% 100%;
+
+    --workflow-prediction-base: 208 84% 58%;
+    --workflow-prediction-surface: 208 32% 19%;
+    --workflow-prediction-subtle: 208 34% 24%;
+    --workflow-prediction-border: 208 30% 42%;
+    --workflow-prediction-text: 207 92% 78%;
+    --workflow-prediction-contrast: 0 0% 100%;
+
+    --workflow-logic-base: 43 88% 60%;
+    --workflow-logic-surface: 43 28% 19%;
+    --workflow-logic-subtle: 43 30% 24%;
+    --workflow-logic-border: 43 32% 44%;
+    --workflow-logic-text: 43 92% 80%;
+    --workflow-logic-contrast: 0 0% 100%;
+
+    --workflow-aggregation-base: 191 74% 56%;
+    --workflow-aggregation-surface: 191 26% 19%;
+    --workflow-aggregation-subtle: 191 28% 24%;
+    --workflow-aggregation-border: 191 30% 43%;
+    --workflow-aggregation-text: 191 90% 79%;
+    --workflow-aggregation-contrast: 0 0% 100%;
+
+    --workflow-routing-base: 264 70% 68%;
+    --workflow-routing-surface: 264 22% 19%;
+    --workflow-routing-subtle: 264 24% 24%;
+    --workflow-routing-border: 264 28% 44%;
+    --workflow-routing-text: 264 92% 83%;
+    --workflow-routing-contrast: 0 0% 100%;
+
+    --workflow-transformation-base: 152 62% 47%;
+    --workflow-transformation-surface: 152 24% 19%;
+    --workflow-transformation-subtle: 152 26% 24%;
+    --workflow-transformation-border: 152 28% 42%;
+    --workflow-transformation-text: 152 78% 78%;
+    --workflow-transformation-contrast: 0 0% 100%;
+
+    --workflow-node-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 14px 30px rgba(0, 0, 0, 0.24);
   }
 
   * {

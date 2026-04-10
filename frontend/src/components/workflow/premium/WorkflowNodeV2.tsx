@@ -221,7 +221,7 @@ export function WorkflowNodeV2({ data, selected, id }: NodeProps<WorkflowNodeDat
           </div>
 
           {/* Node label - enterprise typography optimized for compact nodes */}
-          <div className="text-sm font-semibold text-gray-900 dark:text-gray-100 leading-[1.3] truncate pr-8 tracking-[-0.01em]">
+          <div className="text-sm font-semibold text-card-foreground leading-[1.3] truncate pr-8 tracking-[-0.01em]">
             {data.label}
           </div>
 
@@ -353,7 +353,7 @@ export function WorkflowNodeV2({ data, selected, id }: NodeProps<WorkflowNodeDat
                 <div className="mt-3 space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-neutral-600 dark:text-neutral-400 font-medium">Confidence</span>
-                    <span className="font-semibold text-neutral-900 dark:text-neutral-50 tabular-nums">
+                    <span className="font-semibold text-card-foreground tabular-nums">
                       {(data.executionConfidence * 100).toFixed(0)}%
                     </span>
                   </div>
@@ -449,11 +449,11 @@ export function WorkflowNodeV2({ data, selected, id }: NodeProps<WorkflowNodeDat
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7 hover:bg-blue-50 dark:hover:bg-blue-950/40"
+            className="h-7 w-7 hover:bg-background-secondary"
             onClick={handleConfigure}
             title="Configure (Double-click)"
           >
-            <Settings className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+            <Settings className="h-3.5 w-3.5" style={{ color: stepConfig.color.text }} />
           </Button>
           <Button
             variant="ghost"
@@ -467,11 +467,11 @@ export function WorkflowNodeV2({ data, selected, id }: NodeProps<WorkflowNodeDat
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7 hover:bg-red-50 dark:hover:bg-red-950/40"
+            className="h-7 w-7 hover:bg-background-secondary"
             onClick={handleDelete}
             title="Delete (Del)"
           >
-            <Trash2 className="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
+            <Trash2 className="h-3.5 w-3.5 text-error" />
           </Button>
         </div>
       </motion.div>

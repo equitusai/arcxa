@@ -1,10 +1,10 @@
 /**
  * Collapsible ETL Workflow Node Component
  * Sophisticated design with Framer Motion animations and inline configuration
- * Phase 2.3: Dark mode support
+ * Phase 2.3: Theme-safe styling for light and dark modes
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState } from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronRight, MoreVertical } from 'lucide-react';
@@ -79,12 +79,6 @@ const contentVariants = {
 export function CollapsibleWorkflowNode({ data, selected }: NodeProps<CollapsibleNodeData>) {
   const [isCollapsed, setIsCollapsed] = useState(data.collapsed ?? false);
 
-  // Phase 2.3: Dark mode detection
-  const isDark = useMemo(
-    () => document.documentElement.classList.contains('dark'),
-    []
-  );
-
   // Get configuration based on node type
   const isETLNode = isETLStepType(data.step_type);
   const config = isETLNode
@@ -107,45 +101,35 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
     }
   };
 
-  // Border and shadow based on state with dark mode support
+  // Border and shadow based on state with theme-safe tokens
   const getBorderStyle = () => {
     if (selected) {
       return {
-        borderColor: '#0078D4',
-        boxShadow: isDark
-          ? '0 0 0 2px rgba(255,255,255,0.1), 0 0 0 4px #0078D4, 0 4px 16px rgba(0,120,212,0.30)'
-          : '0 0 0 2px #FFFFFF, 0 0 0 4px #0078D4, 0 4px 16px rgba(0,120,212,0.25)',
+        borderColor: 'hsl(var(--accent))',
+        boxShadow: '0 0 0 1px hsl(var(--background)), 0 0 0 4px hsl(var(--accent) / 0.34), 0 18px 36px hsl(var(--accent) / 0.18)',
       };
     }
 
     switch (data.status) {
       case 'running':
         return {
-          borderColor: config.color.base,
-          boxShadow: isDark
-            ? '0 2px 8px rgba(0,120,212,0.3)'
-            : '0 2px 8px rgba(0,120,212,0.2)',
+          borderColor: 'hsl(var(--accent))',
+          boxShadow: '0 14px 28px hsl(var(--accent) / 0.16), 0 4px 10px hsl(var(--foreground) / 0.06)',
         };
       case 'success':
         return {
-          borderColor: '#107C10',
-          boxShadow: isDark
-            ? '0 2px 8px rgba(16,124,16,0.25)'
-            : '0 2px 8px rgba(16,124,16,0.15)',
+          borderColor: 'hsl(var(--success))',
+          boxShadow: '0 14px 28px hsl(var(--success) / 0.14), 0 4px 10px hsl(var(--foreground) / 0.06)',
         };
       case 'error':
         return {
-          borderColor: '#D13438',
-          boxShadow: isDark
-            ? '0 2px 8px rgba(209,52,56,0.3)'
-            : '0 2px 8px rgba(209,52,56,0.2)',
+          borderColor: 'hsl(var(--error))',
+          boxShadow: '0 14px 28px hsl(var(--error) / 0.16), 0 4px 10px hsl(var(--foreground) / 0.06)',
         };
       default:
         return {
-          borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.12)',
-          boxShadow: isDark
-            ? '0 2px 6px rgba(0,0,0,0.25)'
-            : '0 2px 6px rgba(0,0,0,0.10)',
+          borderColor: 'hsl(var(--border))',
+          boxShadow: '0 10px 24px hsl(var(--foreground) / 0.08), 0 2px 6px hsl(var(--foreground) / 0.04)',
         };
     }
   };
@@ -166,7 +150,7 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
   return (
     <motion.div
       className={cn(
-        'rounded-lg border-2 bg-card transition-shadow relative',
+        'rounded-lg border-2 bg-card transition-shadow relative group',
         data.status === 'running' && 'animate-pulse-border'
       )}
       style={{
@@ -182,24 +166,24 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
       <div
         className="flex items-center gap-2 px-3 py-2 border-b border-border"
         style={{
-          background: `linear-gradient(135deg, ${config.color.base} 0%, ${config.color.base}dd 100%)`,
+          background: `linear-gradient(135deg, ${config.color.surface} 0%, ${config.color.subtle} 100%)`,
         }}
       >
         {/* Status dot */}
         <div className={cn('w-2 h-2 rounded-full', getStatusColor())} />
 
         {/* Icon */}
-        <div className="w-5 h-5 rounded-sm bg-white/95 dark:bg-slate-900/95 flex items-center justify-center">
+        <div className="w-5 h-5 rounded-sm bg-card border border-border-subtle flex items-center justify-center">
           <StepIcon className="w-4 h-4" style={{ color: config.color.text }} strokeWidth={2.5} />
         </div>
 
         {/* Label */}
         <span
           className={cn(
-            'text-sm font-semibold flex-1 text-white',
+            'text-sm font-semibold flex-1',
             isCollapsed && 'truncate max-w-[80px]'
           )}
-          style={{ textShadow: '0 1px 2px rgba(0,0,0,0.15)' }}
+          style={{ color: config.color.text }}
         >
           {isCollapsed ? config.label : data.label}
         </span>
@@ -207,20 +191,21 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
         {/* Toggle chevron */}
         <button
           onClick={handleToggle}
-          className="w-5 h-5 hover:bg-white/20 rounded-sm transition-colors flex items-center justify-center"
+          className="w-5 h-5 hover:bg-background-secondary rounded-sm transition-colors flex items-center justify-center"
           aria-label={isCollapsed ? 'Expand node' : 'Collapse node'}
         >
           <ChevronRight
             className={cn(
-              'w-4 h-4 text-white transition-transform duration-220',
+              'w-4 h-4 transition-transform duration-220',
               !isCollapsed && 'rotate-90'
             )}
+            style={{ color: config.color.text }}
           />
         </button>
 
         {/* Menu (visible on hover) */}
-        <button className="w-5 h-5 hover:bg-white/20 rounded-sm transition-colors opacity-0 group-hover:opacity-100 flex items-center justify-center">
-          <MoreVertical className="w-4 h-4 text-white" />
+        <button className="w-5 h-5 hover:bg-background-secondary rounded-sm transition-colors opacity-0 group-hover:opacity-100 flex items-center justify-center">
+          <MoreVertical className="w-4 h-4" style={{ color: config.color.text }} />
         </button>
       </div>
 
@@ -361,8 +346,11 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
                     </div>
                     <div className="h-1.5 bg-muted rounded-full overflow-hidden">
                       <div
-                        className="h-full bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
-                        style={{ width: `${data.progress}%` }}
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{
+                          width: `${data.progress}%`,
+                          background: 'linear-gradient(90deg, hsl(var(--accent)) 0%, hsl(var(--accent) / 0.8) 100%)',
+                        }}
                       />
                     </div>
                     {data.metrics?.rowsProcessed && (
@@ -395,10 +383,16 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
 
                 {/* Error state */}
                 {data.status === 'error' && data.error && (
-                  <div className="p-2 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded text-xs">
-                    <div className="font-semibold text-red-700 dark:text-red-400 mb-1">{data.error.message}</div>
+                  <div
+                    className="p-2 rounded text-xs"
+                    style={{
+                      backgroundColor: 'hsl(var(--error) / 0.08)',
+                      border: '1px solid hsl(var(--error) / 0.22)',
+                    }}
+                  >
+                    <div className="font-semibold mb-1 text-error">{data.error.message}</div>
                     {data.error.details && (
-                      <div className="text-red-600 dark:text-red-500">{data.error.details}</div>
+                      <div style={{ color: 'hsl(var(--error) / 0.82)' }}>{data.error.details}</div>
                     )}
                   </div>
                 )}
@@ -440,29 +434,25 @@ export function CollapsibleWorkflowNode({ data, selected }: NodeProps<Collapsibl
       <Handle
         type="target"
         position={Position.Left}
-        className={cn(
-          '!w-3 !h-3 !border-2 !shadow-md transition-all hover:!w-4 hover:!h-4 hover:!scale-110',
-          isDark ? '!border-slate-700' : '!border-white'
-        )}
+        className="!w-3 !h-3 !border-2 !shadow-md transition-all hover:!w-4 hover:!h-4 hover:!scale-110"
         style={{
           left: -6,
           top: '50%',
           transform: 'translateY(-50%)',
           backgroundColor: config.color.base,
+          borderColor: 'hsl(var(--background))',
         }}
       />
       <Handle
         type="source"
         position={Position.Right}
-        className={cn(
-          '!w-3 !h-3 !border-2 !shadow-md transition-all hover:!w-4 hover:!h-4 hover:!scale-110',
-          isDark ? '!border-slate-700' : '!border-white'
-        )}
+        className="!w-3 !h-3 !border-2 !shadow-md transition-all hover:!w-4 hover:!h-4 hover:!scale-110"
         style={{
           right: -6,
           top: '50%',
           transform: 'translateY(-50%)',
           backgroundColor: config.color.base,
+          borderColor: 'hsl(var(--background))',
         }}
       />
     </motion.div>

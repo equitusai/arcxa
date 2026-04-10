@@ -126,7 +126,7 @@ export function DataJoinerConfigForm({
 
       {/* No Sources Warning */}
       {!hasBothSources && (
-        <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded text-xs">
+        <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800 dark:text-amber-200">
             {!hasLeftSource && !hasRightSource && (
@@ -163,7 +163,7 @@ export function DataJoinerConfigForm({
           <Label className="text-xs font-medium text-foreground">Connected Sources</Label>
           <div className="grid grid-cols-2 gap-2">
             {/* Left Source */}
-            <div className="p-2 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded">
+            <div className="p-2 bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded">
               <div className="flex items-center gap-1.5 mb-1">
                 <Database className="w-3 h-3 text-blue-600 dark:text-blue-400" />
                 <span className="text-xs font-medium text-blue-900 dark:text-blue-100">Left</span>
@@ -177,7 +177,7 @@ export function DataJoinerConfigForm({
             </div>
 
             {/* Right Source */}
-            <div className="p-2 bg-purple-50 dark:bg-purple-950 border border-purple-200 dark:border-purple-800 rounded">
+            <div className="p-2 bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800 rounded">
               <div className="flex items-center gap-1.5 mb-1">
                 <Database className="w-3 h-3 text-purple-600 dark:text-purple-400" />
                 <span className="text-xs font-medium text-purple-900 dark:text-purple-100">Right</span>
@@ -322,7 +322,7 @@ export function DataJoinerConfigForm({
 
       {/* Validation Messages */}
       {hasBothSources && !hasAnyCondition && (
-        <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded text-xs">
+        <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800 dark:text-amber-200">
             Add at least one join condition to configure the join operation
@@ -331,7 +331,7 @@ export function DataJoinerConfigForm({
       )}
 
       {hasBothSources && hasIncompleteConditions && (
-        <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded text-xs">
+        <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded text-xs">
           <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
           <div className="text-amber-800 dark:text-amber-200">
             Each join condition must have both left and right fields selected
@@ -341,7 +341,7 @@ export function DataJoinerConfigForm({
 
       {/* Configuration Summary */}
       {hasBothSources && hasCompleteConditions && joinConditions.length > 0 && (
-        <div className="p-3 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded text-xs space-y-2">
+        <div className="p-3 bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800 rounded text-xs space-y-2">
           <div className="font-medium text-green-900 dark:text-green-100 mb-2">
             ✓ Join Configuration Complete
           </div>
@@ -361,7 +361,7 @@ export function DataJoinerConfigForm({
               {joinConditions.map((condition, index) => (
                 <div
                   key={index}
-                  className="flex items-center gap-2 font-mono text-green-900 dark:text-green-100 text-xs bg-green-100 dark:bg-green-900 p-2 rounded"
+                  className="flex items-center gap-2 font-mono text-green-900 dark:text-green-100 text-xs bg-green-100 dark:bg-green-900/30 p-2 rounded"
                 >
                   <span className="text-blue-600 dark:text-blue-400">
                     {leftNodeLabel}.{condition.left}

@@ -116,12 +116,6 @@ function WorkflowDesignerInner() {
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const [reactFlowInstance, setReactFlowInstance] = useState<any>(null);
 
-  // Phase 2.3: Dark mode detection
-  const isDark = useMemo(
-    () => document.documentElement.classList.contains('dark'),
-    []
-  );
-
   // API hooks
   const { data: workflows, isLoading: loadingWorkflows } = useWorkflows();
   const registerWorkflow = useRegisterWorkflow();
@@ -223,7 +217,7 @@ function WorkflowDesignerInner() {
             style: edgeStyle,
             label: edgeLabel || undefined,
             labelStyle: { fill: edgeColor, fontWeight: 600, fontSize: 10 },
-            labelBgStyle: { fill: isDark ? 'rgba(15,23,42,0.9)' : 'white', fillOpacity: 0.8 },
+            labelBgStyle: { fill: 'hsl(var(--card))', fillOpacity: 0.94 },
             markerEnd: {
               type: MarkerType.ArrowClosed,
               color: edgeColor,
@@ -233,7 +227,7 @@ function WorkflowDesignerInner() {
         )
       );
     },
-    [nodes, edges, setEdges, isDark]
+    [nodes, edges, setEdges]
   );
 
   const onDragOver = useCallback((event: React.DragEvent) => {
@@ -1207,7 +1201,7 @@ function WorkflowDesignerInner() {
                   : getStepTypeConfig(node.data.step_type);
                 return stepConfig.color.base;
               }}
-              maskColor="rgba(0,0,0,0.05)"
+              maskColor="hsl(var(--background) / 0.72)"
               style={{ width: 180, height: 120 }}
               pannable
               zoomable

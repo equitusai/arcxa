@@ -18,6 +18,7 @@ import {
   Clock,
   FolderInput,
 } from 'lucide-react';
+import { getWorkflowCategoryColor, type WorkflowStepColor } from './workflow-colors';
 
 // ETL Step Types (extends existing StepType)
 export type ETLStepType =
@@ -46,12 +47,7 @@ export interface ETLStepTypeConfig {
   id: ETLStepType;
   label: string;
   icon: any;
-  color: {
-    base: string;
-    subtle: string;
-    border: string;
-    text: string;
-  };
+  color: WorkflowStepColor;
   description: string;
   category: ETLCategory;
   inputs?: string[]; // Port labels for inputs
@@ -61,36 +57,11 @@ export interface ETLStepTypeConfig {
 
 // ETL color palette (Oracle Redwood + Fluent inspired)
 export const ETL_COLORS = {
-  extract: {
-    base: '#0078D4',
-    subtle: 'rgba(0, 120, 212, 0.1)',
-    border: 'rgb(0, 120, 212)',
-    text: 'rgb(0, 120, 212)',
-  },
-  transform: {
-    base: '#00CC6A',
-    subtle: 'rgba(0, 204, 106, 0.1)',
-    border: 'rgb(0, 204, 106)',
-    text: 'rgb(0, 204, 106)',
-  },
-  quality: {
-    base: '#E74856',
-    subtle: 'rgba(231, 72, 86, 0.1)',
-    border: 'rgb(231, 72, 86)',
-    text: 'rgb(231, 72, 86)',
-  },
-  load: {
-    base: '#8764B8',
-    subtle: 'rgba(135, 100, 184, 0.1)',
-    border: 'rgb(135, 100, 184)',
-    text: 'rgb(135, 100, 184)',
-  },
-  orchestration: {
-    base: '#FF8C00',
-    subtle: 'rgba(255, 140, 0, 0.1)',
-    border: 'rgb(255, 140, 0)',
-    text: 'rgb(255, 140, 0)',
-  },
+  extract: getWorkflowCategoryColor('extract'),
+  transform: getWorkflowCategoryColor('transform'),
+  quality: getWorkflowCategoryColor('quality'),
+  load: getWorkflowCategoryColor('load'),
+  orchestration: getWorkflowCategoryColor('orchestration'),
 };
 
 export const ETL_STEP_TYPE_CONFIGS: Record<ETLStepType, ETLStepTypeConfig> = {
