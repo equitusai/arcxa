@@ -44,6 +44,9 @@ const FileLibrary = lazy(() =>
 const DataCatalogue = lazy(() =>
   import('@/pages/DataCatalogue').then((module) => ({ default: module.DataCatalogue }))
 );
+const SosValidation = lazy(() =>
+  import('@/pages/SosValidation').then((module) => ({ default: module.SosValidation }))
+);
 
 // Create a client for React Query
 const queryClient = new QueryClient({
@@ -93,6 +96,7 @@ function App() {
               <Route path="fusion" element={<Fusion />} />
               <Route path="fusion-new" element={<FusionNew />} />
               <Route path="workflows" element={<WorkflowDesigner />} />
+              <Route path="sos-validation" element={<SosValidation />} />
               <Route path="ontologies" element={<Ontologies />} />
               <Route path="sparql" element={<SparqlPlayground />} />
               <Route

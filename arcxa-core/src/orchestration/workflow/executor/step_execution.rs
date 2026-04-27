@@ -132,6 +132,9 @@ impl WorkflowExecutor {
             (StepType::Aggregator, StepConfig::Aggregator(config)) => {
                 self.execute_aggregator(config, context).await
             }
+            (StepType::SosValidation, StepConfig::SosValidation(config)) => {
+                self.execute_sos_validation(config, context).await
+            }
             (StepType::DataJoiner, StepConfig::DataJoiner(config)) => {
                 let (success, output, confidence) =
                     self.execute_data_joiner(config, context).await?;

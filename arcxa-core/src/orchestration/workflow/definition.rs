@@ -123,6 +123,7 @@ pub enum StepType {
     SemanticMapper,
     Deduplicator,
     Aggregator,
+    SosValidation,
 
     // ETL step types (Phase 4 - Export)
     CsvExporter,
@@ -148,6 +149,7 @@ impl std::fmt::Display for StepType {
             StepType::SemanticMapper => "semantic_mapper",
             StepType::Deduplicator => "deduplicator",
             StepType::Aggregator => "aggregator",
+            StepType::SosValidation => "sos_validation",
             StepType::CsvExporter => "csv_exporter",
         };
         write!(f, "{}", s)
@@ -175,6 +177,7 @@ impl StepType {
             StepType::SemanticMapper => "semantic_mapper",
             StepType::Deduplicator => "deduplicator",
             StepType::Aggregator => "aggregator",
+            StepType::SosValidation => "sos_validation",
             StepType::CsvExporter => "csv_exporter",
         }
     }
@@ -211,6 +214,7 @@ pub enum StepConfig {
     SemanticMapper(SemanticMapperConfig),
     Deduplicator(DeduplicatorConfig), // Has method + key_fields - more specific than ConfidenceAggregate
     Aggregator(AggregatorConfig),
+    SosValidation(SosValidationConfig),
 
     // ETL configs (Phase 4 - Export)
     CsvExporter(CsvExporterConfig),
@@ -248,6 +252,7 @@ impl StepConfig {
             StepType::SemanticMapper => StepConfig::SemanticMapper(parse(value, step_type)?),
             StepType::Deduplicator => StepConfig::Deduplicator(parse(value, step_type)?),
             StepType::Aggregator => StepConfig::Aggregator(parse(value, step_type)?),
+            StepType::SosValidation => StepConfig::SosValidation(parse(value, step_type)?),
             StepType::CsvExporter => StepConfig::CsvExporter(parse(value, step_type)?),
         })
     }
@@ -276,6 +281,7 @@ impl StepConfig {
             (StepConfig::SemanticMapper(cfg), StepType::SemanticMapper) => cfg.validate(),
             (StepConfig::Deduplicator(cfg), StepType::Deduplicator) => cfg.validate(),
             (StepConfig::Aggregator(cfg), StepType::Aggregator) => cfg.validate(),
+            (StepConfig::SosValidation(cfg), StepType::SosValidation) => cfg.validate(),
 
             // ETL validators (Phase 4 - Export)
             (StepConfig::CsvExporter(cfg), StepType::CsvExporter) => cfg.validate(),
@@ -1000,6 +1006,112 @@ pub enum AggFunction {
 pub struct AggregatorConfig {
     pub group_by: Vec<String>,
     pub aggregations: Vec<Aggregation>,
+}
+
+/// Systems-of-Systems validation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SosValidationConfig {
+    pub validation: SosValidationSpec,
+    #[serde(default = "default_blocking_severities")]
+    pub blocking_severities: Vec<String>,
+    #[serde(default = "default_true")]
+    pub persist_report: bool,
+    #[serde(default = "default_true")]
+    pub emit_graph_lineage: bool,
+}
+
+impl SosValidationConfig {
+    fn validate(&self) -> Result<()> {
+        self.validation.validate()?;
+
+        if self.blocking_severities.is_empty() {
+            anyhow::bail!("blocking_severities cannot be empty");
+        }
+
+        for severity in &self.blocking_severities {
+            match severity.to_ascii_lowercase().as_str() {
+                "error" | "warning" | "info" => {}
+                _ => anyhow::bail!(
+                    "Unsupported blocking severity '{}'; expected error, warning, or info",
+                    severity
+                ),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn default_blocking_severities() -> Vec<String> {
+    vec!["error".to_string()]
+}
+
+/// Shared SoS validation spec used by workflow steps.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SosValidationSpec {
+    InterfaceCompatibility {
+        provider_interface_id: String,
+        consumer_interface_id: String,
+    },
+    ContractCompliance {
+        contract_id: String,
+    },
+    SystemIntegration {
+        source_system_id: String,
+        target_system_id: String,
+    },
+    PolicyCheck {
+        sparql_query: String,
+        #[serde(default)]
+        context: HashMap<String, serde_json::Value>,
+    },
+    DataValidation {
+        interface_id: String,
+        data: serde_json::Value,
+    },
+}
+
+impl SosValidationSpec {
+    fn validate(&self) -> Result<()> {
+        match self {
+            SosValidationSpec::InterfaceCompatibility {
+                provider_interface_id,
+                consumer_interface_id,
+            } => {
+                if provider_interface_id.is_empty() || consumer_interface_id.is_empty() {
+                    anyhow::bail!(
+                        "provider_interface_id and consumer_interface_id cannot be empty"
+                    );
+                }
+            }
+            SosValidationSpec::ContractCompliance { contract_id } => {
+                if contract_id.is_empty() {
+                    anyhow::bail!("contract_id cannot be empty");
+                }
+            }
+            SosValidationSpec::SystemIntegration {
+                source_system_id,
+                target_system_id,
+            } => {
+                if source_system_id.is_empty() || target_system_id.is_empty() {
+                    anyhow::bail!("source_system_id and target_system_id cannot be empty");
+                }
+            }
+            SosValidationSpec::PolicyCheck { sparql_query, .. } => {
+                if sparql_query.trim().is_empty() {
+                    anyhow::bail!("sparql_query cannot be empty");
+                }
+            }
+            SosValidationSpec::DataValidation { interface_id, .. } => {
+                if interface_id.is_empty() {
+                    anyhow::bail!("interface_id cannot be empty");
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl AggregatorConfig {

@@ -1,282 +1,151 @@
 # ARCXA
 
-Mapping intelligence for enterprise data migrations: schema mapping, lineage, and transformation traceability that compounds across every project.
+<p align="center">
+  <a href="https://github.com/equitusai/arcxa"><img src="https://img.shields.io/badge/GitHub-equitusai%2Farcxa-181717?logo=github" alt="GitHub repository" /></a>
+  <img src="https://img.shields.io/badge/Rust-1.91%2B-000000?logo=rust" alt="Rust 1.91+" />
+  <img src="https://img.shields.io/badge/Deploy-Docker%20%26%20Kubernetes-2496ED?logo=docker&logoColor=white" alt="Docker and Kubernetes" />
+  <img src="https://img.shields.io/badge/UI-React%20%2B%20Vite-61DAFB?logo=react&logoColor=061A23" alt="React and Vite" />
+  <a href="./LICENSE.md"><img src="https://img.shields.io/badge/License-BSL%201.1-EA580C" alt="BSL 1.1 license" /></a>
+</p>
 
-ARCXA is a data governance and orchestration platform for teams that need to connect operational data sources, materialize governed datasets, map them into semantic models, and run repeatable transformation or loading workflows with traceable provenance.
+<p align="center"><strong>Governed data movement, semantic mapping, lineage, and systems-of-systems validation in one platform.</strong></p>
 
-One of the main reasons ARCXA exists is enterprise AI governance. In regulated or high-risk environments, multiple teams may be using LLMs, AI agents, model services, and transformation workflows against shared datasets. That creates a hard governance problem: what data was used where, what changed it, which workflow or service touched it, and what downstream systems or teams are now depending on it. ARCXA is built to make those relationships observable instead of implicit.
+<p align="center">
+  ARCXA helps teams connect operational data sources, materialize governed datasets, orchestrate repeatable workflows,
+  preserve lineage, and apply policy-driven validation without stitching together five separate control planes.
+</p>
 
-This public repository combines the Rust backend services and the React frontend used to operate the platform. The repository layout reflects the deployable surface of the system rather than just library internals, so it is suitable as both a codebase and an operational reference.
+<p align="center">
+  <img src="./assets/arcxa-arch.png" alt="ARCXA architecture diagram" width="100%" />
+</p>
 
-The codebase is organized for a distributed deployment model:
-- `arcxa-coordinator` exposes the REST and gRPC control plane, manages metadata, orchestrates workflows, and routes shard-facing operations.
-- `arcxa-shard` is the RDF/SPARQL data plane for graph storage and distributed query execution.
-- `arcxa-model-service` provides the optional model-serving path used by semantic matching and ML-oriented workflow steps.
-- `frontend/` contains the ARCXA web application.
+> Welcome to the curated public repository. Historical internal working notes are intentionally not mirrored here. The maintained documentation set for external users starts in `docs/README.md`.
+
+## Table Of Contents
+
+1. [Why ARCXA](#why-arcxa)
+2. [Platform Snapshot](#platform-snapshot)
+3. [Architecture At A Glance](#architecture-at-a-glance)
+4. [Quick Start](#quick-start)
+5. [Documentation](#documentation)
+6. [Repository Map](#repository-map)
+7. [License](#license)
 
 ## Why ARCXA
 
-Enterprise AI programs usually fail governance before they fail modeling. The operational problem is not just storing data or running an LLM call. It is maintaining an auditable understanding of:
+Most data platforms can move data. Fewer can explain, with confidence, what changed, why it changed, which workflow touched it, which ontology terms were applied, which policies were in force, and what downstream systems are now depending on it.
 
-- which sources were connected
-- which datasets were materialized or transformed
-- which workflows changed them
-- which mappings or ontology terms were applied
-- which models, services, or downstream consumers used the resulting data
+ARCXA is designed for that second problem.
 
-ARCXA focuses on that control plane. It gives teams a shared system for cataloging sources, governing transformation flows, materializing datasets, and tracing lineage across those boundaries so that "what changed what" and "what is using what" are answerable questions.
+It combines:
+- source onboarding and schema discovery
+- governed dataset materialization
+- ontology-aware semantic mapping
+- workflow orchestration and loading
+- row, field, and graph-native lineage
+- policy and contract validation for systems-of-systems integrations
 
-## Core Architecture
+## Platform Snapshot
 
-ARCXA separates orchestration, graph storage, and model inference into distinct runtime components.
+| Area | What it does |
+| --- | --- |
+| Data Sources | Registers relational, warehouse, file, and RDF sources; tests connectivity; exposes source capabilities. |
+| Semantic Mapping | Aligns source fields with ontology terms through statistical and model-assisted matching workflows. |
+| Workflows | Runs declarative ETL and loading pipelines with validation, scheduling, and execution history. |
+| Lineage & Governance | Tracks row, field, workflow, and graph lineage with audit-friendly provenance. |
+| Systems Of Systems | Models systems, interfaces, contracts, and policies with persisted validation history and analytics. |
+| Operations | Ships health, metrics, Docker, Kubernetes, CLI, and operator-oriented maintenance surfaces. |
 
-- `Coordinator`
-  Owns the control plane. It exposes the authenticated REST API, manages the datasource catalog, workflow definitions, scheduling, import jobs, lineage-oriented metadata, and operational endpoints such as health and metrics. It is also the place where most integration-facing business logic lives.
+## Architecture At A Glance
 
-- `Shards`
-  Own the distributed RDF storage layer and SPARQL execution path. They are the graph data plane behind lineage, governance, ontology-linked metadata, and other graph-native workloads.
+ARCXA is intentionally split into deployable components rather than one oversized runtime.
 
-- `Model Service`
-  Provides optional gRPC inference services used for semantic matching and model-assisted workflow behavior. It is intentionally deployed separately so model dependencies and scaling concerns do not contaminate the coordinator runtime.
+| Component | Role |
+| --- | --- |
+| `arcxa-coordinator` | Control plane: authenticated APIs, metadata, workflows, validation services, and orchestration. |
+| `arcxa-shard` | RDF/SPARQL data plane for graph storage and distributed query execution. |
+| `arcxa-model-service` | Optional model inference path for semantic matching and model-assisted workflow behavior. |
+| `arcxa-cli` | Thin operator tooling over coordinator APIs and migration/runtime utilities. |
+| `arcxa-core` | Shared contracts, workflow primitives, connector abstractions, and cross-cutting domain types. |
+| `frontend/` | React and Vite web application for operators, analysts, and platform admins. |
 
-- `Frontend`
-  Provides the operator UI for source onboarding, dataset and entity exploration, ontology work, lineage investigation, workflow design, and settings or administrative operations.
+A few important implementation realities:
+- the shard is built separately because it depends on `oxigraph` and an older RocksDB binding than the rest of the workspace
+- the coordinator owns orchestration, policy evaluation, and API composition, but it does not store RDF data directly
+- the model service is optional by design so teams can deploy semantic matching only where it adds value
 
-This split matters operationally. The coordinator can evolve independently from the shard storage engine, and the model service can be enabled only where semantic matching or model-backed workflow steps are required.
+## Quick Start
 
-## What ARCXA Covers
+### 1. Build the backend workspace
 
-- Data source catalog and connection management for relational, warehouse, file, object, and RDF-style sources.
-- Schema discovery, query preview, connector metadata, and per-source capability reporting.
-- Dataset import, catalogue browsing, entity views, and materialized dataset handling.
-- Workflow authoring, validation, execution, scheduling, execution history, and dataset-backed workflow input.
-- Semantic mapping, manual mapping, R2RML, ontology management, ontology-driven DDL, and SHACL/DDL related APIs.
-- Lineage APIs covering row, field, model, and graph-native provenance use cases.
-- File library and staged file ingestion for CSV and related file workflows.
-- Model registry, prediction recording, quality rules, governance/SPARQL operations, GDPR routes, SoS validation, and cluster/ops endpoints.
-
-Taken together, those areas support a common lifecycle:
-1. connect a source
-2. discover or inspect schema
-3. import or materialize governed data
-4. map source fields to semantic terms
-5. run transformation or loading workflows
-6. inspect resulting datasets, entities, and lineage
-7. operate the platform through health, metrics, cluster, and admin surfaces
-
-## Functional Areas
-
-- `Data Sources`
-  Registers and manages source connections, tests connectivity, infers schema, previews queries, and exposes datasource capabilities for UI and workflow gating.
-
-- `Catalogue, Datasets, and Entities`
-  Supports dataset import, catalogue browsing, dataset detail inspection, and entity-centric exploration of governed data.
-
-- `Ontology and Semantic Mapping`
-  Manages ontologies, mapping sessions, manual mapping workflows, R2RML, and ontology-driven schema or DDL generation.
-
-- `Workflow Orchestration`
-  Supports workflow CRUD, validation, dry-run, synchronous and asynchronous execution, scheduling, execution history, progress, cancellation, and materialized dataset handoff.
-
-- `Lineage and Governance`
-  Exposes row lineage, field lineage, lineage query APIs, graph-native governance endpoints, and SPARQL-oriented metadata access.
-
-- `File and Bulk Ingestion`
-  Provides file library APIs, CSV-oriented ingest utilities, loader APIs, and multi-source mapping flows.
-
-- `Models, Quality, and Operations`
-  Includes model registry endpoints, prediction recording, quality rules, health/readiness/metrics, audit paths, cluster admin routes, and WAL/temporal admin surfaces.
-
-## End-to-End Usage Model
-
-ARCXA is easiest to understand as a pipeline from source registration to governed outputs.
-
-### 1. Source onboarding
-
-Users register a datasource through the catalog API or the frontend. The coordinator stores the normalized connection model, validates connector compatibility, and exposes capability metadata so the UI and workflow engine know whether that source can be queried, inferred, read by workflows, or written to by loaders.
-
-### 2. Discovery and preview
-
-For supported source types, ARCXA can infer schema, preview queries, and expose connector metadata before data is imported. This is the stage where operators decide whether a source should remain query-only, feed the catalogue, or become a workflow input.
-
-### 3. Dataset materialization
-
-Datasets can be imported and materialized into governed storage, then surfaced in the catalogue and dataset detail views. That creates a cleaner handoff between raw sources and downstream workflow execution.
-
-### 4. Semantic alignment
-
-Ontologies, mapping sessions, manual mapping, and R2RML-related APIs provide the semantic layer. This is where source-native names and structures are aligned to domain terms so downstream consumption is not forced to remain source-specific.
-
-### 5. Workflow execution
-
-Workflows can read from datasources or materialized datasets, execute transformation and loading steps, and emit outputs such as loaded tables, RDF-oriented results, exported files, or additional materialized datasets depending on the configured flow.
-
-### 6. Lineage and governance
-
-Once data has moved through the system, ARCXA exposes lineage and governance views so operators can trace what happened, which workflow or mapping session was involved, and how governed entities or datasets relate to their originating sources.
-
-That is the point where the platform becomes especially relevant for AI-heavy environments. When teams are training, enriching, validating, or operationalizing data through model-backed services and automated agents, ARCXA is intended to preserve the chain of custody across those steps rather than leaving it scattered across logs, notebooks, and one-off pipelines.
-
-## Supported Source Classes
-
-The connector registry in `arcxa-core` currently includes:
-- Relational and warehouse sources: PostgreSQL, MySQL, Oracle, DB2, SAP HANA, Snowflake, Databricks
-- File and object sources: CSV, S3 Parquet
-- Semantic source: RDF N-Triples
-
-Connector parity is intentionally not described as uniform. Read, write, inference, parameter, workflow, and cancellation support varies by connector and operation. Use the live connector registry and datasource capability responses instead of assuming every source supports every path:
-- `GET /api/v1/connectors`
-- `GET /api/v1/datasources`
-
-In practice, the connector registry should be treated as the authoritative contract for front-end behavior and workflow eligibility. The platform does not assume all connectors are symmetrical.
-
-## API Surface
-
-The coordinator exposes versioned REST APIs under `/api/v1` plus health and auth entry points.
-
-Key API areas:
-- `/api/v1/datasources`
-- `/api/v1/workflows`
-- `/api/v1/ontology`
-- `/api/v1/governance`
-- `/api/v1/lineage`
-- `/api/v1/field-lineage`
-- `/api/v1/file-library`
-- `/api/v1/loader`
-- `/api/v1/r2rml`
-- `/api/v1/mapping`
-- `/api/v1/gdpr`
-- `/api/v1/connectors`
-- `/api/v1/datasets`
-- `/api/v1/entities`
-
-The OpenAPI index is exposed at:
-
-```text
-GET /openapi.yaml
+```bash
+./build.sh
 ```
 
-Module-specific Swagger UIs are mounted under the versioned API, for example:
-- `/api/v1/datasources/swagger-ui`
-- `/api/v1/workflows/swagger-ui`
-- `/api/v1/ontology/swagger-ui`
-- `/api/v1/governance/swagger-ui`
-- `/api/v1/lineage/swagger-ui`
-- `/api/v1/file-library/swagger-ui`
+### 2. Run the default local topology
 
-The API surface is intentionally modular rather than a single monolith. The code under `arcxa-coordinator/src/api` is split by business area, and the OpenAPI index points to module-specific documentation rather than collapsing everything into one giant spec.
+```bash
+./run-local.sh
+```
 
-## Frontend
+### 3. Verify the coordinator
 
-The React frontend lives in `/frontend` and provides the main operating interface for:
-- dashboard and status views
-- data catalogue and dataset detail
-- data sources
-- entities
-- file library
-- models
-- lineage
-- fusion
-- workflow design and execution
-- ontologies
-- SPARQL playground
-- admin settings
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/openapi.yaml
+```
 
-Frontend routes are implemented in `frontend/src/App.tsx`, and the UI is branded as `ARCXA`.
+### 4. Run the frontend
 
-The frontend is not just a thin API shell. It contains dedicated operating surfaces for datasource management, dataset and catalogue views, workflow design and execution, ontology work, lineage exploration, and related admin tooling.
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-## Repository Layout
+### 5. Explore the curated docs
+
+Start with `docs/README.md`, then follow the guide that matches your role.
+
+## Documentation
+
+The documentation set below is the maintained public surface for this repository.
+
+| Guide | Best for | Covers |
+| --- | --- | --- |
+| [`docs/README.md`](docs/README.md) | Everyone | Documentation hub, reading paths, and guide map. |
+| [`docs/getting-started.md`](docs/getting-started.md) | First-time users | Local prerequisites, build, run, and first verification steps. |
+| [`docs/architecture.md`](docs/architecture.md) | Architects and platform leads | Runtime topology, control-plane/data-plane split, and data flow model. |
+| [`docs/platform-capabilities.md`](docs/platform-capabilities.md) | Product and delivery teams | What the platform covers across sources, mapping, workflows, lineage, and governance. |
+| [`docs/systems-of-systems.md`](docs/systems-of-systems.md) | Integration and governance teams | SoS catalog, contracts, policies, validation reports, analytics, and operator surfaces. |
+| [`docs/deployment-and-operations.md`](docs/deployment-and-operations.md) | Operators | Scripts, Docker/Kubernetes entry points, health, metrics, and deployment concerns. |
+| [`docs/repository-guide.md`](docs/repository-guide.md) | Contributors | Workspace layout, crate responsibilities, and public-repo structure. |
+
+## Repository Map
 
 ```text
-/
+.
+├── assets/
 ├── arcxa-cli/
 ├── arcxa-coordinator/
 ├── arcxa-core/
 ├── arcxa-migrations/
 ├── arcxa-model-service/
 ├── arcxa-shard/
+├── docker/
+├── docs/
 ├── frontend/
-├── docker-compose.yml
+├── kubernetes/
+├── proto/
 ├── build.sh
 ├── run-local.sh
-└── run-local-ha.sh
+├── run-local-ha.sh
+├── sync-public.sh
+└── test.sh
 ```
 
-Notes:
-- The root Cargo workspace includes `arcxa-core`, `arcxa-coordinator`, `arcxa-model-service`, `arcxa-migrations`, and `arcxa-cli`.
-- `arcxa-shard` is built separately because of the RocksDB dependency split between shard storage and the rest of the workspace.
+## License
 
-`arcxa-core` contains the shared contracts, workflow engine pieces, connector abstractions, and schema or catalog types used across the rest of the system.
+ARCXA is released under the Business Source License 1.1.
 
-## Local Development
-
-Toolchain requirement:
-- Rust `1.91.1` or newer is required for the current AWS SDK dependency set.
-- The repo includes `rust-toolchain.toml` pinned to `1.91.1` so `rustup` can select the right toolchain automatically.
-
-Build the backend components:
-
-```bash
-./build.sh
-```
-
-Run the default local topology with Docker-backed infrastructure and local binaries:
-
-```bash
-./run-local.sh
-```
-
-Run the HA-oriented local topology:
-
-```bash
-./run-local-ha.sh
-```
-
-Build the frontend:
-
-```bash
-cd frontend
-npm install
-npm run build
-```
-
-Run the frontend in development mode:
-
-```bash
-cd frontend
-npm run dev
-```
-
-If you want to explore the API without the frontend first, start the coordinator and use the OpenAPI index plus module-specific Swagger UIs under `/api/v1/*/swagger-ui`.
-
-## Deployment and Operations
-
-- Dockerfiles and `docker-compose*.yml` are included at the repository root.
-- A Helm chart is included under `kubernetes/helm-chart`.
-- Health endpoints are available at `/health`, `/health/live`, and `/health/ready`.
-- Metrics are exposed from the coordinator at `/metrics` behind authentication.
-
-For local and test environments, the repository also includes helper scripts such as `build.sh`, `run-local.sh`, `run-local-ha.sh`, and `test.sh`. Those scripts are the intended entry points for the public repo layout.
-
-## What This Repository Is
-
-This repository is the deployable product surface for ARCXA:
-- Rust services and shared crates
-- the React frontend
-- local orchestration scripts
-- Docker and compose assets
-- Helm packaging
-- demo and vendor artifacts that are part of the runnable product tree
-
-It is not intended to claim that every subsystem has identical maturity across every source type or deployment mode. The codebase has a broad feature surface, and some areas are connector-specific, feature-gated, or optional by design.
-
-## Accuracy Notes
-
-This README is intentionally conservative. ARCXA has a broad surface area, but some subsystems are source-specific or feature-flagged:
-- connector capabilities vary by source and operation
-- some workflow and loader paths are only valid for specific source classes
-- optional features such as ODBC, cryptographic audit, and raft-backed coordination are build- or deployment-dependent
-- the model service is optional and primarily relevant for semantic matching and model-backed workflow behavior
-
-For exact request and response contracts, use the live OpenAPI documents and the source modules under `arcxa-coordinator/src/api`.
+See `LICENSE.md` for terms, change-date behavior, and commercial-use guidance.

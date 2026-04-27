@@ -2,9 +2,6 @@
 /target/
 /arcxa-shard/target/
 **/target/
-Cargo.lock
-!Cargo.lock
-!arcxa-shard/Cargo.lock
 
 # Frontend
 /frontend/node_modules/

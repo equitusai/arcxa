@@ -7,12 +7,11 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     CorruptionTolerance, EntryType, LogSequenceNumber, RecoveryError, RecoveryMode, RecoveryResult,
-    RepairReport, StorageCheckpoint, TransactionOp, ValidationReport, WalConfig, WalEntry,
-    WalError, WalResult,
+    RepairReport, TransactionOp, ValidationReport, WalConfig, WalEntry, WalError, WalResult,
 };
 
 /// Manages WAL recovery after crashes
@@ -76,7 +75,7 @@ pub enum RecoveryDecision {
 
 /// Represents a WAL segment file for recovery
 #[derive(Clone)]
-pub(super) struct SegmentFile {
+pub struct SegmentFile {
     path: PathBuf,
     id: u64,
     size: u64,
@@ -105,6 +104,7 @@ impl RecoveryManager {
             mode: self.config.recovery_mode,
             corruption_tolerance: self.config.corruption_tolerance,
         };
+        info!("Using WAL recovery mode: {:?}", self.config.recovery_mode);
 
         // Validate segments
         let validation = strategy.validate(segments.clone()).await?;
@@ -294,9 +294,12 @@ impl RecoveryStrategy for DefaultRecoveryStrategy {
         let mut last_valid_lsn = LogSequenceNumber::ZERO;
 
         for segment in segments {
-            debug!("Recovering segment {} from {:?}", segment.id, segment.path);
+            debug!(
+                "Recovering segment {} from {:?} (created {:?})",
+                segment.id, segment.path, segment.created
+            );
 
-            let mut file = File::open(&segment.path).map_err(|e| WalError::Io {
+            let file = File::open(&segment.path).map_err(|e| WalError::Io {
                 source: e,
                 path: Some(segment.path.clone()),
             })?;
@@ -370,6 +373,7 @@ impl RecoveryStrategy for DefaultRecoveryStrategy {
     }
 
     async fn validate(&self, segments: Vec<SegmentFile>) -> WalResult<ValidationReport> {
+        debug!("Validating WAL segments in {:?} mode", self.mode);
         let mut valid_segments = 0;
         let mut corrupted_segments = Vec::new();
         let mut total_entries = 0u64;

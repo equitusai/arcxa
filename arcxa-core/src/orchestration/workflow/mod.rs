@@ -88,6 +88,8 @@ pub use definition::{
     RuleType,
     SemanticMapperConfig,
     Severity,
+    SosValidationConfig,
+    SosValidationSpec,
 
     StepConfig,
     StepType,
@@ -114,8 +116,8 @@ pub use engine::{WorkflowEngine, WorkflowMetadata, WorkflowPersistenceEvent};
 pub use error::WorkflowErrorCategory;
 pub use execution_context_v2::{ExecutionContextV2, ResourceLimits as ResourceLimitsV2};
 pub use executor::{
-    ExecutionContext, FinalDecision, ResourceLimits, StepResult, TransformerCallback,
-    WorkflowExecutor, WorkflowResult,
+    ExecutionContext, FinalDecision, ResourceLimits, SosValidationCallback, SosValidationCheck,
+    SosValidationStepResult, StepResult, TransformerCallback, WorkflowExecutor, WorkflowResult,
 };
 #[cfg(feature = "workflow-storage")]
 pub use executor_optimized::OptimizedStepExecutor;

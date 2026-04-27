@@ -35,6 +35,7 @@ COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-graphica}"
 KEEP_DATA=false
 FULL_CLEAN=false
 FORCE=false
+DOCKER_COMPOSE_CMD="${DOCKER_COMPOSE_CMD:-}"
 
 # Logging functions
 log_info() {
@@ -51,6 +52,38 @@ log_warning() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check Docker and choose a compatible Compose command.
+check_prerequisites() {
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed. Please install Docker first."
+        exit 1
+    fi
+
+    if docker compose version &> /dev/null; then
+        DOCKER_COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        DOCKER_COMPOSE_CMD="docker-compose"
+    else
+        log_error "Docker Compose is not installed. Please install Docker Compose first."
+        exit 1
+    fi
+
+    if ! docker info &> /dev/null; then
+        log_error "Docker daemon is not running. Please start Docker."
+        exit 1
+    fi
+
+    log_info "Using: ${DOCKER_COMPOSE_CMD}"
+}
+
+# Count running containers for this compose project in a Docker-version-safe way.
+# Older docker-compose builds do not support `ps --filter`, so rely on labels.
+count_running_project_containers() {
+    docker ps \
+        --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+        --format "{{.Names}}" 2>/dev/null | wc -l
 }
 
 # Parse arguments
@@ -113,12 +146,12 @@ show_status() {
 
     # Check running containers
     local running_containers
-    running_containers=$(docker-compose ps --services --filter "status=running" 2>/dev/null | wc -l)
+    running_containers=$(count_running_project_containers)
 
     if [[ ${running_containers} -eq 0 ]]; then
         log_info "No running containers found"
     else
-        docker-compose ps
+        ${DOCKER_COMPOSE_CMD} ps
         echo ""
     fi
 
@@ -143,7 +176,7 @@ stop_containers() {
     cd "${PROJECT_ROOT}"
 
     # Stop all containers
-    docker-compose down --remove-orphans || log_warning "Some containers may have already been stopped"
+    ${DOCKER_COMPOSE_CMD} down --remove-orphans || log_warning "Some containers may have already been stopped"
 
     log_success "Containers stopped"
 }
@@ -221,11 +254,11 @@ verify_cleanup() {
 
     # Check containers
     local running_containers
-    running_containers=$(docker-compose ps --services --filter "status=running" 2>/dev/null | wc -l)
+    running_containers=$(count_running_project_containers)
 
     if [[ ${running_containers} -gt 0 ]]; then
         log_warning "Some containers are still running"
-        docker-compose ps --filter "status=running"
+        ${DOCKER_COMPOSE_CMD} ps
         return 1
     fi
 
@@ -252,7 +285,7 @@ show_summary() {
 
     if [[ "${KEEP_DATA}" == "true" ]]; then
         log_info "Data volumes were preserved"
-        echo "  To remove data later: docker-compose down -v"
+        echo "  To remove data later: ${DOCKER_COMPOSE_CMD} down -v"
     elif [[ "${FULL_CLEAN}" == "true" ]]; then
         log_success "Full cleanup completed (containers, volumes, networks, and configs removed)"
     else
@@ -271,6 +304,7 @@ main() {
     echo ""
 
     parse_args "$@"
+    check_prerequisites
 
     # Show current status
     show_status

@@ -14,6 +14,7 @@ import {
   Combine,
   Workflow,
   FileCode,
+  ShieldCheck,
   Settings as SettingsIcon,
   Moon,
   Sun,
@@ -53,6 +54,12 @@ const navigationGroups = [
       { name: 'Fusion', href: '/fusion', icon: Combine },
       { name: 'Workflows', href: '/workflows', icon: Workflow },
       { name: 'Lineage', href: '/lineage', icon: Network },
+    ],
+  },
+  {
+    name: 'Systems-of-Systems',
+    items: [
+      { name: 'SoS Validation', href: '/sos-validation', icon: ShieldCheck },
     ],
   },
   {
@@ -128,7 +135,7 @@ export function Layout() {
               {/* Navigation - Grouped sections */}
               <nav className="flex-1 px-2 py-3 overflow-y-auto">
                 <div className="space-y-4">
-                  {navigationGroups.map((group, groupIndex) => (
+                  {navigationGroups.map((group) => (
                     <div key={group.name}>
                       {/* Group header - only show for non-Dashboard groups and when not collapsed */}
                       {!sidebarCollapsed && group.name !== 'Dashboard' && (

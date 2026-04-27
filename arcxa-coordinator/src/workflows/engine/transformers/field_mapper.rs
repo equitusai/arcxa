@@ -226,7 +226,7 @@ impl FieldMapperTransformer {
         }
 
         // Record batch lookup performance
-        let duration = start.elapsed().as_secs_f64();
+        let _duration = start.elapsed().as_secs_f64();
         // self.metrics.record_batch_lookup("manual", duration);
         // self.metrics.record_cache_hits(field_names.len() - uncached_fields.len());
         // self.metrics.record_cache_misses(uncached_fields.len());
@@ -303,7 +303,7 @@ impl FieldMapperTransformer {
     /// Apply field mappings to data rows with conflict detection (memory-optimized)
     fn apply_mappings(
         &self,
-        dataset_id: &str,
+        _dataset_id: &str,
         rows: &[JsonValue],
         mappings: &HashMap<String, MappingInfo>,
     ) -> Result<Vec<JsonValue>> {
@@ -406,9 +406,10 @@ impl FieldMapperTransformer {
 
     /// Apply field mappings in-place to mutable rows array (zero-copy optimization)
     /// This is more memory-efficient for large datasets
+    #[allow(dead_code)]
     fn apply_mappings_inplace(
         &self,
-        dataset_id: &str,
+        _dataset_id: &str,
         rows: &mut [JsonValue],
         mappings: &HashMap<String, MappingInfo>,
     ) -> Result<()> {
@@ -461,7 +462,7 @@ impl FieldMapperTransformer {
                     }
 
                     // Check for conflicts
-                    if let Some((prev_source, prev_confidence)) = target_usage.get(target) {
+                    if let Some((_prev_source, prev_confidence)) = target_usage.get(target) {
                         let should_replace = match conflict_resolution {
                             ConflictResolution::FirstWins => false,
                             ConflictResolution::HighestConfidence => {
@@ -736,7 +737,7 @@ impl Transformer for FieldMapperTransformer {
         }
 
         // Record transformation completion
-        let duration = start.elapsed().as_secs_f64();
+        let _duration = start.elapsed().as_secs_f64();
         // self.metrics.record_transformation(dataset_id, duration, true);
 
         Ok(())
@@ -798,6 +799,7 @@ enum MappingSource {
 }
 
 /// Conflict resolution strategy when multiple source fields map to same target
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 enum ConflictResolution {
     /// Use the first mapping encountered (default)
@@ -823,66 +825,7 @@ impl Default for ConflictResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::manual::{ManualFieldMapping, MappingSuggestion};
     use serde_json::json;
-    use std::sync::Mutex;
-
-    // ========================================================================
-    // Mock Implementations (using trait wrapper pattern)
-    // ========================================================================
-
-    /// Test helper to create mappings for mock data
-    struct TestMappingData {
-        mappings: Mutex<HashMap<String, ManualFieldMapping>>,
-        suggestions: Mutex<HashMap<String, Vec<MappingSuggestion>>>,
-    }
-
-    impl TestMappingData {
-        fn new() -> Self {
-            Self {
-                mappings: Mutex::new(HashMap::new()),
-                suggestions: Mutex::new(HashMap::new()),
-            }
-        }
-
-        fn add_mapping(&self, key: String, mapping: ManualFieldMapping) {
-            self.mappings.lock().unwrap().insert(key, mapping);
-        }
-
-        fn add_suggestion(&self, field_name: String, suggestions: Vec<MappingSuggestion>) {
-            self.suggestions
-                .lock()
-                .unwrap()
-                .insert(field_name, suggestions);
-        }
-
-        fn get_mappings(
-            &self,
-            contexts: &[SourceContext],
-        ) -> Result<HashMap<String, ManualFieldMapping>> {
-            let mappings = self.mappings.lock().unwrap();
-            let mut results = HashMap::new();
-
-            for ctx in contexts {
-                let key = format!(
-                    "{}:{}:{}",
-                    ctx.source_id.as_ref().unwrap_or(&"".to_string()),
-                    ctx.table_name,
-                    ctx.field_name
-                );
-                if let Some(mapping) = mappings.get(&key) {
-                    results.insert(ctx.field_name.clone(), mapping.clone());
-                }
-            }
-
-            Ok(results)
-        }
-
-        fn get_suggestions(&self, field_name: &str) -> Vec<MappingSuggestion> {
-            let suggestions = self.suggestions.lock().unwrap();
-            suggestions.get(field_name).cloned().unwrap_or_default()
-        }
-    }
 
     // ========================================================================
     // Helper Functions
@@ -916,7 +859,7 @@ mod tests {
         /// Test apply_mappings logic
         fn apply_mappings(
             &self,
-            dataset_id: &str,
+            _dataset_id: &str,
             rows: &[JsonValue],
             mappings: &HashMap<String, MappingInfo>,
         ) -> Result<Vec<JsonValue>> {
@@ -956,7 +899,7 @@ mod tests {
                     if let Some(mapping) = mappings.get(source_field) {
                         let target = &mapping.target;
 
-                        if let Some((prev_source, prev_confidence)) = target_usage.get(target) {
+                        if let Some((_prev_source, prev_confidence)) = target_usage.get(target) {
                             let should_replace = match conflict_resolution {
                                 ConflictResolution::FirstWins => false,
                                 ConflictResolution::HighestConfidence => {
@@ -1005,38 +948,6 @@ mod tests {
             }
 
             Ok(())
-        }
-    }
-
-    fn create_manual_mapping(id: &str, target_uri: &str, confidence: f64) -> ManualFieldMapping {
-        use crate::mapping::manual::UsageStats;
-
-        let now = chrono::Utc::now();
-        ManualFieldMapping {
-            id: id.to_string(),
-            target_field_uri: target_uri.to_string(),
-            confidence,
-            created_at: now,
-            created_by: "test".to_string(),
-            updated_at: now,
-            notes: None,
-            usage_stats: UsageStats::default(),
-            source_context: SourceContext {
-                source_id: None,
-                table_name: "".to_string(),
-                field_name: "".to_string(),
-                field_metadata: None,
-            },
-        }
-    }
-
-    fn create_suggestion(mapping: ManualFieldMapping, score: f64) -> MappingSuggestion {
-        use crate::mapping::manual::SuggestionReason;
-
-        MappingSuggestion {
-            mapping,
-            relevance_score: score,
-            suggestion_reason: SuggestionReason::SimilarFieldName { similarity: score },
         }
     }
 

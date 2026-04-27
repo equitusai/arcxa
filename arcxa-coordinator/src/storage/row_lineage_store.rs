@@ -560,7 +560,9 @@ impl RowLevelLineageSink for RowLineageStore {
         }
 
         let cf_by_row = self.cf(cf::BY_ROW)?;
-        let iter = self.db.iterator_cf(&cf_by_row, rocksdb::IteratorMode::Start);
+        let iter = self
+            .db
+            .iterator_cf(&cf_by_row, rocksdb::IteratorMode::Start);
 
         let mut exact_matches = Vec::new();
         let mut prefix_matches = Vec::new();
@@ -589,9 +591,8 @@ impl RowLevelLineageSink for RowLineageStore {
 
             total_matches += 1;
 
-            let within_limit =
-                seen.insert(row_key.clone())
-                    && exact_matches.len() + prefix_matches.len() + contains_matches.len() < limit;
+            let within_limit = seen.insert(row_key.clone())
+                && exact_matches.len() + prefix_matches.len() + contains_matches.len() < limit;
 
             if within_limit {
                 match Self::decode_row_id(row_key.as_bytes()) {
@@ -1342,7 +1343,9 @@ mod tests {
 
         assert!(!matches.is_empty());
         assert_eq!(matches[0].to_key(), oracle_row.to_key());
-        assert!(matches.iter().all(|row_id| row_id.to_key().contains("CUSTOMER")));
+        assert!(matches
+            .iter()
+            .all(|row_id| row_id.to_key().contains("CUSTOMER")));
 
         Ok(())
     }

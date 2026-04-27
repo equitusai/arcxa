@@ -7,7 +7,7 @@ use anyhow::Result;
 use prometheus::{Encoder, Registry, TextEncoder};
 
 use super::{
-    ApiMetrics, ErrorMetrics, LoaderMetrics, RdfMetrics, ShardMetrics, SystemMetrics,
+    ApiMetrics, ErrorMetrics, LoaderMetrics, RdfMetrics, ShardMetrics, SosMetrics, SystemMetrics,
     WorkflowMetrics,
 };
 
@@ -24,6 +24,7 @@ pub struct MetricsRegistry {
     pub error: ErrorMetrics,
     pub loader: LoaderMetrics,
     pub workflow: WorkflowMetrics,
+    pub sos: SosMetrics,
 }
 
 impl MetricsRegistry {
@@ -40,6 +41,7 @@ impl MetricsRegistry {
         let error = ErrorMetrics::new(&registry)?;
         let loader = LoaderMetrics::new(&registry)?;
         let workflow = WorkflowMetrics::new(&registry)?;
+        let sos = SosMetrics::new(&registry)?;
 
         Ok(Self {
             registry,
@@ -50,6 +52,7 @@ impl MetricsRegistry {
             error,
             loader,
             workflow,
+            sos,
         })
     }
 

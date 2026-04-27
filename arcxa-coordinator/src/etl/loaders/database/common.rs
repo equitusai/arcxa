@@ -9,7 +9,12 @@ fn validate_postgres_identifier(identifier: &str, identifier_type: &str) -> Resu
     use graphica_core::security::validate_identifier;
 
     validate_identifier(identifier).map_err(|e| {
-        anyhow::anyhow!("Invalid PostgreSQL {} '{}': {}", identifier_type, identifier, e)
+        anyhow::anyhow!(
+            "Invalid PostgreSQL {} '{}': {}",
+            identifier_type,
+            identifier,
+            e
+        )
     })?;
     Ok(())
 }

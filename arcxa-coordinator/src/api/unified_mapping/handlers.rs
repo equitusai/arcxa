@@ -1424,7 +1424,7 @@ pub async fn list_unified_sessions(
         })?;
 
     // Apply filters
-    let mut filtered: Vec<_> = all_sessions
+    let filtered: Vec<_> = all_sessions
         .into_iter()
         .filter(|session| {
             // Filter by status if specified
@@ -1966,7 +1966,7 @@ pub async fn load_to_database(
         // Actual database loading logic
         let result = std::panic::AssertUnwindSafe(async {
             use crate::mapping::loader::postgres_bulk::{
-                LoadMode as PgLoadMode, PostgreSQLBulkConfig, PostgreSQLBulkLoader,
+                MappingPostgresBulkLoader, PgBulkLoadMode, PostgreSQLBulkConfig,
             };
 
             let effective_session = build_effective_load_session(&session_clone);
@@ -1997,7 +1997,7 @@ pub async fn load_to_database(
                                     "Resolved PostgreSQL target datasource connection string missing"
                                 )
                             })?,
-                        load_mode: PgLoadMode::Copy, // Use high-performance COPY
+                        load_mode: PgBulkLoadMode::Copy, // Use high-performance COPY
                         batch_size,
                         create_tables,
                         drop_existing: false,
@@ -2008,7 +2008,9 @@ pub async fn load_to_database(
                     };
 
                     // Create loader with database connection
-                    let loader = PostgreSQLBulkLoader::new(bulk_config).await.map_err(|e| {
+                    let loader = MappingPostgresBulkLoader::new(bulk_config)
+                        .await
+                        .map_err(|e| {
                         anyhow::anyhow!("Failed to create PostgreSQL loader: {}", e)
                     })?;
 
@@ -2695,7 +2697,7 @@ mod tests {
     };
     use graphica_core::catalog::client::{DataSourceCatalog, UsageStatistics};
     use graphica_core::catalog::types::{
-        ConnectionDetails, DataSource, DatabricksConfig, PostgreSQLConfig, SourceConfig,
+        ConnectionDetails, DataSource, PostgreSQLConfig, SourceConfig,
     };
     use graphica_core::errors::GraphicaError;
     use std::collections::HashMap;
@@ -2715,11 +2717,6 @@ mod tests {
                 sources: HashMap::new(),
                 query_rows: HashMap::new(),
             }
-        }
-
-        fn with_source(mut self, source: DataSourceResponse) -> Self {
-            self.sources.insert(source.source.id.clone(), source);
-            self
         }
 
         fn with_query_rows(mut self, datasource_id: &str, rows: Vec<serde_json::Value>) -> Self {
@@ -3353,7 +3350,7 @@ mod tests {
     async fn test_binding_coverage_diff_reports_unmapped_and_covered() {
         let state = create_plan_test_state();
 
-        upsert_ontology_bindings(
+        let _ = upsert_ontology_bindings(
             State(state.clone()),
             Json(UpsertOntologyBindingsRequest {
                 source_id: "source-a".to_string(),
@@ -3410,7 +3407,7 @@ mod tests {
         let state = create_plan_test_state();
 
         // Seed stored binding used by planning.
-        upsert_ontology_bindings(
+        let _ = upsert_ontology_bindings(
             State(state.clone()),
             Json(UpsertOntologyBindingsRequest {
                 source_id: "source-a".to_string(),

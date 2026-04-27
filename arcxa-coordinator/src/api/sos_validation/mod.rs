@@ -32,20 +32,38 @@
 //! ### Data Contracts
 //! - `POST /api/v1/sos/contracts` - Create a data contract
 //! - `GET /api/v1/sos/contracts` - List all contracts
+//! - `GET /api/v1/sos/contracts/lookup` - Get contract by provider/consumer interface pair
 //! - `GET /api/v1/sos/contracts/{id}` - Get contract by ID
 //! - `PUT /api/v1/sos/contracts/{id}` - Update contract
 //! - `DELETE /api/v1/sos/contracts/{id}` - Delete contract
+//! - `POST /api/v1/sos/contracts/{id}/approval-requests` - Open a contract approval request
+//! - `GET /api/v1/sos/contracts/{id}/approval-requests` - List contract approval requests
+//! - `GET /api/v1/sos/contracts/{id}/approval-requests/{request_id}` - Get contract approval request
+//! - `POST /api/v1/sos/contracts/{id}/approval-requests/{request_id}/evidence` - Attach contract approval evidence
+//! - `POST /api/v1/sos/contracts/{id}/approval-requests/{request_id}/approve` - Approve contract approval request
+//! - `POST /api/v1/sos/contracts/{id}/approval-requests/{request_id}/reject` - Reject contract approval request
 //! - `POST /api/v1/sos/contracts/{id}/approve` - Approve contract
 //! - `POST /api/v1/sos/contracts/{id}/sign` - Sign contract
 //!
 //! ### Validation
 //! - `POST /api/v1/sos/validate` - Execute validation
 //! - `POST /api/v1/sos/validate/dry-run` - Dry-run validation
+//! - `POST /api/v1/sos/policies` - Create a persisted policy
+//! - `GET /api/v1/sos/policies` - List persisted policies
+//! - `GET /api/v1/sos/policies/{id}` - Get policy by ID
+//! - `PUT /api/v1/sos/policies/{id}` - Update policy
+//! - `DELETE /api/v1/sos/policies/{id}` - Delete policy
+//! - `POST /api/v1/sos/policies/{id}/validate` - Evaluate a persisted policy
+//! - `POST /api/v1/sos/policies/{id}/validate/dry-run` - Dry-run a persisted policy
+//! - `GET /api/v1/sos/validation-reports/{report_id}` - Get persisted validation report
+//! - `GET /api/v1/sos/validation-history` - Get validation history for a normalized subject
+//! - `GET /api/v1/sos/validation-lineage` - Traverse validation report lineage
 //!
 //! ### Analytics
 //! - `GET /api/v1/sos/compatibility-matrix` - Get compatibility matrix
 //! - `GET /api/v1/sos/dependency-graph` - Get dependency graph
 //! - `POST /api/v1/sos/what-if` - What-if analysis
+//! - `POST /api/v1/sos/reconcile` - Explicitly rerun SoS ontology/graph reconcile
 //!
 //! ## Usage Example
 //!
@@ -95,7 +113,10 @@ pub mod openapi;
 pub mod types;
 
 // Submodules for implementation (to be created)
+pub(crate) mod contract_governance;
+pub(crate) mod contract_signature;
 pub mod integration;
+pub(crate) mod policy_attestation;
 pub mod storage;
 pub mod validators;
 
@@ -109,6 +130,7 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use crate::api::ApiState;
 pub use openapi::SosValidationApiDoc;
+pub use policy_attestation::PolicyAttestationSigningMaterial;
 
 /// Create SoS validation API router
 ///
@@ -150,9 +172,46 @@ pub fn create_router() -> Router<Arc<ApiState>> {
         // ===== Data Contract Routes =====
         .route("/sos/contracts", post(handlers::create_contract))
         .route("/sos/contracts", get(handlers::list_contracts))
+        .route("/sos/contracts/lookup", get(handlers::lookup_contract))
+        .route(
+            "/sos/contracts/signing-key",
+            get(handlers::get_contract_signing_key_status),
+        )
+        .route(
+            "/sos/contracts/signing-key/rotate",
+            post(handlers::rotate_contract_signing_key),
+        )
         .route("/sos/contracts/:id", get(handlers::get_contract))
         .route("/sos/contracts/:id", put(handlers::update_contract))
         .route("/sos/contracts/:id", delete(handlers::delete_contract))
+        .route(
+            "/sos/contracts/:id/signatures",
+            get(handlers::list_contract_signatures),
+        )
+        .route(
+            "/sos/contracts/:id/approval-requests",
+            post(handlers::create_contract_approval_request),
+        )
+        .route(
+            "/sos/contracts/:id/approval-requests",
+            get(handlers::list_contract_approval_requests),
+        )
+        .route(
+            "/sos/contracts/:id/approval-requests/:request_id",
+            get(handlers::get_contract_approval_request),
+        )
+        .route(
+            "/sos/contracts/:id/approval-requests/:request_id/evidence",
+            post(handlers::add_contract_approval_evidence),
+        )
+        .route(
+            "/sos/contracts/:id/approval-requests/:request_id/approve",
+            post(handlers::approve_contract_approval_request),
+        )
+        .route(
+            "/sos/contracts/:id/approval-requests/:request_id/reject",
+            post(handlers::reject_contract_approval_request),
+        )
         .route(
             "/sos/contracts/:id/approve",
             post(handlers::approve_contract),
@@ -161,6 +220,69 @@ pub fn create_router() -> Router<Arc<ApiState>> {
         // ===== Validation Routes =====
         .route("/sos/validate", post(handlers::validate))
         .route("/sos/validate/dry-run", post(handlers::validate_dry_run))
+        .route("/sos/policies", post(handlers::create_policy))
+        .route("/sos/policies", get(handlers::list_policies))
+        .route(
+            "/sos/policies/signing-key",
+            get(handlers::get_policy_signing_key_status),
+        )
+        .route(
+            "/sos/policies/signing-key/rotate",
+            post(handlers::rotate_policy_signing_key),
+        )
+        .route("/sos/policies/:id", get(handlers::get_policy))
+        .route("/sos/policies/:id", put(handlers::update_policy))
+        .route("/sos/policies/:id", delete(handlers::delete_policy))
+        .route(
+            "/sos/policies/:id/attestations",
+            get(handlers::list_policy_attestations),
+        )
+        .route(
+            "/sos/policies/:id/approval-requests",
+            post(handlers::create_policy_approval_request),
+        )
+        .route(
+            "/sos/policies/:id/approval-requests",
+            get(handlers::list_policy_approval_requests),
+        )
+        .route(
+            "/sos/policies/:id/approval-requests/:request_id",
+            get(handlers::get_policy_approval_request),
+        )
+        .route(
+            "/sos/policies/:id/approval-requests/:request_id/evidence",
+            post(handlers::add_policy_approval_evidence),
+        )
+        .route(
+            "/sos/policies/:id/approval-requests/:request_id/approve",
+            post(handlers::approve_policy_approval_request),
+        )
+        .route(
+            "/sos/policies/:id/approval-requests/:request_id/reject",
+            post(handlers::reject_policy_approval_request),
+        )
+        .route("/sos/policies/:id/approve", post(handlers::approve_policy))
+        .route("/sos/policies/:id/reject", post(handlers::reject_policy))
+        .route(
+            "/sos/policies/:id/validate",
+            post(handlers::validate_policy),
+        )
+        .route(
+            "/sos/policies/:id/validate/dry-run",
+            post(handlers::validate_policy_dry_run),
+        )
+        .route(
+            "/sos/validation-reports/:report_id",
+            get(handlers::get_validation_report),
+        )
+        .route(
+            "/sos/validation-history",
+            get(handlers::get_validation_history),
+        )
+        .route(
+            "/sos/validation-lineage",
+            get(handlers::get_validation_lineage),
+        )
         // ===== Analytics Routes =====
         .route(
             "/sos/compatibility-matrix",
@@ -168,4 +290,5 @@ pub fn create_router() -> Router<Arc<ApiState>> {
         )
         .route("/sos/dependency-graph", get(handlers::get_dependency_graph))
         .route("/sos/what-if", post(handlers::what_if_analysis))
+        .route("/sos/reconcile", post(handlers::reconcile_sos_runtime))
 }

@@ -5,9 +5,11 @@
 //! ## Available Commands
 //!
 //! - **migrate**: Database migration tool for upgrading storage formats
-//! - **admin**: Administrative operations (future)
+//! - **admin**: Operator-facing coordinator administration
 //! - **backup**: Backup and restore utilities (future)
 //! - **validate**: Workflow and configuration validation (future)
+
+pub mod sos;
 
 /// Common CLI utilities and helpers
 pub mod utils {

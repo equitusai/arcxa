@@ -35,8 +35,8 @@
 //! ```
 
 use crate::workflows::domain::{
-    Action, ActionResult, ExecutionLog, ExecutionMode, ExecutionStatus, StateBackendConfig,
-    StreamingConfig, WatermarkStrategy, Workflow, WorkflowExecution,
+    Action, ExecutionLog, ExecutionMode, ExecutionStatus, StateBackendConfig, StreamingConfig,
+    WatermarkStrategy, Workflow, WorkflowExecution,
 };
 use crate::workflows::engine::transformers::TransformerRegistry;
 use crate::workflows::engine::{ActionExecutor, ExecutionContext, KafkaSource, WorkflowRouter};
@@ -45,9 +45,7 @@ use crate::workflows::storage::{ExecutionStore, WorkflowStore};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::BorrowedMessage;
-use rocksdb::DB;
+use rdkafka::consumer::Consumer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -55,16 +53,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use timely::dataflow::operators::{Input as TimelyInput, Inspect, Map, Probe};
-use timely::dataflow::{InputHandle, ProbeHandle};
-use timely::{Config, WorkerConfig};
+use timely::dataflow::operators::Input;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// Stream executor for real-time workflow processing
 pub struct StreamExecutor {
     /// Workflow definitions
-    workflow_store: Arc<WorkflowStore>,
+    _workflow_store: Arc<WorkflowStore>,
 
     /// Workflow execution tracking
     execution_store: Arc<ExecutionStore>,
@@ -111,9 +107,6 @@ pub struct StreamMetrics {
     /// Current watermark as epoch milliseconds (-1 if None)
     watermark_epoch_ms: AtomicI64,
 
-    /// Last update timestamp (for throughput calculation)
-    last_update: RwLock<Instant>,
-
     /// Start time for throughput calculation
     start_time: Instant,
 }
@@ -127,7 +120,6 @@ impl StreamMetrics {
             avg_latency_ms: AtomicU64::new(0),
             lag: AtomicU64::new(0),
             watermark_epoch_ms: AtomicI64::new(-1),
-            last_update: RwLock::new(Instant::now()),
             start_time: Instant::now(),
         }
     }
@@ -305,7 +297,7 @@ impl StreamExecutor {
     /// Create a new stream executor
     pub fn new(workflow_store: Arc<WorkflowStore>, execution_store: Arc<ExecutionStore>) -> Self {
         Self {
-            workflow_store,
+            _workflow_store: workflow_store,
             execution_store,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             rule_executor: None,
@@ -324,7 +316,7 @@ impl StreamExecutor {
         rule_executor: Arc<graphica_core::orchestration::rules::RuleExecutor>,
     ) -> Self {
         Self {
-            workflow_store,
+            _workflow_store: workflow_store,
             execution_store,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             rule_executor: Some(rule_executor),
@@ -525,14 +517,15 @@ impl StreamExecutor {
     /// Run the Timely/Differential dataflow computation
     ///
     /// This is the core streaming execution engine.
+    #[allow(dead_code)]
     async fn run_streaming_dataflow(
         workflow: Workflow,
         config: StreamingConfig,
-        state_path: Option<PathBuf>,
+        _state_path: Option<PathBuf>,
         num_workers: usize,
         cancellation_token: tokio_util::sync::CancellationToken,
         execution_store: Arc<ExecutionStore>,
-        workflow_store: Arc<WorkflowStore>,
+        _workflow_store: Arc<WorkflowStore>,
         rule_executor: Option<Arc<graphica_core::orchestration::rules::RuleExecutor>>,
         metrics: Arc<StreamMetrics>,
     ) -> Result<()> {
@@ -601,20 +594,21 @@ impl StreamExecutor {
     }
 
     /// Run the Timely computation with dataflow operators
+    #[allow(dead_code)]
     async fn run_timely_computation(
         workflow: Workflow,
         config: StreamingConfig,
         kafka_source: Arc<KafkaSource>,
         partition_assignment: HashMap<usize, Vec<i32>>,
         cancellation_token: tokio_util::sync::CancellationToken,
-        execution_store: Arc<ExecutionStore>,
+        _execution_store: Arc<ExecutionStore>,
         rule_executor: Option<Arc<graphica_core::orchestration::rules::RuleExecutor>>,
         metrics: Arc<StreamMetrics>,
     ) -> Result<()> {
         let workflow_id = workflow.id.clone();
         let workflow_id_for_logging = workflow_id.clone();
         let partition_assignment_for_shutdown = partition_assignment.clone();
-        let checkpoint_interval = Duration::from_millis(config.checkpoint_interval_ms);
+        let _checkpoint_interval = Duration::from_millis(config.checkpoint_interval_ms);
 
         info!(
             "Building Timely dataflow graph for workflow: {}",
@@ -670,8 +664,7 @@ impl StreamExecutor {
 
                         // Placeholder: In production, this would be a Kafka source operator
                         // that polls from the assigned partitions
-                        use timely::dataflow::operators::generic::operator::source;
-                        let (mut input_handle, stream) = scope.new_input::<(String, JsonValue)>();
+                        let (input_handle, stream) = scope.new_input::<(String, JsonValue)>();
 
                         // Clone Arc for routing operator
                         let workflow_for_routing = workflow.clone();
@@ -906,14 +899,6 @@ impl StreamExecutor {
         state_path: Option<PathBuf>,
         runtime: StreamRuntimeSummary,
     ) -> Result<StreamHandle> {
-        use crate::workflows::domain::DebeziumEvent;
-        use crate::workflows::integration::{HttpClient, KafkaProducer};
-        use crate::workflows::lineage::WorkflowLineageGenerator;
-        use rdkafka::consumer::stream_consumer::StreamConsumer;
-        use rdkafka::message::Message;
-        use rdkafka::Message as KafkaMessage;
-        use uuid::Uuid;
-
         info!(
             "Starting simple streaming loop for workflow: {} (topic: {}, brokers: {:?})",
             workflow.id, kafka_topic, kafka_brokers
@@ -1025,10 +1010,8 @@ impl StreamExecutor {
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         use crate::workflows::domain::DebeziumEvent;
-        use crate::workflows::integration::{HttpClient, KafkaProducer};
         use rdkafka::consumer::stream_consumer::StreamConsumer;
         use rdkafka::message::Message;
-        use rdkafka::Message as KafkaMessage;
         use uuid::Uuid;
 
         // Create Kafka consumer
@@ -1585,9 +1568,8 @@ impl Clone for StreamHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflows::domain::{Action, Condition, ExecutionMode, Route, Workflow};
+    use crate::workflows::domain::{Action, Condition, Route, Workflow};
     use crate::workflows::storage::{ExecutionStore, WorkflowStore};
-    use std::time::Duration as StdDuration;
 
     #[test]
     fn test_stream_metrics_creation() {
@@ -1681,7 +1663,7 @@ mod tests {
         assert!(snapshot.avg_latency_ms < 500);
     }
 
-    fn create_test_workflow(id: &str, topic: &str) -> Workflow {
+    fn create_test_workflow(id: &str, _topic: &str) -> Workflow {
         let route = Route::with_priority(
             "rt_001",
             "test_route",
@@ -1692,19 +1674,6 @@ mod tests {
             }],
             10,
         );
-
-        let streaming_config = StreamingConfig {
-            source_topic: topic.to_string(),
-            consumer_group: format!("{}_group", id),
-            checkpoint_interval_ms: 60000,
-            watermark_strategy: WatermarkStrategy::BoundedOutOfOrderness {
-                max_out_of_orderness_ms: 30000,
-            },
-            max_parallel_workers: Some(2),
-            state_backend: StateBackendConfig::Memory,
-            auto_scaling: None,
-            kafka_properties: HashMap::new(),
-        };
 
         Workflow::new(id, format!("Test Workflow {}", id), vec![route])
             .with_description("Test streaming workflow")

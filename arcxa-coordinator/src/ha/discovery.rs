@@ -4,14 +4,14 @@
 //! to find the current leader coordinator.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::net::lookup_host;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Service discovery method
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +168,7 @@ impl ServiceDiscovery {
         );
 
         // Format SRV record name
-        let srv_name = format!("_{}._{}.{}", service, "tcp", domain);
+        let _srv_name = format!("_{}._{}.{}", service, "tcp", domain);
 
         // TODO: Implement actual SRV record lookup
         // For now, use A record lookup as fallback
@@ -236,8 +236,8 @@ impl ServiceDiscovery {
         port: u16,
     ) -> Result<Vec<CoordinatorInstance>> {
         info!(
-            "Discovering coordinators via Kubernetes: {}/{}",
-            namespace, service
+            "Discovering coordinators via Kubernetes: {}/{}:{}",
+            namespace, service, port
         );
 
         // TODO: Implement Kubernetes service discovery
@@ -256,7 +256,11 @@ impl ServiceDiscovery {
         service_name: &str,
         datacenter: Option<&str>,
     ) -> Result<Vec<CoordinatorInstance>> {
-        info!("Discovering coordinators via Consul: {}", service_name);
+        info!(
+            "Discovering coordinators via Consul: {} (datacenter: {})",
+            service_name,
+            datacenter.unwrap_or("default")
+        );
 
         // TODO: Implement Consul service discovery
         // This would involve:
@@ -274,7 +278,11 @@ impl ServiceDiscovery {
         endpoints: &[String],
         prefix: &str,
     ) -> Result<Vec<CoordinatorInstance>> {
-        info!("Discovering coordinators via Etcd: {}", prefix);
+        info!(
+            "Discovering coordinators via Etcd: {} via {} endpoints",
+            prefix,
+            endpoints.len()
+        );
 
         // TODO: Implement Etcd service discovery
         // This would involve:
@@ -290,6 +298,7 @@ impl ServiceDiscovery {
     async fn check_health(&self, address: &SocketAddr) -> Result<()> {
         // TODO: Implement actual health check
         // This would involve making an HTTP request to /health endpoint
+        debug!("Performing placeholder health check against {}", address);
 
         // Simulate health check
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -300,6 +309,10 @@ impl ServiceDiscovery {
     async fn query_leader_status(&self, address: &SocketAddr) -> Result<bool> {
         // TODO: Implement actual leader status query
         // This would involve making an RPC call to the coordinator
+        debug!(
+            "Performing placeholder leader-status check against {}",
+            address
+        );
 
         // Simulate query
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -330,6 +343,10 @@ impl ServiceDiscovery {
         instance: &CoordinatorInstance,
     ) -> Result<()> {
         // TODO: Implement Consul registration
+        debug!(
+            "Placeholder Consul registration for service {} and instance {}",
+            service_name, instance.node_id
+        );
         Ok(())
     }
 
@@ -341,6 +358,12 @@ impl ServiceDiscovery {
         instance: &CoordinatorInstance,
     ) -> Result<()> {
         // TODO: Implement Etcd registration
+        debug!(
+            "Placeholder Etcd registration for prefix {} across {} endpoints (instance {})",
+            prefix,
+            endpoints.len(),
+            instance.node_id
+        );
         Ok(())
     }
 }
@@ -445,6 +468,15 @@ impl CoordinatorClient {
             .unwrap()
             .as_ref()
             .map(|c| c.instance.address)
+    }
+
+    /// How long the current leader connection has been active.
+    pub fn connection_uptime(&self) -> Option<Duration> {
+        self.current_connection
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.connected_at.elapsed())
     }
 
     /// Handle leader change (reconnect)

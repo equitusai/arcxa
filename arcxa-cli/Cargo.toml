@@ -10,12 +10,21 @@ description = "Command-line tools for the ARCXA data governance platform"
 name = "graphica_cli"
 path = "src/lib.rs"
 
+[features]
+default = ["migrate"]
+migrate = ["dep:graphica-migrations", "dep:rocksdb"]
+
 [[bin]]
 name = "migrate"
 path = "src/bin/migrate.rs"
+required-features = ["migrate"]
+
+[[bin]]
+name = "admin"
+path = "src/bin/admin.rs"
 
 [dependencies]
-graphica-migrations = { package = "arcxa-migrations", path = "../arcxa-migrations" }
+graphica-migrations = { package = "arcxa-migrations", path = "../arcxa-migrations", optional = true }
 
 # Core utilities
 anyhow = "1.0"
@@ -32,5 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Async runtime / HTTP
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
 # Storage (for migrate tool)
-rocksdb = "0.22"
+rocksdb = { workspace = true, optional = true }

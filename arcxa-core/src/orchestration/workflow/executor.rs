@@ -56,6 +56,7 @@ mod prediction_extraction;
 mod row_extraction;
 mod rule_steps;
 mod semantic_mapper_step;
+mod sos_validation_step;
 mod state;
 mod step_bookkeeping;
 mod step_execution;
@@ -159,12 +160,47 @@ pub type DbExtractCallback = Box<
         + Sync,
 >;
 
+/// Single SoS validation check emitted by the coordinator callback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SosValidationCheck {
+    pub check_name: String,
+    pub passed: bool,
+    pub severity: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+/// Result returned by a SoS validation callback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SosValidationStepResult {
+    pub validation_id: String,
+    pub passed: bool,
+    pub checks: Vec<SosValidationCheck>,
+    pub confidence: f64,
+    pub validated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+}
+
+/// SoS validation callback signature.
+pub type SosValidationCallback = Box<
+    dyn Fn(
+            &SosValidationConfig,
+            &ExecutionContext,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<SosValidationStepResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[cfg(test)]
 use self::state::{
     ExecuteLoopOutcome, ExecuteLoopState, WorkflowExecutionSession, WorkflowRunState,
 };
 use super::dag::DagExecutor;
-use super::definition::{StepConfig, StepType, WorkflowDefinition, WorkflowStep};
+use super::definition::{
+    SosValidationConfig, StepConfig, StepType, WorkflowDefinition, WorkflowStep,
+};
 #[cfg(test)]
 use super::lineage_tracker::StepExecutionRecord;
 use super::lineage_tracker::{FieldModificationRecord, LineageTracker, WorkflowExecutionRecord};
@@ -220,6 +256,8 @@ pub struct WorkflowExecutor {
     /// into the core's WorkflowExecutor, enabling DbExtract steps to run
     /// without creating a dependency from core to coordinator.
     db_extract_callback: Option<Arc<DbExtractCallback>>,
+    /// Optional Systems-of-Systems validation callback (injected by coordinator).
+    sos_validation_callback: Option<Arc<SosValidationCallback>>,
 }
 
 impl WorkflowExecutor {
@@ -240,6 +278,7 @@ impl WorkflowExecutor {
             transformer_callback: None,
             db_loader_callback: None,
             db_extract_callback: None,
+            sos_validation_callback: None,
         })
     }
 
@@ -261,6 +300,7 @@ impl WorkflowExecutor {
             transformer_callback: None,
             db_loader_callback: None,
             db_extract_callback: None,
+            sos_validation_callback: None,
         })
     }
 
@@ -305,6 +345,12 @@ impl WorkflowExecutor {
     /// extract data without creating a dependency from core to coordinator.
     pub fn with_db_extract_callback(mut self, callback: Arc<DbExtractCallback>) -> Self {
         self.db_extract_callback = Some(callback);
+        self
+    }
+
+    /// Set a Systems-of-Systems validation callback for backend/API-driven checks.
+    pub fn with_sos_validation_callback(mut self, callback: Arc<SosValidationCallback>) -> Self {
+        self.sos_validation_callback = Some(callback);
         self
     }
 

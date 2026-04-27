@@ -24,4 +24,9 @@ pub mod manager;
 pub mod rocks_store;
 
 pub use manager::SosStorageManager;
-pub use rocks_store::{Contract, Interface, SlaMetric, SosStore, System};
+pub use rocks_store::{
+    Contract, ContractApprovalEvidenceRecord, ContractApprovalRequestRecord,
+    ContractSignatureRecord, Interface, PolicyApprovalEvidenceRecord, PolicyApprovalRequestRecord,
+    PolicyAttestationRecord, SlaMetric, SosPolicy, SosStore, System, ValidationChangeSummary,
+    ValidationCheckRecord, ValidationReport,
+};

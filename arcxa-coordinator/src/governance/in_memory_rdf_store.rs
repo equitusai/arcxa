@@ -449,6 +449,51 @@ impl InMemoryRdfStore {
         })])
     }
 
+    fn execute_delete_where_update(&self, sparql_update: &str) -> Result<()> {
+        let trimmed = sparql_update.trim();
+        let (prefixes, query_body) = self.parse_prefixes(trimmed);
+        let query_body = query_body.trim();
+        let upper = query_body.to_ascii_uppercase();
+
+        if !upper.starts_with("DELETE WHERE") {
+            return Err(anyhow!(
+                "Unsupported SPARQL UPDATE for in-memory store: {}",
+                sparql_update
+            ));
+        }
+
+        let delete_body = &query_body["DELETE WHERE".len()..];
+        let where_body = self.extract_where_body(delete_body)?;
+        let (graph, pattern_source) = self.parse_optional_graph_clause(where_body)?;
+        let pattern = self.parse_triple_pattern(pattern_source, &prefixes)?;
+
+        let mut store = self
+            .triples
+            .write()
+            .map_err(|e| anyhow!("Failed to acquire write lock: {}", e))?;
+
+        let graphs_to_search: Vec<String> = if let Some(graph_uri) = graph {
+            vec![graph_uri]
+        } else {
+            store.keys().cloned().collect()
+        };
+
+        for graph_uri in graphs_to_search {
+            let mut remove_graph = false;
+
+            if let Some(graph_triples) = store.get_mut(&graph_uri) {
+                graph_triples.retain(|triple| !self.triple_matches_query(&pattern, triple));
+                remove_graph = graph_triples.is_empty();
+            }
+
+            if remove_graph {
+                store.remove(&graph_uri);
+            }
+        }
+
+        Ok(())
+    }
+
     fn triple_matches_query(&self, pattern: &SimpleTriplePattern, triple: &Triple) -> bool {
         self.term_matches(&pattern.subject, &triple.subject, TriplePosition::Subject)
             && self.term_matches(
@@ -844,9 +889,13 @@ impl RdfStore for InMemoryRdfStore {
 
     fn update(&self, sparql_update: &str) -> Result<()> {
         // Very basic UPDATE support for testing
-        // Just parse INSERT DATA blocks
+        let upper = sparql_update.to_ascii_uppercase();
 
-        if sparql_update.contains("INSERT DATA") {
+        if upper.contains("DELETE WHERE") {
+            return self.execute_delete_where_update(sparql_update);
+        }
+
+        if upper.contains("INSERT DATA") {
             // Extract the data block and parse as Turtle
             if let Some(start) = sparql_update.find('{') {
                 if let Some(end) = sparql_update.rfind('}') {

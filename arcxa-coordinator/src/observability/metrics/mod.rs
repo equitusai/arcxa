@@ -9,6 +9,7 @@
 //! - `error`: Error tracking and categorization
 //! - `loader`: ETL loader operations and performance metrics
 //! - `workflow`: Workflow execution and action metrics
+//! - `sos`: Systems-of-Systems validation metrics
 
 pub mod api;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod loader;
 pub mod rdf;
 pub mod registry;
 pub mod shard;
+pub mod sos;
 pub mod system;
 pub mod workflow;
 
@@ -25,5 +27,6 @@ pub use loader::LoaderMetrics;
 pub use rdf::RdfMetrics;
 pub use registry::MetricsRegistry;
 pub use shard::ShardMetrics;
+pub use sos::SosMetrics;
 pub use system::SystemMetrics;
 pub use workflow::WorkflowMetrics;

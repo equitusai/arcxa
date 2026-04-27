@@ -125,7 +125,12 @@ impl RowLevelLineageSink for MockRowLineageStore {
         for row_id in events
             .iter()
             .map(|event| event.row_id.clone())
-            .filter(|row_id| row_id.to_key().to_ascii_lowercase().contains(&normalized_query))
+            .filter(|row_id| {
+                row_id
+                    .to_key()
+                    .to_ascii_lowercase()
+                    .contains(&normalized_query)
+            })
         {
             if row_ids.iter().any(|existing: &RowId| existing == &row_id) {
                 continue;

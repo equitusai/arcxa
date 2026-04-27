@@ -967,6 +967,93 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Initialize Systems-of-Systems validation storage and orchestration service.
+    let sos_storage_manager = {
+        use graphica_coordinator::api::sos_validation::storage::SosStorageManager;
+
+        let sos_enabled = std::env::var("SOS_VALIDATION_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+
+        if sos_enabled {
+            let sos_db_path = std::env::var("SOS_DB_PATH")
+                .unwrap_or_else(|_| "./data/sos-validation-db".to_string());
+
+            info!("Initializing SoS validation storage at: {}", sos_db_path);
+
+            match SosStorageManager::new(&sos_db_path) {
+                Ok(manager) => {
+                    info!(
+                        "SUCCESS: SoS validation RocksDB initialized at {}",
+                        sos_db_path
+                    );
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    warn!("ERROR: Failed to initialize SoS validation storage: {}", e);
+                    warn!("   SoS validation features will not be available");
+                    None
+                }
+            }
+        } else {
+            info!("INFO: SoS validation storage disabled (SOS_VALIDATION_ENABLED=false)");
+            None
+        }
+    };
+
+    let sos_validation_service = sos_storage_manager.as_ref().map(|manager| {
+        let service =
+            graphica_coordinator::api::sos_validation::integration::SosValidationService::new(
+                manager.clone(),
+                Some(rdf_store.clone()),
+                Some(persisted_ontology_registry.clone()),
+            )
+            .with_metrics(
+                app_context
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| metrics.sos.clone()),
+            );
+        Arc::new(service)
+    });
+
+    let sos_startup_recovery =
+        graphica_coordinator::api::sos_validation::integration::perform_startup_recovery(
+            sos_storage_manager.as_ref(),
+            Some(&persisted_ontology_registry),
+            sos_validation_service.as_ref(),
+        )
+        .await;
+
+    if sos_startup_recovery.ontology_sync_attempted {
+        if sos_startup_recovery.ontology_sync_succeeded {
+            info!("SUCCESS: Reconciled SoS ontology and shape assets into persisted registry");
+        } else if let Some(error) = sos_startup_recovery.ontology_sync_error.as_deref() {
+            warn!(
+                "WARNING: Failed to reconcile SoS ontology and shape assets: {}",
+                error
+            );
+        }
+    }
+
+    if sos_startup_recovery.graph_reconcile_attempted {
+        if sos_startup_recovery.graph_reconcile_succeeded {
+            info!("SUCCESS: Reconciled SoS catalog and validation lineage graphs from RocksDB");
+        } else if let Some(error) = sos_startup_recovery.graph_reconcile_error.as_deref() {
+            warn!(
+                "WARNING: Failed to reconcile SoS catalog and validation lineage graphs: {}",
+                error
+            );
+        }
+    }
+
+    let sos_validation_callback = sos_validation_service.as_ref().map(|service| {
+        graphica_coordinator::api::sos_validation::integration::create_sos_validation_callback(
+            service.clone(),
+        )
+    });
+
     // Initialize workflow orchestration components
     info!("Workflow: Initializing workflow orchestration components...");
     let (workflow_engine, model_registry, model_cache, rule_executor) = {
@@ -1018,10 +1105,15 @@ async fn main() -> Result<()> {
         info!("SUCCESS: Rule executor initialized (with WASM engine)");
 
         // Initialize workflow engine with execution capabilities
-        let workflow_engine = Arc::new(WorkflowEngine::new_with_execution(
-            model_invoker,
-            rule_executor.clone(),
-        ));
+        let mut workflow_engine =
+            WorkflowEngine::new_with_execution(model_invoker, rule_executor.clone());
+
+        if let Some(ref callback) = sos_validation_callback {
+            workflow_engine = workflow_engine.with_sos_validation_callback(callback.clone());
+            info!("SUCCESS: Workflow engine wired with SoS validation callback");
+        }
+
+        let workflow_engine = Arc::new(workflow_engine);
         info!("SUCCESS: Workflow engine initialized with execution capabilities");
 
         (
@@ -1590,6 +1682,11 @@ async fn main() -> Result<()> {
                     new_engine = new_engine.with_db_extract_callback(db_extract_callback);
                     info!("SUCCESS: Workflow engine wired with DB extract callback");
 
+                    if let Some(ref callback) = sos_validation_callback {
+                        new_engine = new_engine.with_sos_validation_callback(callback.clone());
+                        info!("SUCCESS: Workflow engine rewired with SoS validation callback");
+                    }
+
                     info!("SUCCESS: Workflow engine wired with lineage tracking");
                     Some(Arc::new(new_engine))
                 } else {
@@ -1864,39 +1961,7 @@ async fn main() -> Result<()> {
             graphica_coordinator::workflows::CancellationManager::new(),
         )),
         // Systems-of-Systems validation storage (high-performance RocksDB backend)
-        sos_storage_manager: {
-            use graphica_coordinator::api::sos_validation::storage::SosStorageManager;
-
-            let sos_enabled = std::env::var("SOS_VALIDATION_ENABLED")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true);
-
-            if sos_enabled {
-                let sos_db_path = std::env::var("SOS_DB_PATH")
-                    .unwrap_or_else(|_| "./data/sos-validation-db".to_string());
-
-                info!("Initializing SoS validation storage at: {}", sos_db_path);
-
-                match SosStorageManager::new(&sos_db_path) {
-                    Ok(manager) => {
-                        info!(
-                            "SUCCESS: SoS validation RocksDB initialized at {}",
-                            sos_db_path
-                        );
-                        Some(Arc::new(manager))
-                    }
-                    Err(e) => {
-                        warn!("ERROR: Failed to initialize SoS validation storage: {}", e);
-                        warn!("   SoS validation features will not be available");
-                        None
-                    }
-                }
-            } else {
-                info!("INFO: SoS validation storage disabled (SOS_VALIDATION_ENABLED=false)");
-                None
-            }
-        },
+        sos_storage_manager: sos_storage_manager.clone(),
         // Schema discovery state manager (Phase 1: Async discovery with progress tracking)
         discovery_state: Some(Arc::new(
             graphica_coordinator::mapping::discovery::DiscoveryStateManager::new(),

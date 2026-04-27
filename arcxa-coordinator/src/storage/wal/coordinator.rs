@@ -3,7 +3,6 @@
 // Orchestrates atomic writes across RocksDB, Kafka, and Parquet
 // using two-phase commit protocol with WAL as transaction log
 
-use async_trait::async_trait;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::storage::{LineageStorage, StorageTier};
+use crate::storage::LineageStorage;
 use graphica_core::core::lineage::LineageEvent;
 
 use super::{
@@ -451,7 +450,7 @@ impl WalCoordinator {
         let mut storage_states = Vec::new();
 
         let storage = self.storage.read().await;
-        if let Some(ref storage) = *storage {
+        if storage.is_some() {
             // Get checkpoint from each tier
             storage_states.push(StorageCheckpoint {
                 storage_type: StorageType::RocksDb,
@@ -612,6 +611,10 @@ impl WalCoordinator {
     async fn find_last_checkpoint(&self) -> WalResult<LogSequenceNumber> {
         // Scan backwards from tail to find most recent checkpoint
         let tail = self.wal.tail_lsn().await;
+        debug!(
+            "Scanning backwards for latest checkpoint starting from tail LSN {}",
+            tail.0
+        );
 
         // For now, start from beginning if no checkpoint found
         // In production, would maintain checkpoint metadata
@@ -624,6 +627,10 @@ impl WalCoordinator {
         start_lsn: LogSequenceNumber,
         end_lsn: LogSequenceNumber,
     ) -> WalResult<Vec<WalEntry>> {
+        debug!(
+            "Scanning WAL for recovery between LSN {} and {}",
+            start_lsn.0, end_lsn.0
+        );
         // Use WalReader if available to scan the range
         // For now, return empty vec as placeholder
         // In production, would use self.wal.scan(start_lsn..end_lsn)
@@ -646,7 +653,7 @@ impl WalCoordinator {
                             TransactionState {
                                 id: TransactionId(*tx_id),
                                 created_at: Instant::now(),
-                                timeout: Duration::from_secs(300),
+                                timeout: Duration::from_millis(*timeout_ms),
                                 participants: Vec::new(),
                                 entries: vec![entry.clone()],
                                 lsns: vec![entry.header.lsn],
@@ -662,6 +669,10 @@ impl WalCoordinator {
                         }
                     }
                     TransactionOp::Commit { tx_id, commit_lsn } => {
+                        debug!(
+                            "Recovered commit marker for transaction {} at LSN {}",
+                            tx_id, commit_lsn.0
+                        );
                         if let Some(state) = tx_states.get_mut(&TransactionId(*tx_id)) {
                             state.status = TransactionStatus::Committed;
                             state.lsns.push(entry.header.lsn);
@@ -673,7 +684,6 @@ impl WalCoordinator {
                             state.lsns.push(entry.header.lsn);
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -702,7 +712,7 @@ impl WalCoordinator {
         self.wal.sync().await?;
 
         // Apply to storage backends
-        if let Some(ref storage) = *self.storage.read().await {
+        if self.storage.read().await.is_some() {
             for participant in &state.participants {
                 match participant.storage_type {
                     StorageType::RocksDb => {
@@ -717,7 +727,9 @@ impl WalCoordinator {
                         // Commit to Parquet
                         debug!("Committing Parquet participant for tx {}", tx_id.0);
                     }
-                    _ => {}
+                    StorageType::Archive => {
+                        debug!("Committing Archive participant for tx {}", tx_id.0);
+                    }
                 }
             }
         }
@@ -745,13 +757,17 @@ impl WalCoordinator {
         self.wal.sync().await?;
 
         // Rollback storage backends using saved state
-        if let Some(ref storage) = *self.storage.read().await {
+        if self.storage.read().await.is_some() {
             for participant in &state.participants {
                 if let Some(ref rollback_data) = participant.rollback_data {
                     match participant.storage_type {
                         StorageType::RocksDb => {
                             // Rollback RocksDB using saved state
-                            debug!("Rolling back RocksDB participant for tx {}", tx_id.0);
+                            debug!(
+                                "Rolling back RocksDB participant for tx {} using {} bytes of state",
+                                tx_id.0,
+                                rollback_data.len()
+                            );
                         }
                         StorageType::Kafka => {
                             // Kafka transactions are atomic, no rollback needed
@@ -761,7 +777,9 @@ impl WalCoordinator {
                             // Discard uncommitted Parquet writes
                             debug!("Rolling back Parquet participant for tx {}", tx_id.0);
                         }
-                        _ => {}
+                        StorageType::Archive => {
+                            debug!("Rolling back Archive participant for tx {}", tx_id.0);
+                        }
                     }
                 }
             }

@@ -98,8 +98,10 @@ fn create_valid_sla_metrics() -> Vec<SlaMetric> {
 
 /// Helper to create a test contract
 fn create_test_contract(contract_id: &str, provider_id: &str, consumer_id: &str) -> Contract {
+    let now = Utc::now();
     Contract {
         contract_id: contract_id.to_string(),
+        revision: 1,
         contract_name: format!("Test Contract {}", contract_id),
         provider_interface_id: provider_id.to_string(),
         consumer_interface_id: consumer_id.to_string(),
@@ -109,8 +111,22 @@ fn create_test_contract(contract_id: &str, provider_id: &str, consumer_id: &str)
         tags: vec!["test".to_string()],
         approved: false,
         signed: false,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        lifecycle_state: Some("draft".to_string()),
+        approval_status: Some("pending".to_string()),
+        approval_requested_by: None,
+        approval_requested_at: None,
+        approved_by: None,
+        approved_at: None,
+        rejected_by: None,
+        rejected_at: None,
+        rejection_reason: None,
+        signed_by: None,
+        signed_at: None,
+        created_by: "system".to_string(),
+        updated_by: "system".to_string(),
+        superseded_by_revision: None,
+        created_at: now.clone(),
+        updated_at: now,
     }
 }
 
@@ -179,6 +195,9 @@ fn test_contract_state_machine() -> Result<()> {
 
     // Approve contract
     contract.approved = true;
+    contract.lifecycle_state = Some("approved".to_string());
+    contract.approved_by = Some("system".to_string());
+    contract.approved_at = Some(Utc::now());
     contract.updated_at = Utc::now();
     manager.put_contract(&contract)?;
 
@@ -188,6 +207,9 @@ fn test_contract_state_machine() -> Result<()> {
 
     // Sign contract (requires approved = true)
     contract.signed = true;
+    contract.lifecycle_state = Some("signed".to_string());
+    contract.signed_by = Some("system".to_string());
+    contract.signed_at = Some(Utc::now());
     contract.updated_at = Utc::now();
     manager.put_contract(&contract)?;
 
@@ -299,7 +321,7 @@ fn test_list_contracts_by_consumer() -> Result<()> {
     Ok(())
 }
 
-/// Test: Update contract (only allowed if not signed)
+/// Test: Semantic contract updates create a new revision while unsigned
 #[test]
 fn test_update_contract() -> Result<()> {
     let (manager, _temp_dir) = setup_test_environment()?;
@@ -317,13 +339,18 @@ fn test_update_contract() -> Result<()> {
     let mut contract = create_test_contract("contract-upd", "prov-upd", "cons-upd");
     manager.put_contract(&contract)?;
 
-    // Update contract name
+    // Semantic updates must advance the contract revision.
     contract.contract_name = "Updated Contract Name".to_string();
+    contract.revision = 2;
     contract.updated_at = Utc::now();
     manager.put_contract(&contract)?;
 
     let retrieved = manager.get_contract("contract-upd")?.unwrap();
     assert_eq!(retrieved.contract_name, "Updated Contract Name");
+    assert_eq!(retrieved.revision, 2);
+
+    let revisions = manager.list_contract_revisions("contract-upd", 10)?;
+    assert_eq!(revisions.len(), 2);
 
     Ok(())
 }

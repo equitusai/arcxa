@@ -17,7 +17,7 @@ pub mod middleware;
 
 pub use export::metrics_handler;
 pub use metrics::{
-    ApiMetrics, ErrorMetrics, MetricsRegistry, RdfMetrics, ShardMetrics, SystemMetrics,
+    ApiMetrics, ErrorMetrics, MetricsRegistry, RdfMetrics, ShardMetrics, SosMetrics, SystemMetrics,
 };
 pub use middleware::{MetricsLayer, RequestIdLayer};
 

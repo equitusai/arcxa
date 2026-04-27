@@ -9,8 +9,8 @@ use uuid::Uuid;
 use super::dag::DagExecutor;
 use super::definition::{WorkflowDefinition, WorkflowStep};
 use super::executor::{
-    DbExtractCallback, DbLoaderCallback, ExecutionContext, TransformerCallback, WorkflowExecutor,
-    WorkflowResult,
+    DbExtractCallback, DbLoaderCallback, ExecutionContext, SosValidationCallback,
+    TransformerCallback, WorkflowExecutor, WorkflowResult,
 };
 use super::lineage_tracker::LineageTracker;
 use super::row_lineage_context::RowLineageContext;
@@ -38,6 +38,8 @@ pub struct WorkflowEngine {
     db_loader_callback: Option<Arc<DbLoaderCallback>>,
     /// Optional DB extract callback for database extraction steps (injected by coordinator)
     db_extract_callback: Option<Arc<DbExtractCallback>>,
+    /// Optional SoS validation callback for backend/API-driven validation steps.
+    sos_validation_callback: Option<Arc<SosValidationCallback>>,
 }
 
 /// Registered workflow with metadata
@@ -122,6 +124,7 @@ impl WorkflowEngine {
             transformer_callback: None,
             db_loader_callback: None,
             db_extract_callback: None,
+            sos_validation_callback: None,
         }
     }
 
@@ -140,6 +143,7 @@ impl WorkflowEngine {
             transformer_callback: None,
             db_loader_callback: None,
             db_extract_callback: None,
+            sos_validation_callback: None,
         }
     }
 
@@ -207,6 +211,12 @@ impl WorkflowEngine {
     /// Set DB extract callback for database extraction steps (injected by coordinator)
     pub fn with_db_extract_callback(mut self, callback: Arc<DbExtractCallback>) -> Self {
         self.db_extract_callback = Some(callback);
+        self
+    }
+
+    /// Set SoS validation callback for workflow execution.
+    pub fn with_sos_validation_callback(mut self, callback: Arc<SosValidationCallback>) -> Self {
+        self.sos_validation_callback = Some(callback);
         self
     }
 
@@ -481,6 +491,10 @@ impl WorkflowEngine {
             executor = executor.with_db_extract_callback(callback.clone());
         }
 
+        if let Some(callback) = &self.sos_validation_callback {
+            executor = executor.with_sos_validation_callback(callback.clone());
+        }
+
         // Create execution context
         let mut exec_context = ExecutionContext::from_input_value(input)?;
         exec_context.metadata = context.clone();
@@ -584,6 +598,10 @@ impl WorkflowEngine {
         // Inject DB extract callback if available
         if let Some(callback) = &self.db_extract_callback {
             executor = executor.with_db_extract_callback(callback.clone());
+        }
+
+        if let Some(callback) = &self.sos_validation_callback {
+            executor = executor.with_sos_validation_callback(callback.clone());
         }
 
         // Prepare execution contexts using adapter
@@ -739,8 +757,8 @@ mod tests {
     use super::*;
     use crate::orchestration::workflow::definition::{
         ConfidenceGateConfig, DataValidatorConfig, FallbackStrategy, FieldTransformation,
-        FieldTransformerConfig, RuleType, Severity, StepConfig, StepType, TransformOperation,
-        ValidationRule, WorkflowStep,
+        FieldTransformerConfig, RuleType, Severity, SosValidationConfig, SosValidationSpec,
+        StepConfig, StepType, TransformOperation, ValidationRule, WorkflowStep,
     };
     use crate::orchestration::workflow::input::{
         DatasetInputAdapter, DatasetResolver, WorkflowInput,
@@ -830,6 +848,26 @@ mod tests {
                     depends_on: vec!["transform1".to_string()],
                 },
             ],
+            fusion_threshold: 0.8,
+            fallback: FallbackStrategy::ManualReview,
+        }
+    }
+
+    fn create_sos_validation_definition(blocking_severities: Vec<String>) -> WorkflowDefinition {
+        WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                id: "sos_validate".to_string(),
+                step_type: StepType::SosValidation,
+                config: StepConfig::SosValidation(SosValidationConfig {
+                    validation: SosValidationSpec::ContractCompliance {
+                        contract_id: "contract-1".to_string(),
+                    },
+                    blocking_severities,
+                    persist_report: true,
+                    emit_graph_lineage: true,
+                }),
+                depends_on: vec![],
+            }],
             fusion_threshold: 0.8,
             fallback: FallbackStrategy::ManualReview,
         }
@@ -1295,6 +1333,145 @@ mod tests {
         assert_eq!(
             validate_metadata.source_id.as_deref(),
             Some("ds_input_chain_456")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sos_validation_step_fails_workflow_on_blocking_severity() {
+        use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+        use crate::orchestration::rules::RuleExecutor;
+        use crate::orchestration::workflow::{
+            ExecutionContext, SosValidationCallback, SosValidationCheck, SosValidationStepResult,
+        };
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let registry = Arc::new(ModelRegistry::new());
+        let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+        let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+        let rule_executor = Arc::new(RuleExecutor::new());
+
+        let callback: Arc<SosValidationCallback> = Arc::new(Box::new(
+            |_config: &SosValidationConfig, _context: &ExecutionContext| {
+                Box::pin(async move {
+                    Ok(SosValidationStepResult {
+                        validation_id: "validation-1".to_string(),
+                        passed: false,
+                        checks: vec![SosValidationCheck {
+                            check_name: "schema_compatibility".to_string(),
+                            passed: false,
+                            severity: "error".to_string(),
+                            description: "Synthetic blocking failure".to_string(),
+                            details: None,
+                        }],
+                        confidence: 0.0,
+                        validated_at: "2026-04-13T00:00:00Z".to_string(),
+                        report_id: Some("report-1".to_string()),
+                    })
+                })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<SosValidationStepResult>> + Send>>
+            },
+        ));
+
+        let engine = WorkflowEngine::new_with_execution(invoker, rule_executor)
+            .with_sos_validation_callback(callback);
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "sos_blocking_validation".to_string(),
+                create_sos_validation_definition(vec!["error".to_string()]),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute_workflow(&workflow_id, serde_json::json!({}), &HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("Step 'sos_validate' failed"));
+
+        let step = result
+            .step_results
+            .get("sos_validate")
+            .expect("sos validation step should be recorded");
+        assert!(!step.success);
+        assert_eq!(step.output["report_id"], "report-1");
+        assert_eq!(step.output["step_passed"], false);
+    }
+
+    #[tokio::test]
+    async fn test_sos_validation_step_allows_non_blocking_warning() {
+        use crate::orchestration::ml::{CacheConfig, ModelCache, ModelRegistry};
+        use crate::orchestration::rules::RuleExecutor;
+        use crate::orchestration::workflow::{
+            ExecutionContext, SosValidationCallback, SosValidationCheck, SosValidationStepResult,
+        };
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let registry = Arc::new(ModelRegistry::new());
+        let cache = Arc::new(ModelCache::new(CacheConfig::default()));
+        let invoker = Arc::new(ModelInvoker::new(registry, cache).unwrap());
+        let rule_executor = Arc::new(RuleExecutor::new());
+
+        let callback: Arc<SosValidationCallback> = Arc::new(Box::new(
+            |_config: &SosValidationConfig, _context: &ExecutionContext| {
+                Box::pin(async move {
+                    Ok(SosValidationStepResult {
+                        validation_id: "validation-2".to_string(),
+                        passed: false,
+                        checks: vec![SosValidationCheck {
+                            check_name: "policy_warning".to_string(),
+                            passed: false,
+                            severity: "warning".to_string(),
+                            description: "Synthetic non-blocking warning".to_string(),
+                            details: None,
+                        }],
+                        confidence: 0.5,
+                        validated_at: "2026-04-13T00:00:01Z".to_string(),
+                        report_id: Some("report-2".to_string()),
+                    })
+                })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<SosValidationStepResult>> + Send>>
+            },
+        ));
+
+        let engine = WorkflowEngine::new_with_execution(invoker, rule_executor)
+            .with_sos_validation_callback(callback);
+
+        let workflow_id = engine
+            .register_workflow(
+                format!("wf_{}", Uuid::new_v4()),
+                "sos_warning_validation".to_string(),
+                create_sos_validation_definition(vec!["error".to_string()]),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute_workflow(&workflow_id, serde_json::json!({}), &HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let step = result
+            .step_results
+            .get("sos_validate")
+            .expect("sos validation step should be recorded");
+        assert!(step.success);
+        assert_eq!(step.output["report_id"], "report-2");
+        assert_eq!(step.output["step_passed"], true);
+        assert_eq!(
+            step.output["blocking_severities"],
+            serde_json::json!(["error"])
         );
     }
 

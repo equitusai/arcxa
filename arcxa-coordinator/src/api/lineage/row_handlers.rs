@@ -10,11 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use graphica_core::core::lineage::row_level::{
-    JobStatistics, RowId, RowJourney,
-};
 #[cfg(feature = "test-endpoints")]
 use graphica_core::core::lineage::row_level::RowLineageEvent;
+use graphica_core::core::lineage::row_level::{JobStatistics, RowId, RowJourney};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::info;
@@ -136,7 +134,10 @@ pub async fn search_row_keys(
     }
 
     let limit = params.limit.unwrap_or(10).clamp(1, 25);
-    info!("Searching row lineage keys for query='{}' limit={}", query, limit);
+    info!(
+        "Searching row lineage keys for query='{}' limit={}",
+        query, limit
+    );
 
     let row_lineage_store = state.row_lineage_store.as_ref().ok_or_else(|| {
         RowLineageApiError::InternalError("Row lineage store not available".to_string())
