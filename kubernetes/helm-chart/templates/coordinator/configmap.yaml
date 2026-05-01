@@ -12,4 +12,15 @@ data:
   GRAPHICA_SECRET_STORE_TYPE: {{ .Values.graphica.coordinator.secretStore.type | default "file" | quote }}
   GRAPHICA_SECRET_STORE_DIR: {{ .Values.graphica.coordinator.secretStore.directory | default "/data/secrets" | quote }}
   GRAPHICA_SECRET_STORE_FORMAT: {{ .Values.graphica.coordinator.secretStore.format | default "json" | quote }}
+  MIGRATION_EVIDENCE_GATEWAY_MODE: {{ .Values.graphica.migrationEvidence.mode | default "embedded" | quote }}
+  MIGRATION_EVIDENCE_CONNECTOR_STATE_PATH: "/data/migration-evidence/connectors/state.json"
+  MIGRATION_EVIDENCE_CONNECTOR_ROCKSDB_PATH: "/data/migration-evidence/connectors/rocksdb"
+  MIGRATION_EVIDENCE_TRACEABILITY_STATE_PATH: "/data/migration-evidence/traceability/state.json"
+  MIGRATION_EVIDENCE_TRACEABILITY_ROCKSDB_PATH: "/data/migration-evidence/traceability/rocksdb"
+  MIGRATION_EVIDENCE_EVENT_BUS_MODE: {{ .Values.graphica.migrationEvidence.eventDeliveryMode | default "direct" | quote }}
+  MIGRATION_EVIDENCE_KAFKA_BOOTSTRAP_SERVERS: {{ include "kafka.brokerList" . | quote }}
+  MIGRATION_EVIDENCE_KAFKA_TOPIC: {{ .Values.graphica.migrationEvidence.kafka.topic | default "arcxa.migration-evidence.events.v1" | quote }}
+  MIGRATION_EVIDENCE_KAFKA_CONSUMER_GROUP: {{ .Values.graphica.migrationEvidence.kafka.consumerGroup | default "arcxa-coordinator-traceability" | quote }}
+  MIGRATION_EVIDENCE_INGESTION_ENDPOINT: "http://arcxa-evidence-ingestion:50071"
+  MIGRATION_EVIDENCE_TRACEABILITY_ENDPOINT: "http://arcxa-traceability:50072"
 {{- end }}

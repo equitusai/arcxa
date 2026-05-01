@@ -70,6 +70,9 @@ pub mod gdpr;
 // OpenLineage integration (lineage event interchange format)
 pub mod openlineage;
 
+// Migration evidence graph domain
+pub mod migration_evidence;
+
 // Re-export commonly used types
 pub use errors::GraphicaError;
 

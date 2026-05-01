@@ -15,6 +15,7 @@ import {
   Workflow,
   FileCode,
   ShieldCheck,
+  Fingerprint,
   Settings as SettingsIcon,
   Moon,
   Sun,
@@ -60,6 +61,12 @@ const navigationGroups = [
     name: 'Systems-of-Systems',
     items: [
       { name: 'SoS Validation', href: '/sos-validation', icon: ShieldCheck },
+    ],
+  },
+  {
+    name: 'Migration Intelligence',
+    items: [
+      { name: 'Evidence Graph', href: '/migration-evidence', icon: Fingerprint },
     ],
   },
   {

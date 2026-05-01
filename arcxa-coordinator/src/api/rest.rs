@@ -228,6 +228,8 @@ fn v1_routes() -> Router<Arc<ApiState>> {
         .merge(crate::api::schema_api::create_router())
         // GDPR compliance routes (Article 17: Right to Erasure)
         .merge(crate::api::gdpr::create_router())
+        // Migration evidence graph routes (IBM RISE / SAP explainability)
+        .merge(crate::api::migration_evidence::create_router())
 }
 
 /// Read-only routes - accessible by all authenticated users (Viewer, Operator, Admin, Service)

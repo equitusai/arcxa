@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package graphica.migration.v1;
+
+service EvidenceIngestionService {
+  rpc UpsertConnector(UpsertConnectorRequest) returns (ConnectorReply);
+  rpc GetConnector(GetConnectorRequest) returns (ConnectorReply);
+  rpc RunConnector(RunConnectorRequest) returns (RunConnectorResponse);
+  rpc GetRuntimeStatus(RuntimeStatusRequest) returns (RuntimeStatusReply);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+service TraceabilityService {
+  rpc IngestEvents(IngestEventsRequest) returns (IngestEventsResponse);
+  rpc ExplainValue(ExplainValueRequest) returns (ValueExplanationReply);
+  rpc GetEvidencePacket(GetEvidencePacketRequest) returns (EvidencePacketReply);
+  rpc GetControls(GetObjectRequest) returns (ControlsReply);
+  rpc GetExceptions(GetProgramRequest) returns (ExceptionsReply);
+  rpc GetApprovals(GetProgramRequest) returns (ApprovalsReply);
+  rpc GetRuntimeStatus(RuntimeStatusRequest) returns (RuntimeStatusReply);
+  rpc RebuildReadModels(RebuildReadModelsRequest) returns (RebuildReadModelsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+service VerificationService {
+  rpc RunVerification(RunVerificationRequest) returns (RunVerificationResponse);
+  rpc RunVerificationAndEmit(RunVerificationAndEmitRequest) returns (RunVerificationAndEmitResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string service_name = 2;
+  int64 uptime_seconds = 3;
+}
+
+message UpsertConnectorRequest {
+  string connector_json = 1;
+}
+
+message GetConnectorRequest {
+  string connector_id = 1;
+}
+
+message ConnectorReply {
+  string connector_json = 1;
+}
+
+message RunConnectorRequest {
+  string connector_id = 1;
+  string run_request_json = 2;
+}
+
+message RunConnectorResponse {
+  string run_summary_json = 1;
+  repeated string event_json = 2;
+}
+
+message IngestEventsRequest {
+  repeated string event_json = 1;
+}
+
+message IngestEventsResponse {
+  int64 ingested_count = 1;
+  repeated string program_ids = 2;
+  repeated string object_ids = 3;
+}
+
+message ExplainValueRequest {
+  string program_id = 1;
+  string object_id = 2;
+  string target_field_path = 3;
+  string target_record_id = 4;
+  string source_record_id = 5;
+}
+
+message ValueExplanationReply {
+  string value_explanation_json = 1;
+}
+
+message GetEvidencePacketRequest {
+  string object_id = 1;
+  string value_key = 2;
+}
+
+message EvidencePacketReply {
+  string evidence_packet_json = 1;
+}
+
+message GetObjectRequest {
+  string object_id = 1;
+}
+
+message GetProgramRequest {
+  string program_id = 1;
+}
+
+message ControlsReply {
+  repeated string control_json = 1;
+}
+
+message ExceptionsReply {
+  repeated string exception_json = 1;
+}
+
+message ApprovalsReply {
+  repeated string approval_json = 1;
+}
+
+message RuntimeStatusRequest {}
+
+message RuntimeStatusReply {
+  string runtime_status_json = 1;
+}
+
+message RebuildReadModelsRequest {}
+
+message RebuildReadModelsResponse {
+  string rebuild_summary_json = 1;
+}
+
+message RunVerificationRequest {
+  string verification_request_json = 1;
+}
+
+message RunVerificationResponse {
+  string verification_result_json = 1;
+}
+
+message RunVerificationAndEmitRequest {
+  string verification_dispatch_request_json = 1;
+}
+
+message RunVerificationAndEmitResponse {
+  string verification_dispatch_result_json = 1;
+}

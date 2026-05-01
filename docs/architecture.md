@@ -186,6 +186,25 @@ Important auth nuance:
 - the `/api/v1/...` surfaces live behind the main API router, so in secured deployments they inherit API auth requirements
 - `./run-local.sh` disables auth, which is why local Swagger exploration is easier than a secured environment
 
+## Migration Evidence Graph Topology
+
+The repository now also contains the first ARCXA Migration Evidence Graph service split.
+
+Current implementation shape:
+- `arcxa-coordinator` exposes the public REST surface under `/api/v1/migration-evidence`
+- `arcxa-evidence-ingestion` owns connector-oriented ingestion and verification-run orchestration
+- `arcxa-traceability` owns evidence assembly, packet signing, and traceability queries
+- `arcxa-verification` owns read-only verification flows, including SAP HANA SQL reads through the existing connector seam
+
+Important current nuance:
+- the standalone crates and gRPC contracts exist now
+- the coordinator can also host an in-process migration-evidence gateway for single-node or local deployment
+- the coordinator-hosted gateway can run in direct mode or in an opt-in Kafka-backed delivery mode
+- the coordinator can now also run in an external migration-evidence gateway mode, where it proxies the public REST surface to separately deployed ingestion and traceability services over gRPC
+- verification now emits canonical migration-evidence events through the same direct/Kafka forwarding layer instead of relying on ingestion to translate verification results after the fact
+- traceability now persists replayable read models in RocksDB, deduplicates replay by `event_id`, and can rebuild from its own event log
+- this keeps the first release usable without forcing an immediate multi-service rollout while still moving the architecture toward a higher-assurance service split
+
 ## Operator Surfaces
 
 Operator workflows now span four layers:
@@ -200,4 +219,3 @@ Operator workflows now span four layers:
 - [`api-surface.md`](api-surface.md)
 - [`model-service-and-inference.md`](model-service-and-inference.md)
 - [`deployment-and-operations.md`](deployment-and-operations.md)
-

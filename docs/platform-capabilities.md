@@ -40,6 +40,11 @@ ARCXA is not just a connector layer or a workflow runner. Its strongest opinions
 - data movement should stay connected to lineage and governance
 - semantic mapping should be treated as a managed workflow, not only a one-off integration task
 - interoperability validation should be persisted and auditable, not only computed transiently
+- interoperability validation now distinguishes direct compatibility from narrower declared transformability instead of treating every transform hint as equivalent
+- interoperability validation now requires executable unit and coordinate transform semantics for the rule families it understands, rather than treating endpoint labels alone as proof
+- interoperability validation now reduces confidence for unbounded transforms and preserves declared error budgets for bounded transforms
+- interoperability validation now derives explicit interface-pair compatibility states instead of forcing operators to infer everything from raw check lists
+- interoperability validation, contract compliance, policy evaluation, data validation, and system-integration results now expose structured confidence assessments instead of leaving confidence as an opaque scalar
 - graph-native governance matters enough to justify a dedicated shard runtime
 
 Those choices explain why the platform looks broader than a traditional ETL point solution.
@@ -118,7 +123,26 @@ That layer provides:
 - persisted validation reports and report lineage
 - compatibility matrix, dependency graph, and what-if analytics
 - revisioned governance workflows for contracts and policies
+- validated contract transformation rules for unit, coordinate, and field-level compatibility, rather than presence-only hints
+- explicit separation between direct schema compatibility and narrower schema transformability
 - operator controls for reconcile, signing-key status and rotation, and governance audit
+
+## Migration Evidence Graph
+
+ARCXA now also has a dedicated migration explainability wedge aimed at IBM RISE, SAP ECC, SAP S/4HANA, and SAP HANA-heavy programs.
+
+Current capabilities include:
+- canonical migration-evidence domain contracts in `arcxa-core`
+- replay-capable traceability read models with RocksDB-backed persistence and signed evidence packets
+- connector-driven evidence ingestion
+- opt-in Kafka-backed delivery between migration-evidence producers and traceability, with replay-safe deduplication
+- runtime status that surfaces async-delivery posture instead of treating Kafka mode as an invisible implementation detail
+- signed evidence packets
+- field-level and record-level explain-value responses
+- explicit modeling of transformation rules, execution runs, exceptions, controls, and approvals
+- read-only verification support that can emit control and exception evidence directly onto the shared event backbone
+
+This area is intentionally adjacent to migration execution tooling rather than a replacement for it.
 
 ## Operator And Automation Experience
 
@@ -135,4 +159,3 @@ The operator-facing experience is intentionally multi-surface:
 - [`api-surface.md`](api-surface.md)
 - [`architecture.md`](architecture.md)
 - [`frontend-and-cli.md`](frontend-and-cli.md)
-

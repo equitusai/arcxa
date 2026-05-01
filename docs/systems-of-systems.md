@@ -17,11 +17,12 @@ Use this guide when you want to:
 3. [Core Validation Flows](#core-validation-flows)
 4. [Validation History, Lineage, And Change Tracking](#validation-history-lineage-and-change-tracking)
 5. [Contract Governance](#contract-governance)
-6. [Policy Governance](#policy-governance)
-7. [Analytics And Large-Catalog Behavior](#analytics-and-large-catalog-behavior)
-8. [Operator Surfaces](#operator-surfaces)
-9. [Projection, Reconcile, And Recovery](#projection-reconcile-and-recovery)
-10. [Current Design Boundaries](#current-design-boundaries)
+6. [Canonical Transformation Rules](#canonical-transformation-rules)
+7. [Policy Governance](#policy-governance)
+8. [Analytics And Large-Catalog Behavior](#analytics-and-large-catalog-behavior)
+9. [Operator Surfaces](#operator-surfaces)
+10. [Projection, Reconcile, And Recovery](#projection-reconcile-and-recovery)
+11. [Current Design Boundaries](#current-design-boundaries)
 
 ## Mental Model
 
@@ -123,6 +124,100 @@ Important semantic point:
 - semantic contract changes require new revisions
 - governance metadata changes do not pretend to be new semantic revisions
 - signed contracts can now carry attestation material tied to the exact revision that was approved and signed
+
+## Canonical Transformation Rules
+
+`transformation_rules` are no longer treated as a vague escape hatch for "some conversion exists somewhere."
+
+For the contract paths that affect SoS compatibility today, the coordinator now expects a canonical object shape for known rule families:
+- unit conversion rules
+- coordinate-system conversion rules
+- field-level mapping rules used for schema transformability
+
+Supported aliases for the unit rule are:
+- `unit_transform`
+- `unit_conversion`
+- `unit_mapping`
+- `unit`
+
+Supported aliases for the coordinate rule are:
+- `coordinate_transform`
+- `coordinate_conversion`
+- `coordinate_mapping`
+- `coordinate`
+
+Supported aliases for field-level mapping rules are:
+- `field_mapping`
+- `field_mappings`
+- `field_transform`
+
+Each known rule must be an object with explicit endpoints. The canonical shape is:
+
+```json
+{
+  "unit_transform": {
+    "from": "SI",
+    "to": "Imperial",
+    "strategy": "linear_scale"
+  },
+  "coordinate_transform": {
+    "from": "WGS84",
+    "to": "ECI_J2000",
+    "strategy": "helmert"
+  },
+  "field_mapping": {
+    "mappings": [
+      {
+        "from": "$.payload.rank",
+        "to": "$.payload.priority"
+      },
+      {
+        "value": 1,
+        "to": "$.payload.severity",
+        "strategy": "constant"
+      }
+    ]
+  }
+}
+```
+
+The implementation also accepts `source` or `provider` as aliases for `from`, and `target` or `consumer` as aliases for `to`.
+
+What this means in practice:
+- the rule must be a JSON object, not a free-form string
+- the rule must declare non-empty endpoint values
+- only one alias for a given semantic rule family should be present at a time
+- the rule must actually match the interface direction being validated
+- field-mapping rules must declare a `mappings` array
+- each mapping entry must declare either `from` or `value`
+- each mapping entry must declare one target `to`
+- the same target path should not be mapped more than once
+
+Examples:
+- provider unit system `SI`, consumer unit system `Imperial`, rule `SI -> Imperial`: compatible
+- provider unit system `SI`, consumer unit system `Imperial`, rule `Imperial -> SI`: not compatible
+- `\"unit_transform\": \"SI->Imperial\"`: invalid at contract create or update time
+- a mapping from `$.payload.rank` to `$.payload.priority`: valid field-mapping rule
+- two mappings that both target `$.payload.priority`: invalid field-mapping rule
+
+This matters because the validation engine now distinguishes:
+- no transform rule
+- malformed transform rule
+- transform rule present but pointed at the wrong direction
+- transform rule present and aligned with the actual provider and consumer metadata
+
+It also now distinguishes direct schema compatibility from schema transformability.
+
+Today, the `schema_transformability` signal is intentionally narrower than full semantic equivalence:
+- it currently covers explicit field mappings for missing required consumer fields
+- it does not yet claim to resolve every type mismatch, enum mismatch, array mismatch, or additional-properties mismatch
+- `schema_compatibility` still fails when the provider schema does not directly satisfy the consumer schema
+- `schema_transformability` can still pass at the same time, which means "not directly compatible, but a declared transform path exists for the missing field requirement"
+
+That distinction is deliberate. The platform is trying to separate:
+- directly interoperable contracts
+- contracts that require an explicit transform step
+- contracts that are still unresolved even with declared transform rules
 
 ## Policy Governance
 

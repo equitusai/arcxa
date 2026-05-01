@@ -1,0 +1,10 @@
+graphica:
+  migrationEvidence:
+    mode: external
+    eventDeliveryMode: kafka
+    ingestion:
+      enabled: true
+    traceability:
+      enabled: true
+    verification:
+      enabled: true

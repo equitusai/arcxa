@@ -1,0 +1,62 @@
+{{- if .Values.graphica.migrationEvidence.ingestion.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arcxa-evidence-ingestion
+  namespace: {{ .Release.namespace }}
+spec:
+  serviceName: arcxa-evidence-ingestion
+  replicas: {{ .Values.graphica.migrationEvidence.ingestion.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: graphica
+      component: migration-evidence-ingestion
+  template:
+    metadata:
+      labels:
+        app: graphica
+        component: migration-evidence-ingestion
+    spec:
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
+      imagePullSecrets:
+      - name: arcxa-pull
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: arcxa-evidence-ingestion
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        image: {{ .Values.graphica.migrationEvidence.ingestion.imageTag }}
+        args:
+          - ./arcxa-evidence-ingestion
+          - --listen-addr=0.0.0.0:50071
+          - --state-path=/data/connectors/state.json
+          - --rocksdb-path=/data/connectors/rocksdb
+          - --event-delivery-mode={{ .Values.graphica.migrationEvidence.eventDeliveryMode | default "direct" }}
+          - --traceability-endpoint=http://arcxa-traceability:50072
+          - --verification-endpoint=http://arcxa-verification:50073
+          {{- if eq (.Values.graphica.migrationEvidence.eventDeliveryMode | default "direct") "kafka" }}
+          - --kafka-bootstrap-servers={{ include "kafka.brokerList" . }}
+          - --kafka-topic={{ .Values.graphica.migrationEvidence.kafka.topic | default "arcxa.migration-evidence.events.v1" }}
+          {{- end }}
+        env:
+        - name: RUST_LOG
+          value: info
+        ports:
+        - name: grpc
+          containerPort: 50071
+        volumeMounts:
+        - name: migration-evidence-ingestion-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: migration-evidence-ingestion-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: {{ .Values.graphica.migrationEvidence.ingestion.storage.size }}
+      storageClassName: {{ .Values.global.storageClassName }}
+      volumeMode: Filesystem
+{{- end }}

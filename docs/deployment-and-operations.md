@@ -133,6 +133,70 @@ For SoS specifically, the platform now supports:
 - retention-aware replay of persisted validation history
 - startup recovery helpers around SoS projection and ontology synchronization
 
+## Migration Evidence Graph Operations
+
+The migration-evidence wedge currently has two deployment modes:
+- coordinator-hosted gateway mode for simpler topologies and local development
+- standalone service mode using `arcxa-evidence-ingestion`, `arcxa-traceability`, and `arcxa-verification`
+
+Helm chart support now exists for both modes:
+- the default chart values keep migration evidence embedded in the coordinator
+- `kubernetes/helm-chart/values-migration-evidence-external-direct.yaml` switches the coordinator into an external gateway mode and deploys the three migration-evidence services with direct gRPC delivery
+- `kubernetes/helm-chart/values-migration-evidence-external-kafka.yaml` does the same, but enables Kafka-backed producer fan-out into traceability
+
+Current service persistence is PVC-friendly, but no longer uniform:
+- connector state now defaults to a RocksDB-backed ingestion store with one-time import support for older JSON connector snapshots
+- traceability now persists read models and a replayable event log in RocksDB
+- signed evidence packets are persisted as part of traceability state
+- older JSON traceability state can be imported into RocksDB on first startup
+- both ingestion and traceability are currently single-writer services from a persistence perspective, so the split-service chart profiles keep them at one replica by default
+
+Current event-delivery posture is intentionally phased:
+- `direct` delivery is still the default for coordinator-hosted and single-node setups
+- `kafka` delivery is now available as an opt-in runtime mode for evidence-producer fan-out into traceability
+- both `arcxa-evidence-ingestion` and `arcxa-verification` can publish onto that shared backbone
+- Kafka delivery uses schema-versioned envelopes and idempotent producer settings
+- traceability deduplicates replay and retry traffic by `event_id`
+- malformed Kafka messages are logged and skipped so one poison payload does not wedge the consumer
+
+Current operator controls now include:
+- `GET /api/v1/migration-evidence/runtime/status`
+- `POST /api/v1/migration-evidence/runtime/rebuild`
+- CLI parity through `admin migration-evidence runtime status|rebuild`
+- these controls rebuild the traceability service read models; they are not yet a full shard-graph reconcile primitive
+
+`runtime/status` now also exposes event-bus posture for migration-evidence operators:
+- whether the service is in `direct` or `kafka` mode
+- the Kafka topic and consumer group when configured
+- consumer state, startup-failure reason, and the most recent async-delivery error
+- broker reachability, discovered broker count, assigned partitions, and topic partition count
+- lag posture, lag diagnostics, and the latest observed estimated lag when Kafka delivery is active
+- counters for processed, malformed, and retried messages
+- connector-store backend, health, connector count, and writability through the aggregated ingestion status
+
+Relevant runtime configuration now includes:
+- `MIGRATION_EVIDENCE_GATEWAY_MODE` with `embedded` or `external`
+- `MIGRATION_EVIDENCE_INGESTION_ENDPOINT`
+- `MIGRATION_EVIDENCE_TRACEABILITY_ENDPOINT`
+- `MIGRATION_EVIDENCE_CONNECTOR_ROCKSDB_PATH`
+- `MIGRATION_EVIDENCE_EVENT_BUS_MODE` with `direct` or `kafka`
+- `MIGRATION_EVIDENCE_KAFKA_BOOTSTRAP_SERVERS`
+- `MIGRATION_EVIDENCE_KAFKA_TOPIC`
+- `MIGRATION_EVIDENCE_KAFKA_CONSUMER_GROUP`
+- `MIGRATION_EVIDENCE_TRACEABILITY_ROCKSDB_PATH`
+- legacy `MIGRATION_EVIDENCE_CONNECTOR_STATE_PATH` and `MIGRATION_EVIDENCE_TRACEABILITY_STATE_PATH` retention for one-time import and compatibility
+
+Current runtime direction is:
+- REST through coordinator
+- gRPC between internal services
+- optional Kafka-backed fan-out between migration-evidence producers and traceability
+- shard projection as the long-lived graph of record
+
+In the external gateway mode specifically:
+- the coordinator proxies migration-evidence REST calls to `arcxa-evidence-ingestion` and `arcxa-traceability` over gRPC
+- verification runs still start from the coordinator REST surface, but execute through the ingestion service and then through the standalone verification service
+- this keeps the public API stable while allowing the evidence path to be deployed and operated as distinct services
+
 ## Health, Metrics, And API Docs
 
 Operationally useful surfaces include:

@@ -102,6 +102,19 @@ fn persist_setup_token_output(token: Option<&str>) {
     }
 }
 
+
+fn decode_migration_evidence_seed(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64 {
+        return None;
+    }
+
+    let mut seed = [0u8; 32];
+    for (index, chunk) in raw.as_bytes().chunks(2).enumerate() {
+        let chunk = std::str::from_utf8(chunk).ok()?;
+        seed[index] = u8::from_str_radix(chunk, 16).ok()?;
+    }
+    Some(seed)
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -1795,6 +1808,79 @@ async fn main() -> Result<()> {
         workflow_metrics.clone(),
     );
 
+    let migration_evidence_gateway = {
+        use graphica_coordinator::api::migration_evidence::{
+            MigrationEvidenceEventBusConfig, MigrationEvidenceGateway, MigrationEvidenceGatewayConfig,
+            MigrationEvidenceRemoteGatewayConfig,
+        };
+
+        let connector_state_path = std::env::var("MIGRATION_EVIDENCE_CONNECTOR_STATE_PATH")
+            .unwrap_or_else(|_| "./data/migration-evidence/connectors/state.json".to_string());
+        let connector_rocksdb_path = std::env::var("MIGRATION_EVIDENCE_CONNECTOR_ROCKSDB_PATH")
+            .unwrap_or_else(|_| "./data/migration-evidence/connectors/rocksdb".to_string());
+        let traceability_state_path = std::env::var("MIGRATION_EVIDENCE_TRACEABILITY_STATE_PATH")
+            .unwrap_or_else(|_| "./data/migration-evidence/traceability/state.json".to_string());
+        let traceability_rocksdb_path =
+            std::env::var("MIGRATION_EVIDENCE_TRACEABILITY_ROCKSDB_PATH")
+                .unwrap_or_else(|_| "./data/migration-evidence/traceability/rocksdb".to_string());
+        let signing_seed_hex = std::env::var("ARCXA_TRACEABILITY_SIGNING_KEY_HEX").unwrap_or_else(|_| {
+            "0101010101010101010101010101010101010101010101010101010101010101"
+                .to_string()
+        });
+
+        let signing_seed = decode_migration_evidence_seed(&signing_seed_hex).unwrap_or([1u8; 32]);
+        let event_bus_mode = std::env::var("MIGRATION_EVIDENCE_EVENT_BUS_MODE")
+            .unwrap_or_else(|_| "direct".to_string());
+        let gateway_mode = std::env::var("MIGRATION_EVIDENCE_GATEWAY_MODE")
+            .unwrap_or_else(|_| "embedded".to_string());
+        let remote_services = if gateway_mode.eq_ignore_ascii_case("external")
+            || gateway_mode.eq_ignore_ascii_case("remote")
+        {
+            Some(MigrationEvidenceRemoteGatewayConfig {
+                evidence_ingestion_endpoint: std::env::var("MIGRATION_EVIDENCE_INGESTION_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:50071".to_string()),
+                traceability_endpoint: std::env::var("MIGRATION_EVIDENCE_TRACEABILITY_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:50072".to_string()),
+            })
+        } else {
+            None
+        };
+        let event_bus = if remote_services.is_none() && event_bus_mode.eq_ignore_ascii_case("kafka") {
+            Some(MigrationEvidenceEventBusConfig {
+                bootstrap_servers: std::env::var("MIGRATION_EVIDENCE_KAFKA_BOOTSTRAP_SERVERS")
+                    .unwrap_or_else(|_| "127.0.0.1:9092".to_string()),
+                topic: std::env::var("MIGRATION_EVIDENCE_KAFKA_TOPIC")
+                    .unwrap_or_else(|_| "arcxa.migration-evidence.events.v1".to_string()),
+                consumer_group: std::env::var("MIGRATION_EVIDENCE_KAFKA_CONSUMER_GROUP")
+                    .unwrap_or_else(|_| "arcxa-coordinator-traceability".to_string()),
+            })
+        } else {
+            None
+        };
+
+        match MigrationEvidenceGateway::new(MigrationEvidenceGatewayConfig {
+            connector_state_path: connector_state_path.into(),
+            connector_rocksdb_path: Some(connector_rocksdb_path.into()),
+            traceability_state_path: traceability_state_path.into(),
+            traceability_rocksdb_path: Some(traceability_rocksdb_path.into()),
+            signing_key_seed: signing_seed,
+            shard_endpoint: std::env::var("ARCXA_MIGRATION_EVIDENCE_SHARD_ENDPOINT").ok(),
+            event_bus,
+            remote_services,
+        })
+        .await
+        {
+            Ok(gateway) => {
+                info!("Initialized migration evidence gateway");
+                Some(Arc::new(gateway))
+            }
+            Err(error) => {
+                warn!("WARNING: Failed to initialize migration evidence gateway: {}", error);
+                None
+            }
+        }
+    };
+
     // Build API state
     let api_state = ApiState {
         lineage_storage,
@@ -1962,6 +2048,7 @@ async fn main() -> Result<()> {
         )),
         // Systems-of-Systems validation storage (high-performance RocksDB backend)
         sos_storage_manager: sos_storage_manager.clone(),
+        migration_evidence_gateway,
         // Schema discovery state manager (Phase 1: Async discovery with progress tracking)
         discovery_state: Some(Arc::new(
             graphica_coordinator::mapping::discovery::DiscoveryStateManager::new(),

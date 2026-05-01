@@ -147,6 +147,44 @@ Examples:
 
 This family owns the SoS catalog, validation reports, analytics, and governance workflows.
 
+One current contract-governance detail is worth calling out explicitly:
+- `POST /api/v1/sos/contracts`
+- `PUT /api/v1/sos/contracts/{id}`
+
+Known `transformation_rules` for unit, coordinate, and field-mapping compatibility are now validated, not just stored blindly. For those rule families:
+- the payload must use an object shape with explicit endpoints such as `from` and `to`
+- unit transforms for mismatched systems must declare executable semantics such as `identity` or `linear_scale`
+- `linear_scale` unit transforms must include a numeric `scale`, with optional `offset` and `tolerance`
+- coordinate transforms for mismatched systems must declare executable semantics such as `identity`, `helmert`, or `local_tangent_plane`
+- `helmert` coordinate transforms must include numeric `translation_m` and `rotation_arcsec` vectors
+- `local_tangent_plane` coordinate transforms must include an `origin` object with latitude/longitude metadata
+- field-level transforms must use a `mappings` array with explicit target paths
+- duplicate aliases for the same rule family are rejected
+- malformed known rules return `400 INVALID_TRANSFORMATION_RULES`
+
+That means callers should treat `transformation_rules` as part of the active API contract, not as an arbitrary blob for known SoS compatibility semantics.
+
+One more current behavior is worth knowing:
+- interface validation can now report both strict `schema_compatibility` and additive `schema_transformability`
+- a pair can still be schema-incompatible while also being marked transformable for a narrower missing-field case
+- unit and coordinate compatibility checks now also distinguish:
+  - direct alignment
+  - bounded transforms with a declared error budget
+  - unbounded transforms that still need runtime verification
+- those distinctions are surfaced through per-check `details` metadata and affect the overall confidence score
+- validation responses and persisted reports now also expose a top-level `confidence_assessment` object with:
+  - contributor counts
+  - runtime-verification flags
+  - a short summary
+  - material confidence contributors with structured categories such as `blocking_failure`, `non_blocking_policy_failure`, `bounded_transform`, and `runtime_verification_required`
+- interface-compatibility responses and compatibility-matrix entries now also surface a derived `compatibility_state`:
+  - `semantically_equivalent`
+  - `syntactically_compatible`
+  - `transformable`
+  - `incompatible`
+
+That explainability is not limited to interface-pair validation anymore. `data_validation`, `policy_check`, `contract_compliance`, `system_integration`, and persisted history/report lookups all normalize check-level confidence metadata so operators can see why a score stayed high, dropped modestly, or fell to zero.
+
 ### Administrative And Maintenance Routes
 
 Examples visible in the coordinator include:
@@ -158,6 +196,37 @@ Examples visible in the coordinator include:
 - Kafka and Raft-oriented routes when those features are enabled
 
 Treat these as operator-facing surfaces, not as a general application API.
+
+## Migration Evidence Graph API
+
+The coordinator now exposes a first migration-evidence API family under `/api/v1/migration-evidence`.
+
+Current endpoints:
+- `POST /api/v1/migration-evidence/connectors`
+- `POST /api/v1/migration-evidence/connectors/{id}/runs`
+- `GET /api/v1/migration-evidence/values/explain`
+- `GET /api/v1/migration-evidence/objects/{id}/evidence-packet`
+- `GET /api/v1/migration-evidence/objects/{id}/controls`
+- `GET /api/v1/migration-evidence/programs/{id}/exceptions`
+- `GET /api/v1/migration-evidence/programs/{id}/approvals`
+- `GET /api/v1/migration-evidence/runtime/status`
+- `POST /api/v1/migration-evidence/runtime/rebuild`
+
+This surface is designed around one core operator question: explain this migrated value.
+
+Important current response behavior:
+- connector-run summaries now include `delivery_mode` so operators can tell whether the run used direct or Kafka-backed delivery
+- connector-run summaries also include `traceability_acknowledged` so callers can distinguish synchronous local ingestion from async bus publication
+- verification-backed connector runs now report those same delivery fields from the verification service path, rather than depending on ingestion to translate and forward the verification result afterward
+- runtime-status responses now include:
+  - traceability event-bus posture such as mode, consumer state, counters, startup-failure reason, lag posture, broker reachability, discovered broker count, partition assignment, and lag diagnostics
+  - ingestion connector-store posture such as backend type, health, connector count, and writability
+- runtime rebuild rebuilds the traceability read models from the persisted traceability event log; it is not yet a full shard-graph reconcile primitive
+
+Current documentation nuance:
+- the REST routes are live
+- unlike some older coordinator modules, the migration-evidence surface does not yet have its own dedicated Swagger UI module page
+- the route family should currently be treated as documented through the curated docs and source-controlled request/response contracts
 
 ## Important Current Boundary
 

@@ -62,6 +62,8 @@ Those identifiers are still operationally relevant, so this documentation calls 
 | [`workflows-and-execution.md`](workflows-and-execution.md) | Workflow authors and operators | Workflow CRUD, validation, execution, schedules, approvals, progress tracking, and runtime modes. |
 | [`lineage-and-governance.md`](lineage-and-governance.md) | Audit, lineage, and platform governance teams | Row, column, workflow, and schema-evolution lineage plus SPARQL and graph-oriented governance surfaces. |
 | [`systems-of-systems.md`](systems-of-systems.md) | Integration governance teams | SoS catalog, validation, analytics, policy and contract governance, reconcile, and recovery. |
+| [`migration-evidence-graph.md`](migration-evidence-graph.md) | Migration architects, IBM teams, and audit stakeholders | The Migration Evidence Graph product wedge, current implementation, API surface, and evidence-packet model. |
+| [`ibm-rise-migration-evidence-graph.md`](ibm-rise-migration-evidence-graph.md) | Solution leads and presentation authors | IBM-facing narrative, slide structure, messaging rules, and demo story for SAP migration engagements. |
 | [`frontend-and-cli.md`](frontend-and-cli.md) | Operators and enablement teams | The web UI surface, SoS workspace tabs, and the operator CLI binaries and usage patterns. |
 | [`sdk-and-automation.md`](sdk-and-automation.md) | Automation teams | Python client, CLI automation, curl-first workflows, and current automation boundaries. |
 | [`deployment-and-operations.md`](deployment-and-operations.md) | Operators | Scripts, Docker and Kubernetes assets, metrics, health, topology choices, and operational caveats. |

@@ -55,6 +55,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", coordinator_proto.display());
 
     // Compile shared prediction_service proto for ML model invocation
+    let migration_evidence_proto = shared_proto_dir.join("migration_evidence_service.proto");
+    if migration_evidence_proto.exists() {
+        tonic_build::configure()
+            .build_server(true)
+            .build_client(true)
+            .file_descriptor_set_path(out_dir.join("migration_evidence_descriptor.bin"))
+            .compile(
+                &[migration_evidence_proto.to_str().unwrap()],
+                &[shared_proto_dir.to_str().unwrap()],
+            )?;
+
+        println!("cargo:rerun-if-changed={}", migration_evidence_proto.display());
+    }
+
     let prediction_proto = shared_proto_dir.join("prediction_service.proto");
     if prediction_proto.exists() {
         tonic_build::configure()

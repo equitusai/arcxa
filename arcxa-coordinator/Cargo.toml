@@ -44,6 +44,9 @@ full-enterprise = ["raft-consensus", "cryptographic-audit", "wal-replication", "
 # Internal dependencies
 graphica-core = { package = "arcxa-core", path = "../arcxa-core" }
 graphica-migrations = { package = "arcxa-migrations", path = "../arcxa-migrations" }
+arcxa-evidence-ingestion = { path = "../arcxa-evidence-ingestion" }
+arcxa-traceability = { path = "../arcxa-traceability" }
+arcxa-verification = { path = "../arcxa-verification" }
 
 # Core utilities
 anyhow = "1.0"

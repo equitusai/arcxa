@@ -64,8 +64,9 @@ use crate::api::sos_validation::types::{
     WhatIfResponse,
 };
 use crate::api::sos_validation::validators::{
-    compare_interface_schemas, evaluate_policy_results, extract_policy_placeholders,
-    map_policy_severity, render_policy_query, validate_coordinate_compatibility,
+    compare_interface_schemas, evaluate_policy_results, evaluate_schema_transformability,
+    extract_policy_placeholders, map_policy_severity, render_policy_query,
+    validate_contract_transformation_rules, validate_coordinate_compatibility,
     validate_data_against_schema, validate_sla_metrics, validate_unit_compatibility,
     PolicyQueryTemplateError,
 };
@@ -2088,17 +2089,22 @@ impl SosValidationService {
     ) -> Result<ValidationExecution, SosValidationServiceError> {
         let schema_report = compare_interface_schemas(&provider.schema, &consumer.schema)
             .map_err(map_internal_error)?;
-        let has_unit_transform = contract_has_transform_rule(contract, "unit");
-        let has_coordinate_transform = contract_has_transform_rule(contract, "coordinate");
+        let transformation_report = contract
+            .map(|contract| validate_contract_transformation_rules(&contract.transformation_rules))
+            .unwrap_or_default();
         let unit_report = validate_unit_compatibility(
             provider.unit_system.as_deref(),
             consumer.unit_system.as_deref(),
-            has_unit_transform,
+            transformation_report.unit_rule.as_ref(),
         );
         let coordinate_report = validate_coordinate_compatibility(
             provider.coordinate_system.as_deref(),
             consumer.coordinate_system.as_deref(),
-            has_coordinate_transform,
+            transformation_report.coordinate_rule.as_ref(),
+        );
+        let schema_transformability = evaluate_schema_transformability(
+            &schema_report,
+            transformation_report.field_mapping_rule.as_ref(),
         );
 
         let mut checks = Vec::new();
@@ -2134,6 +2140,31 @@ impl SosValidationService {
             },
         ));
         checks.push(simple_check(
+            "schema_transformability",
+            schema_transformability.transformable,
+            if schema_transformability.transformable {
+                "info"
+            } else {
+                "warning"
+            },
+            if schema_report.compatible {
+                "No schema transformations are required".to_string()
+            } else if schema_transformability.transformable {
+                format!(
+                    "Explicit field mappings cover schema gaps for: {}",
+                    schema_transformability.covered_paths.join(", ")
+                )
+            } else if schema_transformability.covered_paths.is_empty() {
+                "No explicit field mappings cover the current schema gaps".to_string()
+            } else {
+                format!(
+                    "Explicit field mappings cover {} but unresolved schema gaps remain: {}",
+                    schema_transformability.covered_paths.join(", "),
+                    schema_transformability.uncovered_issues.join("; ")
+                )
+            },
+        ));
+        checks.push(simple_check(
             "unit_compatibility",
             unit_report.compatible,
             if unit_report.compatible {
@@ -2153,6 +2184,14 @@ impl SosValidationService {
             },
             coordinate_report.explanation,
         ));
+        if contract.is_some() && !transformation_report.valid {
+            checks.push(simple_check(
+                "transformation_rules",
+                false,
+                "error",
+                transformation_report.issues.join("; "),
+            ));
+        }
         checks.push(simple_check(
             "contract_alignment",
             contract.is_some(),
@@ -3289,23 +3328,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn contract_has_transform_rule(contract: Option<&Contract>, kind: &str) -> bool {
-    let Some(contract) = contract else {
-        return false;
-    };
-
-    let candidate_keys = [
-        format!("{}_transform", kind),
-        format!("{}_conversion", kind),
-        format!("{}_mapping", kind),
-        kind.to_string(),
-    ];
-
-    candidate_keys
-        .iter()
-        .any(|key| contract.transformation_rules.contains_key(key))
-}
-
 fn normalize_non_empty(
     field_name: &str,
     value: String,
@@ -4209,6 +4231,241 @@ mod tests {
         assert_eq!(lineage.reports.len(), 2);
         assert_eq!(lineage.edges.len(), 1);
         assert_eq!(lineage.edges[0].relationship, "prov:wasRevisionOf");
+    }
+
+    #[test]
+    fn interface_validation_reports_nested_schema_incompatibility() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        storage_manager
+            .put_system(&sample_system("provider-system", "Provider"))
+            .expect("provider system should be stored");
+        storage_manager
+            .put_system(&sample_system("consumer-system", "Consumer"))
+            .expect("consumer system should be stored");
+
+        let mut provider = sample_interface("provider-if", "provider-system", "SI");
+        provider.schema = json!({
+            "type": "object",
+            "required": ["payload"],
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {
+                        "status": { "type": "string" }
+                    }
+                }
+            }
+        });
+
+        let mut consumer = sample_interface("consumer-if", "consumer-system", "SI");
+        consumer.schema = json!({
+            "type": "object",
+            "required": ["payload"],
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "required": ["status", "priority"],
+                    "properties": {
+                        "status": { "type": "string" },
+                        "priority": { "type": "integer" }
+                    }
+                }
+            }
+        });
+
+        storage_manager
+            .put_interface(&provider)
+            .expect("provider interface should be stored");
+        storage_manager
+            .put_interface(&consumer)
+            .expect("consumer interface should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("nested schema validation should execute");
+
+        assert!(!response.passed);
+
+        let schema_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "schema_compatibility")
+            .expect("schema compatibility check should be present");
+
+        assert!(!schema_check.passed);
+        assert!(schema_check.description.contains("$.payload.priority"));
+    }
+
+    #[test]
+    fn interface_validation_rejects_misaligned_unit_transform_rule() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        register_minimal_catalog(&storage_manager);
+
+        let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
+        contract.transformation_rules = HashMap::from([(
+            "unit_transform".to_string(),
+            json!({"from": "Imperial", "to": "SI"}),
+        )]);
+        storage_manager
+            .put_contract(&contract)
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(!response.passed);
+
+        let unit_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "unit_compatibility")
+            .expect("unit compatibility check should be present");
+        assert!(!unit_check.passed);
+        assert!(unit_check
+            .description
+            .contains("maps Imperial -> SI instead"));
+    }
+
+    #[test]
+    fn interface_validation_surfaces_invalid_transformation_rule_shape() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        register_minimal_catalog(&storage_manager);
+
+        let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
+        contract.transformation_rules = HashMap::from([(
+            "unit_transform".to_string(),
+            Value::String("SI->Imperial".to_string()),
+        )]);
+        storage_manager
+            .put_contract(&contract)
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(!response.passed);
+
+        let transform_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "transformation_rules")
+            .expect("transformation_rules check should be present");
+        assert!(!transform_check.passed);
+        assert!(transform_check.description.contains("must be an object"));
+    }
+
+    #[test]
+    fn interface_validation_reports_schema_transformability_from_field_mapping() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        storage_manager
+            .put_system(&sample_system("provider-system", "Provider"))
+            .expect("provider system should be stored");
+        storage_manager
+            .put_system(&sample_system("consumer-system", "Consumer"))
+            .expect("consumer system should be stored");
+
+        let mut provider = sample_interface("provider-if", "provider-system", "SI");
+        provider.schema = json!({
+            "type": "object",
+            "required": ["payload"],
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "required": ["status", "rank"],
+                    "properties": {
+                        "status": { "type": "string" },
+                        "rank": { "type": "integer" }
+                    }
+                }
+            }
+        });
+
+        let mut consumer = sample_interface("consumer-if", "consumer-system", "SI");
+        consumer.schema = json!({
+            "type": "object",
+            "required": ["payload"],
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "required": ["status", "priority"],
+                    "properties": {
+                        "status": { "type": "string" },
+                        "priority": { "type": "integer" }
+                    }
+                }
+            }
+        });
+
+        storage_manager
+            .put_interface(&provider)
+            .expect("provider interface should be stored");
+        storage_manager
+            .put_interface(&consumer)
+            .expect("consumer interface should be stored");
+
+        let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
+        contract.transformation_rules = HashMap::from([(
+            "field_mapping".to_string(),
+            json!({
+                "mappings": [
+                    { "from": "$.payload.rank", "to": "$.payload.priority" }
+                ]
+            }),
+        )]);
+        storage_manager
+            .put_contract(&contract)
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("transformability validation should execute");
+
+        assert!(!response.passed);
+
+        let schema_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "schema_compatibility")
+            .expect("schema compatibility check should be present");
+        assert!(!schema_check.passed);
+        assert!(schema_check.description.contains("$.payload.priority"));
+
+        let transformability_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "schema_transformability")
+            .expect("schema transformability check should be present");
+        assert!(transformability_check.passed);
+        assert!(transformability_check
+            .description
+            .contains("$.payload.priority"));
     }
 
     #[test]

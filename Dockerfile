@@ -46,6 +46,9 @@ COPY proto ./proto
 # Copy all crate directories (workspace members only, no root src)
 COPY arcxa-core ./arcxa-core
 COPY arcxa-model-service ./arcxa-model-service
+COPY arcxa-evidence-ingestion ./arcxa-evidence-ingestion
+COPY arcxa-traceability ./arcxa-traceability
+COPY arcxa-verification ./arcxa-verification
 COPY arcxa-shard ./arcxa-shard
 COPY arcxa-coordinator ./arcxa-coordinator
 COPY arcxa-cli ./arcxa-cli
@@ -65,6 +68,30 @@ RUN cargo build --locked --release --lib
 
 # Build arcxa-model-service (with clean environment for OpenSSL)
 WORKDIR /usr/src/arcxa/arcxa-model-service
+RUN env -u CC -u CFLAGS -u CPPFLAGS -u LDFLAGS \
+        -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u LIBRARY_PATH \
+        PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig \
+        RUSTFLAGS="" \
+        cargo build --locked --release
+
+# Build arcxa-evidence-ingestion
+WORKDIR /usr/src/arcxa/arcxa-evidence-ingestion
+RUN env -u CC -u CFLAGS -u CPPFLAGS -u LDFLAGS \
+        -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u LIBRARY_PATH \
+        PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig \
+        RUSTFLAGS="" \
+        cargo build --locked --release
+
+# Build arcxa-traceability
+WORKDIR /usr/src/arcxa/arcxa-traceability
+RUN env -u CC -u CFLAGS -u CPPFLAGS -u LDFLAGS \
+        -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u LIBRARY_PATH \
+        PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig \
+        RUSTFLAGS="" \
+        cargo build --locked --release
+
+# Build arcxa-verification
+WORKDIR /usr/src/arcxa/arcxa-verification
 RUN env -u CC -u CFLAGS -u CPPFLAGS -u LDFLAGS \
         -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u LIBRARY_PATH \
         PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig \
@@ -119,6 +146,9 @@ ENV ROW_LINEAGE_DB_PATH=/home/eqworker/data/row-lineage-db
 
 # Copy binaries from shared target directory
 COPY --from=builder --chown=eqworker:eqworker /usr/src/arcxa/target/release/arcxa-model-service ./
+COPY --from=builder --chown=eqworker:eqworker /usr/src/arcxa/target/release/arcxa-evidence-ingestion ./
+COPY --from=builder --chown=eqworker:eqworker /usr/src/arcxa/target/release/arcxa-traceability ./
+COPY --from=builder --chown=eqworker:eqworker /usr/src/arcxa/target/release/arcxa-verification ./
 COPY --from=builder --chown=eqworker:eqworker /usr/src/arcxa/target/release/arcxa-shard ./
 COPY --from=builder --chown=eqworker:eqworker /usr/src/arcxa/target/release/arcxa-coordinator ./
 # COPY ./models/ ./models/

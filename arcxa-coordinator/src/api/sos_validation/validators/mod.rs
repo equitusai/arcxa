@@ -40,6 +40,7 @@ pub mod field_validator;
 pub mod policy_validator;
 pub mod schema_validator;
 pub mod sla_validator;
+pub mod transformation_validator;
 pub mod unit_validator;
 
 // Export commonly used validators
@@ -50,10 +51,16 @@ pub use policy_validator::{
     PolicyEvaluation, PolicyQueryTemplateError,
 };
 pub use schema_validator::{
-    compare_interface_schemas, validate_data_against_schema, SchemaCompatibilityReport,
+    compare_interface_schemas, validate_data_against_schema, SchemaCompatibilityIssue,
+    SchemaCompatibilityIssueKind, SchemaCompatibilityReport,
 };
 pub use sla_validator::{
     validate_sla_metric_name, validate_sla_metric_value, validate_sla_metrics,
     validate_sla_operator,
+};
+pub use transformation_validator::{
+    evaluate_schema_transformability, validate_contract_transformation_rules,
+    CanonicalFieldMappingRuleSet, CanonicalTransformRule, FieldMappingRule,
+    SchemaTransformabilityReport, TransformationRulesValidation,
 };
 pub use unit_validator::{validate_unit_compatibility, UnitCompatibilityResult};

@@ -1477,7 +1477,7 @@ pub async fn create_contract(
     Json(request): Json<CreateDataContractRequest>,
 ) -> Result<Json<DataContractResponse>, (StatusCode, Json<SosErrorResponse>)> {
     use super::storage::Contract;
-    use super::validators::validate_sla_metrics;
+    use super::validators::{validate_contract_transformation_rules, validate_sla_metrics};
     use chrono::Utc;
 
     // ========================================================================
@@ -1686,6 +1686,19 @@ pub async fn create_contract(
             Json(SosErrorResponse {
                 error: "INVALID_SLA_METRICS".to_string(),
                 message: e.to_string(),
+                details: None,
+            }),
+        ));
+    }
+
+    let transformation_report =
+        validate_contract_transformation_rules(&request.transformation_rules);
+    if !transformation_report.valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(SosErrorResponse {
+                error: "INVALID_TRANSFORMATION_RULES".to_string(),
+                message: transformation_report.issues.join("; "),
                 details: None,
             }),
         ));
@@ -1986,7 +1999,7 @@ pub async fn update_contract(
     Path(id): Path<String>,
     Json(request): Json<UpdateDataContractRequest>,
 ) -> Result<Json<DataContractResponse>, (StatusCode, Json<SosErrorResponse>)> {
-    use super::validators::validate_sla_metrics;
+    use super::validators::{validate_contract_transformation_rules, validate_sla_metrics};
     use chrono::Utc;
 
     // Get storage manager from state
@@ -2105,6 +2118,18 @@ pub async fn update_contract(
     }
 
     if let Some(transformation_rules) = request.transformation_rules {
+        let transformation_report = validate_contract_transformation_rules(&transformation_rules);
+        if !transformation_report.valid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(SosErrorResponse {
+                    error: "INVALID_TRANSFORMATION_RULES".to_string(),
+                    message: transformation_report.issues.join("; "),
+                    details: None,
+                }),
+            ));
+        }
+
         semantic_changes |= contract.transformation_rules != transformation_rules;
         contract.transformation_rules = transformation_rules;
     }

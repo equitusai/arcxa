@@ -16,6 +16,7 @@ pub mod import_jobs; // Background import job management
 pub mod kafka_raft; // Kafka Raft coordination API (distributed replay leader election)
 pub mod lineage; // Lineage query API (Sprint 1.9: W3C PROV query endpoints)
 pub mod loader; // ETL loader API (CSV to DB2/PostgreSQL)
+pub mod migration_evidence; // Migration evidence graph API for IBM RISE / SAP explainability
 pub mod ontology; // Phase 1: Custom ontology management API
 pub mod ontology_ddl; // Ontology-driven DDL API (GAP-002 Phase 3: Semantic DDL generation)
 pub mod openapi;
@@ -162,6 +163,8 @@ pub struct ApiState {
     pub cancellation_manager: Option<Arc<crate::workflows::CancellationManager>>,
     // Systems-of-Systems validation storage (high-performance RocksDB backend)
     pub sos_storage_manager: Option<Arc<crate::api::sos_validation::storage::SosStorageManager>>,
+    // Migration evidence graph gateway for explainability, audit, and sign-off flows
+    pub migration_evidence_gateway: Option<Arc<crate::api::migration_evidence::MigrationEvidenceGateway>>,
     // Schema discovery state manager (Phase 1: Async discovery with progress tracking)
     pub discovery_state: Option<Arc<crate::mapping::discovery::DiscoveryStateManager>>,
     // Schema discovery orchestrator (Phase 1: Intelligent schema discovery)

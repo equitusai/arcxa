@@ -1,5 +1,9 @@
 use anyhow::Result;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueHint};
+use graphica_cli::migration_evidence::{
+    load_required_json_value, ExplainValueRequest, MigrationEvidenceApiClient,
+    MigrationEvidenceApiConfig,
+};
 use graphica_cli::sos::{
     load_json_value_array, load_optional_json_value_object, render_pretty_json,
     ListPoliciesRequest, ListSystemsRequest, PolicyValidationRequest,
@@ -44,12 +48,133 @@ struct ApiOptions {
 enum AdminCommand {
     /// Systems-of-systems operational controls and governance audit views.
     Sos(SosCommand),
+    /// Migration evidence connectors, explainability, and audit views.
+    MigrationEvidence(MigrationEvidenceCommand),
 }
 
 #[derive(Parser)]
 struct SosCommand {
     #[command(subcommand)]
     command: SosSubcommand,
+}
+
+#[derive(Parser)]
+struct MigrationEvidenceCommand {
+    #[command(subcommand)]
+    command: MigrationEvidenceSubcommand,
+}
+
+#[derive(Subcommand)]
+enum MigrationEvidenceSubcommand {
+    /// Manage migration-evidence connectors and ingestion runs.
+    Connectors(MigrationEvidenceConnectorCommand),
+    /// Inspect or rebuild the traceability read models behind the evidence graph.
+    Runtime(MigrationEvidenceRuntimeCommand),
+    /// Explain one migrated value from the evidence graph.
+    Explain(MigrationEvidenceExplainCommand),
+    /// Build an operator-friendly audit bundle for one migrated value.
+    Audit(MigrationEvidenceAuditCommand),
+    /// Fetch the signed evidence packet for one object and optional value key.
+    EvidencePacket {
+        #[arg(long)]
+        object_id: String,
+        #[arg(long)]
+        value_key: Option<String>,
+    },
+    /// Fetch persisted verification and reconciliation controls for one object.
+    Controls {
+        #[arg(long)]
+        object_id: String,
+    },
+    /// Fetch persisted program-level exceptions.
+    Exceptions {
+        #[arg(long)]
+        program_id: String,
+    },
+    /// Fetch persisted program-level approvals.
+    Approvals {
+        #[arg(long)]
+        program_id: String,
+    },
+}
+
+#[derive(Parser)]
+struct MigrationEvidenceRuntimeCommand {
+    #[command(subcommand)]
+    command: MigrationEvidenceRuntimeSubcommand,
+}
+
+#[derive(Subcommand)]
+enum MigrationEvidenceRuntimeSubcommand {
+    /// Show backend, replay, and read-model status for the traceability service.
+    Status,
+    /// Rebuild the read models from the persisted event log.
+    Rebuild,
+}
+
+#[derive(Parser)]
+struct MigrationEvidenceConnectorCommand {
+    #[command(subcommand)]
+    command: MigrationEvidenceConnectorSubcommand,
+}
+
+#[derive(Subcommand)]
+enum MigrationEvidenceConnectorSubcommand {
+    /// Upsert one migration-evidence connector from JSON.
+    Upsert(MigrationEvidenceJsonInput),
+    /// Start one connector run from JSON.
+    Run {
+        #[arg(long)]
+        connector_id: String,
+        #[command(flatten)]
+        input: MigrationEvidenceJsonInput,
+    },
+}
+
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("migration_evidence_json_input")
+        .required(true)
+        .args(["json", "file"])
+))]
+struct MigrationEvidenceJsonInput {
+    /// Inline JSON object payload.
+    #[arg(long, conflicts_with = "file")]
+    json: Option<String>,
+    /// Path to a JSON file containing one object payload.
+    #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "json")]
+    file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct MigrationEvidenceExplainCommand {
+    #[arg(long)]
+    program_id: String,
+    #[arg(long)]
+    object_id: String,
+    #[arg(long)]
+    target_field_path: String,
+    #[arg(long)]
+    target_record_id: Option<String>,
+    #[arg(long)]
+    source_record_id: Option<String>,
+}
+
+#[derive(Args)]
+struct MigrationEvidenceAuditCommand {
+    #[arg(long)]
+    program_id: String,
+    #[arg(long)]
+    object_id: String,
+    #[arg(long)]
+    target_field_path: String,
+    #[arg(long)]
+    target_record_id: Option<String>,
+    #[arg(long)]
+    source_record_id: Option<String>,
+    /// Override the evidence-packet lookup key when the default field-path lookup is not enough.
+    #[arg(long)]
+    value_key: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -427,14 +552,22 @@ enum PolicySigningKeySubcommand {
 async fn main() -> Result<()> {
     init_tracing()?;
     let cli = Cli::parse();
-    let client = SosApiClient::new(SosApiConfig {
+    let sos_client = SosApiClient::new(SosApiConfig {
+        base_url: cli.api.base_url.clone(),
+        token: cli.api.token.clone(),
+        timeout: Duration::from_secs(cli.api.timeout_seconds),
+    })?;
+    let migration_evidence_client = MigrationEvidenceApiClient::new(MigrationEvidenceApiConfig {
         base_url: cli.api.base_url,
         token: cli.api.token,
         timeout: Duration::from_secs(cli.api.timeout_seconds),
     })?;
 
     let response = match cli.command {
-        AdminCommand::Sos(sos) => run_sos_command(&client, sos).await?,
+        AdminCommand::Sos(sos) => run_sos_command(&sos_client, sos).await?,
+        AdminCommand::MigrationEvidence(command) => {
+            run_migration_evidence_command(&migration_evidence_client, command).await?
+        }
     };
 
     println!("{}", render_pretty_json(&response)?);
@@ -452,6 +585,110 @@ async fn run_sos_command(client: &SosApiClient, command: SosCommand) -> Result<s
         SosSubcommand::Analytics(command) => run_analytics_command(client, command).await,
         SosSubcommand::Contracts(command) => run_contract_command(client, command).await,
         SosSubcommand::Policies(command) => run_policy_command(client, command).await,
+    }
+}
+
+async fn run_migration_evidence_command(
+    client: &MigrationEvidenceApiClient,
+    command: MigrationEvidenceCommand,
+) -> Result<serde_json::Value> {
+    match command.command {
+        MigrationEvidenceSubcommand::Connectors(command) => {
+            run_migration_evidence_connector_command(client, command).await
+        }
+        MigrationEvidenceSubcommand::Runtime(command) => match command.command {
+            MigrationEvidenceRuntimeSubcommand::Status => client.runtime_status().await,
+            MigrationEvidenceRuntimeSubcommand::Rebuild => client.rebuild_read_models().await,
+        },
+        MigrationEvidenceSubcommand::Explain(command) => {
+            client
+                .explain_value(ExplainValueRequest {
+                    program_id: &command.program_id,
+                    object_id: &command.object_id,
+                    target_field_path: &command.target_field_path,
+                    target_record_id: command.target_record_id.as_deref(),
+                    source_record_id: command.source_record_id.as_deref(),
+                })
+                .await
+        }
+        MigrationEvidenceSubcommand::Audit(command) => {
+            let explanation = client
+                .explain_value(ExplainValueRequest {
+                    program_id: &command.program_id,
+                    object_id: &command.object_id,
+                    target_field_path: &command.target_field_path,
+                    target_record_id: command.target_record_id.as_deref(),
+                    source_record_id: command.source_record_id.as_deref(),
+                })
+                .await?;
+            let value_key = command
+                .value_key
+                .clone()
+                .or_else(|| {
+                    command
+                        .target_record_id
+                        .as_deref()
+                        .map(|record_id| format!("{record_id}::{}", command.target_field_path))
+                })
+                .unwrap_or_else(|| command.target_field_path.clone());
+            let packet = client
+                .evidence_packet(&command.object_id, Some(&value_key))
+                .await?;
+            let controls = client.object_controls(&command.object_id).await?;
+            let exceptions = client.program_exceptions(&command.program_id).await?;
+            let approvals = client.program_approvals(&command.program_id).await?;
+            Ok(serde_json::json!({
+                "explanation": explanation,
+                "evidence_packet": packet,
+                "controls": controls,
+                "exceptions": exceptions,
+                "approvals": approvals,
+            }))
+        }
+        MigrationEvidenceSubcommand::EvidencePacket {
+            object_id,
+            value_key,
+        } => {
+            client
+                .evidence_packet(&object_id, value_key.as_deref())
+                .await
+        }
+        MigrationEvidenceSubcommand::Controls { object_id } => {
+            client.object_controls(&object_id).await
+        }
+        MigrationEvidenceSubcommand::Exceptions { program_id } => {
+            client.program_exceptions(&program_id).await
+        }
+        MigrationEvidenceSubcommand::Approvals { program_id } => {
+            client.program_approvals(&program_id).await
+        }
+    }
+}
+
+async fn run_migration_evidence_connector_command(
+    client: &MigrationEvidenceApiClient,
+    command: MigrationEvidenceConnectorCommand,
+) -> Result<serde_json::Value> {
+    match command.command {
+        MigrationEvidenceConnectorSubcommand::Upsert(input) => {
+            let connector = load_required_json_value(
+                input.json.as_deref(),
+                input.file.as_deref(),
+                "connector",
+            )?;
+            client.upsert_connector(connector).await
+        }
+        MigrationEvidenceConnectorSubcommand::Run {
+            connector_id,
+            input,
+        } => {
+            let request = load_required_json_value(
+                input.json.as_deref(),
+                input.file.as_deref(),
+                "connector run request",
+            )?;
+            client.run_connector(&connector_id, request).await
+        }
     }
 }
 

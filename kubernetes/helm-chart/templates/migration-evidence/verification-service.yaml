@@ -1,0 +1,15 @@
+{{- if .Values.graphica.migrationEvidence.verification.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcxa-verification
+  namespace: {{ .Release.namespace }}
+spec:
+  selector:
+    app: graphica
+    component: migration-evidence-verification
+  ports:
+  - name: grpc
+    port: 50073
+    targetPort: grpc
+{{- end }}

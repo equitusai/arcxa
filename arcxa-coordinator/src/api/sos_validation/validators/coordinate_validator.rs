@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::transformation_validator::CanonicalTransformRule;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinateCompatibilityResult {
     pub compatible: bool,
@@ -11,7 +13,7 @@ pub struct CoordinateCompatibilityResult {
 pub fn validate_coordinate_compatibility(
     provider_coordinate_system: Option<&str>,
     consumer_coordinate_system: Option<&str>,
-    has_transform_rule: bool,
+    transform_rule: Option<&CanonicalTransformRule>,
 ) -> CoordinateCompatibilityResult {
     match (provider_coordinate_system, consumer_coordinate_system) {
         (Some(provider), Some(consumer)) if provider.eq_ignore_ascii_case(consumer) => {
@@ -22,19 +24,36 @@ pub fn validate_coordinate_compatibility(
                 ),
             }
         }
-        (Some(provider), Some(consumer)) if has_transform_rule => {
-            CoordinateCompatibilityResult {
-                compatible: true,
-                explanation: format!(
-                    "Coordinate systems differ ({provider} -> {consumer}) but a contract transformation rule is present"
-                ),
+        (Some(provider), Some(consumer)) => match transform_rule {
+            Some(rule)
+                if rule.from.eq_ignore_ascii_case(provider)
+                    && rule.to.eq_ignore_ascii_case(consumer) =>
+            {
+                CoordinateCompatibilityResult {
+                    compatible: true,
+                    explanation: format!(
+                        "Coordinate systems differ ({provider} -> {consumer}) but contract rule '{}' explicitly maps that conversion{}",
+                        rule.key,
+                        rule.strategy
+                            .as_deref()
+                            .map(|strategy| format!(" using strategy '{strategy}'"))
+                            .unwrap_or_default()
+                    ),
+                }
             }
-        }
-        (Some(provider), Some(consumer)) => CoordinateCompatibilityResult {
-            compatible: false,
-            explanation: format!(
-                "Coordinate systems differ ({provider} -> {consumer}) and no explicit transformation rule is defined"
-            ),
+            Some(rule) => CoordinateCompatibilityResult {
+                compatible: false,
+                explanation: format!(
+                    "Coordinate systems differ ({provider} -> {consumer}) and contract rule '{}' maps {} -> {} instead",
+                    rule.key, rule.from, rule.to
+                ),
+            },
+            None => CoordinateCompatibilityResult {
+                compatible: false,
+                explanation: format!(
+                    "Coordinate systems differ ({provider} -> {consumer}) and no explicit transformation rule is defined"
+                ),
+            },
         },
         (None, None) => CoordinateCompatibilityResult {
             compatible: true,
@@ -54,16 +73,44 @@ pub fn validate_coordinate_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::sos_validation::validators::CanonicalTransformRule;
 
     #[test]
     fn coordinate_mismatch_without_transform_fails() {
-        let result = validate_coordinate_compatibility(Some("WGS84"), Some("ECI_J2000"), false);
+        let result = validate_coordinate_compatibility(Some("WGS84"), Some("ECI_J2000"), None);
         assert!(!result.compatible);
     }
 
     #[test]
     fn coordinate_mismatch_with_transform_passes() {
-        let result = validate_coordinate_compatibility(Some("WGS84"), Some("ECI_J2000"), true);
+        let result = validate_coordinate_compatibility(
+            Some("WGS84"),
+            Some("ECI_J2000"),
+            Some(&CanonicalTransformRule {
+                key: "coordinate_transform".to_string(),
+                from: "WGS84".to_string(),
+                to: "ECI_J2000".to_string(),
+                strategy: Some("helmert".to_string()),
+            }),
+        );
         assert!(result.compatible);
+    }
+
+    #[test]
+    fn coordinate_mismatch_with_wrong_transform_fails() {
+        let result = validate_coordinate_compatibility(
+            Some("WGS84"),
+            Some("ECI_J2000"),
+            Some(&CanonicalTransformRule {
+                key: "coordinate_transform".to_string(),
+                from: "ECI_J2000".to_string(),
+                to: "WGS84".to_string(),
+                strategy: None,
+            }),
+        );
+        assert!(!result.compatible);
+        assert!(result
+            .explanation
+            .contains("maps ECI_J2000 -> WGS84 instead"));
     }
 }

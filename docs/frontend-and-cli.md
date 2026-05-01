@@ -133,6 +133,47 @@ It exists for migration-oriented storage tasks such as:
 
 This binary is not a general operator shell. It is a focused maintenance tool.
 
+## Migration Evidence Operator Surface
+
+The migration-evidence wedge is no longer API-only.
+
+Current operator surfaces:
+- the coordinator REST API exposes the core connector, run, explain, controls, exceptions, approvals, and evidence-packet flows
+- the frontend now includes a dedicated `Migration Evidence` workspace at `/migration-evidence`
+- the `admin` CLI now includes a `migration-evidence` command group
+
+The current frontend workspace is intentionally focused on the first operator proof points:
+- explain one migrated value
+- assemble the signed audit bundle around that value
+- register and run migration-evidence connectors
+- inspect whether a connector run was delivered directly or through Kafka, and whether traceability acknowledged it synchronously
+- inspect runtime backend, replay readiness, read-model counts, and event-bus consumer posture
+- trigger a read-model rebuild when recovery or drift repair is needed
+
+The current CLI surface is intentionally thin and coordinator-faithful:
+- `admin migration-evidence connectors upsert`
+- `admin migration-evidence connectors run`
+- `admin migration-evidence explain`
+- `admin migration-evidence audit`
+- `admin migration-evidence evidence-packet`
+- `admin migration-evidence controls`
+- `admin migration-evidence exceptions`
+- `admin migration-evidence approvals`
+- `admin migration-evidence runtime status`
+- `admin migration-evidence runtime rebuild`
+
+Migration-evidence connector-run responses now also expose:
+- `delivery_mode` with `direct` or `kafka`
+- `traceability_acknowledged` to distinguish synchronous direct writes from async bus delivery
+
+Migration-evidence runtime-status responses now also expose:
+- event-bus mode such as `direct` or `kafka`
+- consumer state such as `disabled`, `running`, `recovering`, or `stopped`
+- processed, malformed, and retried async-message counters
+- the configured topic and consumer group when Kafka mode is enabled
+- broker reachability, discovered broker count, partition assignment, and lag diagnostics
+- aggregated connector-store backend and health details from the ingestion service
+
 ## Choosing Between Frontend And CLI
 
 A simple rule of thumb works well:
@@ -151,6 +192,7 @@ A few concrete examples:
 A few current boundaries are worth keeping in view:
 - the frontend covers much more of the platform overall, but the CLI is intentionally focused and does not attempt full API parity
 - the SoS workspace is currently the deepest end-to-end operator experience in the CLI
+- the migration-evidence workspace is now the dedicated operator surface for IBM/SAP migration explainability, but it is still narrower than the mature SoS workbench
 - both the frontend and CLI still reflect some historical `graphica` naming and `8080` defaults, so local-development setup benefits from explicit base-URL configuration
 
 ## Related Guides

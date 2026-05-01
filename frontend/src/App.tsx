@@ -47,6 +47,9 @@ const DataCatalogue = lazy(() =>
 const SosValidation = lazy(() =>
   import('@/pages/SosValidation').then((module) => ({ default: module.SosValidation }))
 );
+const MigrationEvidence = lazy(() =>
+  import('@/pages/MigrationEvidence').then((module) => ({ default: module.MigrationEvidence }))
+);
 
 // Create a client for React Query
 const queryClient = new QueryClient({
@@ -97,6 +100,7 @@ function App() {
               <Route path="fusion-new" element={<FusionNew />} />
               <Route path="workflows" element={<WorkflowDesigner />} />
               <Route path="sos-validation" element={<SosValidation />} />
+              <Route path="migration-evidence" element={<MigrationEvidence />} />
               <Route path="ontologies" element={<Ontologies />} />
               <Route path="sparql" element={<SparqlPlayground />} />
               <Route

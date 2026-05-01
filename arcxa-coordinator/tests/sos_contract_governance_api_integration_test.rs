@@ -9,7 +9,7 @@ use graphica_coordinator::api::sos_validation::{
     storage::{Interface, System},
     types::{
         DataContractResponse, ListContractApprovalRequestsResponse,
-        SosContractApprovalEvidenceResponse, SosContractApprovalRequestResponse,
+        SosContractApprovalEvidenceResponse, SosContractApprovalRequestResponse, SosErrorResponse,
         ValidationReportResponse, ValidationResponse,
     },
 };
@@ -415,6 +415,121 @@ fn seed_contract_interfaces_only(harness: &sos_api::SosApiHarness) {
             updated_at: Utc::now(),
         })
         .expect("consumer interface should be stored");
+}
+
+#[tokio::test]
+#[serial]
+async fn build_router_contract_create_rejects_malformed_transformation_rules() {
+    let harness = setup_authenticated_build_router_app();
+    let token = harness
+        .token
+        .as_deref()
+        .expect("authenticated harness should expose a token");
+    seed_contract_interfaces_only(&harness);
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/sos/contracts",
+            token,
+            json!({
+                "contract_id": "contract-invalid-transform",
+                "contract_name": "Invalid Transform Contract",
+                "provider_interface_id": "provider-if",
+                "consumer_interface_id": "consumer-if",
+                "sla_metrics": [{
+                    "name": "latency_ms",
+                    "value": 100.0,
+                    "operator": "<=",
+                    "unit": "ms"
+                }],
+                "transformation_rules": {
+                    "unit_transform": "SI->Imperial"
+                },
+                "description": "Malformed transform rule",
+                "tags": ["api-test"]
+            }),
+        ))
+        .await
+        .expect("malformed contract creation request should complete");
+
+    let error: SosErrorResponse = assert_json_response(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(error.error, "INVALID_TRANSFORMATION_RULES");
+    assert!(error.message.contains("must be an object"));
+}
+
+#[tokio::test]
+#[serial]
+async fn build_router_interface_validation_rejects_misaligned_unit_transform_rule() {
+    let harness = setup_authenticated_build_router_app();
+    let token = harness
+        .token
+        .as_deref()
+        .expect("authenticated harness should expose a token");
+    seed_contract_interfaces_only(&harness);
+
+    let created = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/sos/contracts",
+            token,
+            json!({
+                "contract_id": "contract-misaligned-transform",
+                "contract_name": "Misaligned Transform Contract",
+                "provider_interface_id": "provider-if",
+                "consumer_interface_id": "consumer-if",
+                "sla_metrics": [{
+                    "name": "latency_ms",
+                    "value": 100.0,
+                    "operator": "<=",
+                    "unit": "ms"
+                }],
+                "transformation_rules": {
+                    "unit_transform": {
+                        "from": "Imperial",
+                        "to": "SI"
+                    }
+                },
+                "description": "Rule endpoints do not match the interface direction",
+                "tags": ["api-test"]
+            }),
+        ))
+        .await
+        .expect("contract creation request should succeed");
+    let _: DataContractResponse = assert_json_response(created, StatusCode::OK).await;
+
+    let validation_response = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/sos/validate",
+            token,
+            json!({
+                "type": "interface_compatibility",
+                "provider_interface_id": "provider-if",
+                "consumer_interface_id": "consumer-if"
+            }),
+        ))
+        .await
+        .expect("interface compatibility request should succeed");
+    let validation: ValidationResponse =
+        assert_json_response(validation_response, StatusCode::OK).await;
+
+    assert!(!validation.passed);
+    let unit_check = validation
+        .checks
+        .iter()
+        .find(|check| check.check_name == "unit_compatibility")
+        .expect("unit compatibility check should be present");
+    assert!(!unit_check.passed);
+    assert!(unit_check
+        .description
+        .contains("maps Imperial -> SI instead"));
 }
 
 #[tokio::test]

@@ -1,0 +1,15 @@
+{{- if .Values.graphica.migrationEvidence.traceability.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcxa-traceability
+  namespace: {{ .Release.namespace }}
+spec:
+  selector:
+    app: graphica
+    component: migration-evidence-traceability
+  ports:
+  - name: grpc
+    port: 50072
+    targetPort: grpc
+{{- end }}

@@ -9,6 +9,7 @@
 //! - **backup**: Backup and restore utilities (future)
 //! - **validate**: Workflow and configuration validation (future)
 
+pub mod migration_evidence;
 pub mod sos;
 
 /// Common CLI utilities and helpers

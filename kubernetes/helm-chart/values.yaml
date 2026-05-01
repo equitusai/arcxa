@@ -45,6 +45,29 @@ graphica:
     enabled: true
     replicas: 1
     imageTag: "registry.gitlab.com/equitus/fusion/graphica:master"
+  migrationEvidence:
+    mode: "embedded"
+    eventDeliveryMode: "direct"
+    kafka:
+      topic: "arcxa.migration-evidence.events.v1"
+      consumerGroup: "arcxa-traceability"
+    ingestion:
+      enabled: false
+      replicas: 1
+      imageTag: "registry.gitlab.com/equitus/fusion/graphica:master"
+      storage:
+        size: 5Gi
+    traceability:
+      enabled: false
+      replicas: 1
+      imageTag: "registry.gitlab.com/equitus/fusion/graphica:master"
+      signingKeyHex: "0101010101010101010101010101010101010101010101010101010101010101"
+      storage:
+        size: 20Gi
+    verification:
+      enabled: false
+      replicas: 1
+      imageTag: "registry.gitlab.com/equitus/fusion/graphica:master"
   frontend:
     enabled: true
     replicas: 1

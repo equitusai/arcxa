@@ -1,0 +1,68 @@
+{{- if .Values.graphica.migrationEvidence.traceability.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arcxa-traceability
+  namespace: {{ .Release.namespace }}
+spec:
+  serviceName: arcxa-traceability
+  replicas: {{ .Values.graphica.migrationEvidence.traceability.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: graphica
+      component: migration-evidence-traceability
+  template:
+    metadata:
+      labels:
+        app: graphica
+        component: migration-evidence-traceability
+    spec:
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
+      imagePullSecrets:
+      - name: arcxa-pull
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: arcxa-traceability
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        image: {{ .Values.graphica.migrationEvidence.traceability.imageTag }}
+        args:
+          - ./arcxa-traceability
+          - --listen-addr=0.0.0.0:50072
+          - --rocksdb-path=/data/rocksdb
+          - --legacy-state-path=/data/state.json
+          {{- if .Values.graphica.shards.enabled }}
+          - --shard-endpoint=http://arcxa-shard:9100
+          {{- end }}
+          {{- if eq (.Values.graphica.migrationEvidence.eventDeliveryMode | default "direct") "kafka" }}
+          - --kafka-bootstrap-servers={{ include "kafka.brokerList" . }}
+          - --kafka-topic={{ .Values.graphica.migrationEvidence.kafka.topic | default "arcxa.migration-evidence.events.v1" }}
+          - --kafka-consumer-group={{ .Values.graphica.migrationEvidence.kafka.consumerGroup | default "arcxa-traceability" }}
+          {{- end }}
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: ARCXA_TRACEABILITY_SIGNING_KEY_HEX
+          valueFrom:
+            secretKeyRef:
+              name: arcxa-traceability-signing-key
+              key: ARCXA_TRACEABILITY_SIGNING_KEY_HEX
+        ports:
+        - name: grpc
+          containerPort: 50072
+        volumeMounts:
+        - name: migration-evidence-traceability-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: migration-evidence-traceability-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: {{ .Values.graphica.migrationEvidence.traceability.storage.size }}
+      storageClassName: {{ .Values.global.storageClassName }}
+      volumeMode: Filesystem
+{{- end }}

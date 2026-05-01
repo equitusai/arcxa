@@ -3,6 +3,9 @@ members = [
     "arcxa-core",
     "arcxa-coordinator",
     "arcxa-model-service",
+    "arcxa-evidence-ingestion",
+    "arcxa-traceability",
+    "arcxa-verification",
     "arcxa-migrations",
     "arcxa-cli",
 ]

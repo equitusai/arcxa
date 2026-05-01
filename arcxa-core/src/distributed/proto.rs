@@ -21,6 +21,11 @@ pub mod prediction_service {
     tonic::include_proto!("graphica.ml");
 }
 
+// Migration evidence services for evidence ingestion, traceability, and verification
+pub mod migration_evidence {
+    tonic::include_proto!("graphica.migration.v1");
+}
+
 // Re-export for convenience
 pub use graphica_v1::*;
 
@@ -31,6 +36,10 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 // Coordinator service file descriptor for reflection
 pub const COORDINATOR_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/coordinator_descriptor.bin"));
+
+// Migration evidence descriptor set for gRPC reflection
+pub const MIGRATION_EVIDENCE_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/migration_evidence_descriptor.bin"));
 
 #[cfg(test)]
 mod tests {

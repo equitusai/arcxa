@@ -1,0 +1,44 @@
+{{- if .Values.graphica.migrationEvidence.verification.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arcxa-verification
+  namespace: {{ .Release.namespace }}
+spec:
+  replicas: {{ .Values.graphica.migrationEvidence.verification.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: graphica
+      component: migration-evidence-verification
+  template:
+    metadata:
+      labels:
+        app: graphica
+        component: migration-evidence-verification
+    spec:
+      serviceAccountName: {{ .Values.graphica.serviceAccountName }}
+      imagePullSecrets:
+      - name: arcxa-pull
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: arcxa-verification
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        image: {{ .Values.graphica.migrationEvidence.verification.imageTag }}
+        args:
+          - ./arcxa-verification
+          - --listen-addr=0.0.0.0:50073
+          - --event-delivery-mode={{ .Values.graphica.migrationEvidence.eventDeliveryMode | default "direct" }}
+          - --traceability-endpoint=http://arcxa-traceability:50072
+          {{- if eq (.Values.graphica.migrationEvidence.eventDeliveryMode | default "direct") "kafka" }}
+          - --kafka-bootstrap-servers={{ include "kafka.brokerList" . }}
+          - --kafka-topic={{ .Values.graphica.migrationEvidence.kafka.topic | default "arcxa.migration-evidence.events.v1" }}
+          {{- end }}
+        env:
+        - name: RUST_LOG
+          value: info
+        ports:
+        - name: grpc
+          containerPort: 50073
+{{- end }}

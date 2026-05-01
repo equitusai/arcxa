@@ -232,7 +232,10 @@ dependencies = [
  "ahash 0.8.12",
  "anyhow",
  "arcxa-core",
+ "arcxa-evidence-ingestion",
  "arcxa-migrations",
+ "arcxa-traceability",
+ "arcxa-verification",
  "argon2",
  "arrow2",
  "async-stream",
@@ -411,6 +414,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcxa-evidence-ingestion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arcxa-core",
+ "arcxa-verification",
+ "async-trait",
+ "chrono",
+ "clap",
+ "prost",
+ "rdkafka",
+ "reqwest 0.11.27",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "arcxa-migrations"
 version = "0.1.0"
 dependencies = [
@@ -448,6 +475,53 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "arcxa-traceability"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arcxa-core",
+ "async-trait",
+ "base64 0.21.7",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "prost",
+ "rdkafka",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "arcxa-verification"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arcxa-core",
+ "async-trait",
+ "chrono",
+ "clap",
+ "prost",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

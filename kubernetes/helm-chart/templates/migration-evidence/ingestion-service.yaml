@@ -1,0 +1,15 @@
+{{- if .Values.graphica.migrationEvidence.ingestion.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcxa-evidence-ingestion
+  namespace: {{ .Release.namespace }}
+spec:
+  selector:
+    app: graphica
+    component: migration-evidence-ingestion
+  ports:
+  - name: grpc
+    port: 50071
+    targetPort: grpc
+{{- end }}

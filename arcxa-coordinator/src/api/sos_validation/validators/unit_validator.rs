@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::transformation_validator::CanonicalTransformRule;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitCompatibilityResult {
     pub compatible: bool,
@@ -11,7 +13,7 @@ pub struct UnitCompatibilityResult {
 pub fn validate_unit_compatibility(
     provider_unit_system: Option<&str>,
     consumer_unit_system: Option<&str>,
-    has_transform_rule: bool,
+    transform_rule: Option<&CanonicalTransformRule>,
 ) -> UnitCompatibilityResult {
     match (provider_unit_system, consumer_unit_system) {
         (Some(provider), Some(consumer)) if provider.eq_ignore_ascii_case(consumer) => {
@@ -22,17 +24,36 @@ pub fn validate_unit_compatibility(
                 ),
             }
         }
-        (Some(provider), Some(consumer)) if has_transform_rule => UnitCompatibilityResult {
-            compatible: true,
-            explanation: format!(
-                "Unit systems differ ({provider} -> {consumer}) but a contract transformation rule is present"
-            ),
-        },
-        (Some(provider), Some(consumer)) => UnitCompatibilityResult {
-            compatible: false,
-            explanation: format!(
-                "Unit systems differ ({provider} -> {consumer}) and no explicit transformation rule is defined"
-            ),
+        (Some(provider), Some(consumer)) => match transform_rule {
+            Some(rule)
+                if rule.from.eq_ignore_ascii_case(provider)
+                    && rule.to.eq_ignore_ascii_case(consumer) =>
+            {
+                UnitCompatibilityResult {
+                    compatible: true,
+                    explanation: format!(
+                        "Unit systems differ ({provider} -> {consumer}) but contract rule '{}' explicitly maps that conversion{}",
+                        rule.key,
+                        rule.strategy
+                            .as_deref()
+                            .map(|strategy| format!(" using strategy '{strategy}'"))
+                            .unwrap_or_default()
+                    ),
+                }
+            }
+            Some(rule) => UnitCompatibilityResult {
+                compatible: false,
+                explanation: format!(
+                    "Unit systems differ ({provider} -> {consumer}) and contract rule '{}' maps {} -> {} instead",
+                    rule.key, rule.from, rule.to
+                ),
+            },
+            None => UnitCompatibilityResult {
+                compatible: false,
+                explanation: format!(
+                    "Unit systems differ ({provider} -> {consumer}) and no explicit transformation rule is defined"
+                ),
+            },
         },
         (None, None) => UnitCompatibilityResult {
             compatible: true,
@@ -52,16 +73,42 @@ pub fn validate_unit_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::sos_validation::validators::CanonicalTransformRule;
 
     #[test]
     fn mismatched_units_without_transform_fail() {
-        let result = validate_unit_compatibility(Some("SI"), Some("Imperial"), false);
+        let result = validate_unit_compatibility(Some("SI"), Some("Imperial"), None);
         assert!(!result.compatible);
     }
 
     #[test]
     fn mismatched_units_with_transform_pass() {
-        let result = validate_unit_compatibility(Some("SI"), Some("Imperial"), true);
+        let result = validate_unit_compatibility(
+            Some("SI"),
+            Some("Imperial"),
+            Some(&CanonicalTransformRule {
+                key: "unit_transform".to_string(),
+                from: "SI".to_string(),
+                to: "Imperial".to_string(),
+                strategy: Some("linear_scale".to_string()),
+            }),
+        );
         assert!(result.compatible);
+    }
+
+    #[test]
+    fn mismatched_units_with_wrong_transform_fail() {
+        let result = validate_unit_compatibility(
+            Some("SI"),
+            Some("Imperial"),
+            Some(&CanonicalTransformRule {
+                key: "unit_transform".to_string(),
+                from: "Imperial".to_string(),
+                to: "SI".to_string(),
+                strategy: None,
+            }),
+        );
+        assert!(!result.compatible);
+        assert!(result.explanation.contains("maps Imperial -> SI instead"));
     }
 }
