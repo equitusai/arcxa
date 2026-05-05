@@ -1,0 +1,39 @@
+[package]
+name = "arcxa-traceability"
+version = "0.1.0"
+edition = "2021"
+authors = ["Equitus Corporation"]
+license-file = "../LICENSE.md"
+description = "ARCXA migration evidence traceability service"
+
+[lib]
+name = "arcxa_traceability"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcxa-traceability"
+path = "src/main.rs"
+
+[dependencies]
+graphica_core = { package = "arcxa-core", path = "../arcxa-core" }
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.21"
+chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = "2.1"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.36", features = ["full"] }
+tonic = { version = "0.11", features = ["gzip"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+prost = "0.12"
+rocksdb = { workspace = true }
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+[dev-dependencies]
+tempfile = "3.0"
