@@ -218,6 +218,20 @@ Important current response behavior:
 - connector-run summaries now include `delivery_mode` so operators can tell whether the run used direct or Kafka-backed delivery
 - connector-run summaries also include `traceability_acknowledged` so callers can distinguish synchronous local ingestion from async bus publication
 - verification-backed connector runs now report those same delivery fields from the verification service path, rather than depending on ingestion to translate and forward the verification result afterward
+- migration-evidence verification sources now support `http_json`, `sap_hana_sql`, `sap_s4_odata`, `sap_ecc_adapter`, and `sap_ecc_rfc_bapi`
+- migration-evidence ingestion sources now also support `sap_ecc_staged_export` and `sap_idoc_extractor_package` for higher-assurance ECC evidence capture
+- `sap_s4_odata` connector runs now also enrich connector metadata from the service `$metadata` document when available, including discovered entity set, entity type, key fields, and property-type summaries
+- `sap_s4_odata` verification now validates requested projection fields against discovered `$metadata` properties when that capability summary is available
+- `sap_s4_odata` verification also follows OData pagination links for larger rowset checks, with control metadata showing fetched page counts and pagination truncation when a safety limit is reached
+- `sap_ecc_adapter` connector runs now discover adapter-advertised ECC capabilities such as object name, key fields, field types, and projection support, and persist that metadata on the connector record
+- `sap_ecc_adapter` verification now validates requested fields against the discovered ECC adapter capability model when available, rather than treating SAP ECC reads as generic HANA SQL
+- `sap_ecc_adapter` verification also follows adapter pagination via `next_path` metadata for larger rowset checks, with control metadata showing fetched page counts and truncation when a safety limit is reached
+- `sap_ecc_rfc_bapi` connector runs now discover bridge-advertised ECC capabilities such as function module or BAPI name, export structure, key fields, field types, and cursor-pagination support, and persist that metadata on the connector record
+- `sap_ecc_rfc_bapi` verification now validates requested fields against the discovered RFC/BAPI capability model when available, follows cursor-based pagination for larger rowset checks, and records ECC-specific projection and pagination metadata on the resulting control evidence
+- `sap_ecc_staged_export` connector runs can ingest either an inline bundle or a manifest-backed local package, validate the declared dataset row count and checksum, and then normalize rules, executions, exceptions, controls, and approvals into canonical migration-evidence events
+- `sap_ecc_staged_export` is intentionally an evidence-ingestion transport, not a live verification transport; it is designed for controlled ECC extract handoffs rather than RFC- or BAPI-style runtime reads
+- `sap_idoc_extractor_package` connector runs can ingest inline or manifest-backed IDoc/extractor evidence bundles, validate row counts and checksums, and normalize package-level executions, exceptions, controls, and approvals into canonical migration-evidence events
+- `sap_idoc_extractor_package` is intentionally an ingestion transport, not a live verification transport; it is designed for structured extractor handoffs rather than online SAP reads
 - runtime-status responses now include:
   - traceability event-bus posture such as mode, consumer state, counters, startup-failure reason, lag posture, broker reachability, discovered broker count, partition assignment, and lag diagnostics
   - ingestion connector-store posture such as backend type, health, connector count, and writability

@@ -15,7 +15,7 @@ export type MigrationConnectorVendor =
   | 'generic';
 
 export type MigrationConnectorRole = 'migration_artifact_source' | 'verification_source';
-export type ConnectorTransport = 'http_json' | 'sap_hana_sql' | 'manual_drop';
+export type ConnectorTransport = 'http_json' | 'sap_hana_sql' | 'sap_s4_odata' | 'manual_drop';
 export type ConnectorAuthKind = 'none' | 'bearer' | 'api_key' | 'basic';
 export type MigrationObjectType =
   | 'table'

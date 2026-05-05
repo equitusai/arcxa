@@ -1,8 +1,44 @@
 mod delivery;
+mod ecc_adapter;
+mod ecc_rfc_bapi;
+mod ecc_staged_export;
+mod idoc_extractor;
+mod odata;
 
 pub use delivery::{
     GrpcMigrationEvidenceEventForwarder, KafkaMigrationEvidenceEventForwarder,
     MigrationEvidenceEventForwarder,
+};
+pub use ecc_adapter::{
+    derive_sap_ecc_projection_fields, discover_sap_ecc_adapter_capabilities,
+    extract_sap_ecc_adapter_next_path, field_types_by_name, merge_sap_ecc_adapter_page_payloads,
+    normalize_sap_ecc_adapter_payload, resolve_sap_ecc_adapter_value,
+    SapEccAdapterCapabilities, SapEccAdapterField, SapEccProjectionFields,
+};
+pub use ecc_rfc_bapi::{
+    derive_sap_ecc_rfc_bapi_projection_fields, discover_sap_ecc_rfc_bapi_capabilities,
+    extract_sap_ecc_rfc_bapi_next_cursor, merge_sap_ecc_rfc_bapi_page_payloads,
+    normalize_sap_ecc_rfc_bapi_payload, resolve_sap_ecc_rfc_bapi_value,
+    rfc_field_types_by_name, SapEccRfcBapiCapabilities, SapEccRfcBapiField,
+    SapEccRfcBapiProjectionFields,
+};
+pub use ecc_staged_export::{
+    SapEccStagedApprovalEvidence, SapEccStagedControlEvidence, SapEccStagedExceptionEvidence,
+    SapEccStagedExecutionEvidence, SapEccStagedExportBundle, SapEccStagedExportDataFormat,
+    SapEccStagedExportDataSet, SapEccStagedExportManifest, SapEccStagedRuleEvidence,
+};
+pub use idoc_extractor::{
+    SapIdocExtractorApprovalEvidence, SapIdocExtractorBundle, SapIdocExtractorControlEvidence,
+    SapIdocExtractorDataFormat, SapIdocExtractorDataSet, SapIdocExtractorExceptionEvidence,
+    SapIdocExtractorExecutionEvidence, SapIdocExtractorManifest,
+};
+pub use odata::{
+    derive_sap_s4_odata_projection_fields, discover_sap_s4_odata_capabilities,
+    extract_json_path_value, extract_sap_s4_odata_next_link,
+    infer_sap_s4_odata_metadata_path, infer_sap_s4_odata_service_root_path,
+    merge_sap_s4_odata_page_payloads, normalize_sap_s4_odata_payload,
+    resolve_sap_s4_odata_value, SapS4ODataCapabilities, SapS4ODataProjectionFields,
+    SapS4ODataProperty, SapS4ODataVersion,
 };
 
 use chrono::{DateTime, Utc};
@@ -36,6 +72,11 @@ pub enum MigrationConnectorRole {
 pub enum ConnectorTransport {
     HttpJson,
     SapHanaSql,
+    SapEccAdapter,
+    SapEccRfcBapi,
+    SapEccStagedExport,
+    SapIdocExtractorPackage,
+    SapS4OData,
     ManualDrop,
 }
 

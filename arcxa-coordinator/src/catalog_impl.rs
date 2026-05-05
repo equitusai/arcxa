@@ -11,6 +11,7 @@ use graphica_core::catalog::{
     client::{CatalogResult, DataSourceCatalog, UsageStatistics},
     connector::{Credentials, DataSourceConnector},
     connectors::ConnectorRegistry,
+    coerce_hana_scalar,
     resolve_oracle_odbc_resolution,
     types::{normalize_source_type_name, ConnectionDetails, DataSource, SourceConfig},
 };
@@ -626,7 +627,7 @@ impl InMemoryDataSourceCatalog {
             };
 
         let supports_parameters = match source_type {
-            "Oracle" => uses_odbc_routing,
+            "Oracle" | "SAPHANA" => uses_odbc_routing,
             _ => connector_capabilities.parameterized_queries,
         };
         let can_infer_schema = if source_type == "SAPHANA" {
@@ -1066,55 +1067,61 @@ impl InMemoryDataSourceCatalog {
         parameters: HashMap<String, serde_json::Value>,
         limit: Option<usize>,
     ) -> CatalogResult<QueryResult> {
+        #[cfg(not(feature = "odbc"))]
+        {
+            let _ = (source, credentials, query, parameters, limit);
+            return Err(GraphicaError::Internal(
+                "ODBC feature is not enabled".to_string(),
+            ));
+        }
+
         #[cfg(feature = "odbc")]
-        use crate::mapping::discovery::extractors::odbc::OdbcPoolableConnection;
-        use crate::mapping::discovery::extractors::{
-            db2::DB2Extractor, oracle::OracleExtractor, saphana::SAPHANAExtractor,
-        };
+        {
+            use crate::mapping::discovery::extractors::odbc::OdbcPoolableConnection;
+            use crate::mapping::discovery::extractors::{
+                db2::DB2Extractor, oracle::OracleExtractor, saphana::SAPHANAExtractor,
+            };
 
-        let start_time = std::time::Instant::now();
+            let start_time = std::time::Instant::now();
 
-        // Build connection string based on source type
-        let connection_string = match &source.connection.config {
-            SourceConfig::DB2(_) => DB2Extractor::build_connection_string(source, credentials)
-                .map_err(|e| {
-                    GraphicaError::Internal(format!("Failed to build DB2 connection: {}", e))
-                })?,
-            SourceConfig::Oracle(_) => {
-                OracleExtractor::build_connection_string(source, credentials).map_err(|e| {
-                    GraphicaError::Internal(format!("Failed to build Oracle connection: {}", e))
-                })?
-            }
-            SourceConfig::SAPHANA(_) => {
-                SAPHANAExtractor::build_connection_string(source, credentials).map_err(|e| {
-                    GraphicaError::Internal(format!("Failed to build SAP HANA connection: {}", e))
-                })?
-            }
-            _ => {
-                return Err(GraphicaError::Internal(
-                    "Unsupported source type for ODBC execution".to_string(),
-                ))
-            }
-        };
+            let connection_string = match &source.connection.config {
+                SourceConfig::DB2(_) => DB2Extractor::build_connection_string(source, credentials)
+                    .map_err(|e| {
+                        GraphicaError::Internal(format!("Failed to build DB2 connection: {}", e))
+                    })?,
+                SourceConfig::Oracle(_) => {
+                    OracleExtractor::build_connection_string(source, credentials).map_err(|e| {
+                        GraphicaError::Internal(format!("Failed to build Oracle connection: {}", e))
+                    })?
+                }
+                SourceConfig::SAPHANA(_) => {
+                    SAPHANAExtractor::build_connection_string(source, credentials).map_err(|e| {
+                        GraphicaError::Internal(format!(
+                            "Failed to build SAP HANA connection: {}",
+                            e
+                        ))
+                    })?
+                }
+                _ => {
+                    return Err(GraphicaError::Internal(
+                        "Unsupported source type for ODBC execution".to_string(),
+                    ))
+                }
+            };
 
-        // Apply limit if specified
-        let final_query = if let Some(limit) = limit {
-            Self::apply_limit_to_query(query, limit, &source.source_type)
-        } else {
-            query.to_string()
-        };
+            let final_query = if let Some(limit) = limit {
+                Self::apply_limit_to_query(query, limit, &source.source_type)
+            } else {
+                query.to_string()
+            };
 
-        tracing::debug!(
-            "Executing ODBC query for {} datasource (pooled): {}",
-            source.source_type,
-            &final_query[..final_query.len().min(100)]
-        );
+            tracing::debug!(
+                "Executing ODBC query for {} datasource (pooled): {}",
+                source.source_type,
+                &final_query[..final_query.len().min(100)]
+            );
 
-        // Execute via pooled connection or fallback to non-pooled when parameters require native
-        // ODBC binding support.
-        let result: crate::mapping::discovery::extractors::odbc::OdbcQueryResult = {
-            #[cfg(feature = "odbc")]
-            {
+            let result: crate::mapping::discovery::extractors::odbc::OdbcQueryResult =
                 match &source.connection.config {
                     SourceConfig::Oracle(_) => {
                         if !parameters.is_empty() {
@@ -1174,7 +1181,10 @@ impl InMemoryDataSourceCatalog {
                             })?;
                             conn.execute_query_with_metadata(&final_query)
                                 .map_err(|e| {
-                                    GraphicaError::Internal(format!("SAP HANA query failed: {}", e))
+                                    GraphicaError::Internal(format!(
+                                        "SAP HANA query failed: {}",
+                                        e
+                                    ))
                                 })?
                         }
                     }
@@ -1194,8 +1204,6 @@ impl InMemoryDataSourceCatalog {
                                 ))
                             })?
                         } else {
-                            // DB2 uses its own dedicated pool via workflow system
-                            // Fallback to non-pooled execution for catalog queries
                             use crate::mapping::discovery::extractors::odbc::execute_odbc_query_with_metadata;
                             execute_odbc_query_with_metadata(&connection_string, &final_query)
                                 .await
@@ -1208,71 +1216,77 @@ impl InMemoryDataSourceCatalog {
                         }
                     }
                     _ => unreachable!(),
-                }
-            }
+                };
 
-            #[cfg(not(feature = "odbc"))]
-            {
-                return Err(GraphicaError::Internal(
-                    "ODBC feature is not enabled".to_string(),
-                ));
-            }
-        };
+            let execution_time_ms = start_time.elapsed().as_millis() as u64;
+            let odbc_columns = result.columns.clone();
+            let odbc_rows = result.rows;
 
-        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+            let json_rows: Vec<serde_json::Value> =
+                if matches!(&source.connection.config, SourceConfig::SAPHANA(_)) {
+                    odbc_rows
+                        .into_iter()
+                        .map(|row| {
+                            let mut object = serde_json::Map::with_capacity(odbc_columns.len());
+                            for column in &odbc_columns {
+                                let value = row
+                                    .get(&column.name)
+                                    .map(|raw| coerce_hana_scalar(raw, &column.data_type))
+                                    .unwrap_or(serde_json::Value::Null);
+                                object.insert(column.name.clone(), value);
+                            }
+                            serde_json::Value::Object(object)
+                        })
+                        .collect()
+                } else {
+                    odbc_rows
+                        .into_iter()
+                        .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
+                        .collect()
+                };
 
-        // Convert HashMap<String, String> rows to Vec<serde_json::Value>
-        let json_rows: Vec<serde_json::Value> = result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
-            .collect();
+            let row_count = json_rows.len();
+            let columns = if odbc_columns.is_empty() {
+                None
+            } else {
+                Some(
+                    odbc_columns
+                        .iter()
+                        .map(|col| ColumnDefinition {
+                            name: col.name.clone(),
+                            data_type: col.data_type.clone(),
+                            nullable: col.nullable,
+                            primary_key: false,
+                            default_value: None,
+                            semantic_type: None,
+                            statistics: None,
+                        })
+                        .collect(),
+                )
+            };
 
-        let row_count = json_rows.len();
+            let truncated = limit.map(|l| row_count >= l).unwrap_or(false);
+            let column_count = columns
+                .as_ref()
+                .map(|c: &Vec<ColumnDefinition>| c.len())
+                .unwrap_or(0);
 
-        // Map ODBC column info to ColumnDefinition with actual types
-        let columns = if result.columns.is_empty() {
-            None
-        } else {
-            Some(
-                result
-                    .columns
-                    .into_iter()
-                    .map(|col| ColumnDefinition {
-                        name: col.name,
-                        data_type: col.data_type,
-                        nullable: col.nullable,
-                        primary_key: false, // Not available from query results
-                        default_value: None,
-                        semantic_type: None,
-                        statistics: None,
-                    })
-                    .collect(),
-            )
-        };
+            tracing::info!(
+                "ODBC query executed successfully: {} rows, {} columns in {}ms (truncated: {})",
+                row_count,
+                column_count,
+                execution_time_ms,
+                truncated
+            );
 
-        let truncated = limit.map(|l| row_count >= l).unwrap_or(false);
-
-        let column_count = columns
-            .as_ref()
-            .map(|c: &Vec<ColumnDefinition>| c.len())
-            .unwrap_or(0);
-
-        tracing::info!(
-            "ODBC query executed successfully: {} rows, {} columns in {}ms (truncated: {})",
-            row_count,
-            column_count,
-            execution_time_ms,
-            truncated
-        );
-
-        Ok(QueryResult {
-            rows: json_rows,
-            row_count,
-            execution_time_ms,
-            truncated,
-            columns,
-        })
+            Ok(QueryResult {
+                rows: json_rows,
+                row_count,
+                execution_time_ms,
+                truncated,
+                columns,
+            })
+        }
     }
 
     fn discovered_schema_to_definition(discovered: DiscoveredSchema) -> SchemaDefinition {
@@ -2026,6 +2040,67 @@ mod tests {
         assert_eq!(capabilities.supports_parameters, cfg!(feature = "odbc"));
         assert_eq!(capabilities.supports_incremental, cfg!(feature = "odbc"));
         assert_eq!(capabilities.can_write_workflow, cfg!(feature = "odbc"));
+    }
+
+    #[tokio::test]
+    async fn test_hana_capabilities_advertise_parameter_support_and_discovery_truthfully() {
+        let registry = Arc::new(RwLock::new(ConnectorRegistry::new()));
+        let catalog = InMemoryDataSourceCatalog::new(registry);
+
+        let source = DataSource::new(
+            "SAP HANA Source".to_string(),
+            "SAP HANA".to_string(),
+            ConnectionDetails {
+                secret_ref: "vault://hana".to_string(),
+                config: SourceConfig::SAPHANA(graphica_core::catalog::types::SAPHANAConfig {
+                    host: "hana.example.com".to_string(),
+                    port: 30015,
+                    database: "HXE".to_string(),
+                    schema: Some("SAPABAP1".to_string()),
+                    instance_number: Some("00".to_string()),
+                }),
+                encryption_enabled: true,
+                credentials: HashMap::from([
+                    ("username".to_string(), "SYSTEM".to_string()),
+                    ("password".to_string(), "secret".to_string()),
+                ]),
+            },
+        );
+        let mut source = source;
+        source
+            .metadata
+            .insert("odbc_driver".to_string(), "HDBODBC".to_string());
+
+        let source_id = source.id.clone();
+        let created = catalog.register_source(source).await.unwrap();
+        assert_eq!(created.status, DataSourceStatus::Unverified);
+
+        let created_capabilities = created
+            .capabilities
+            .expect("capabilities should be populated after registration");
+        assert_eq!(
+            created_capabilities.supports_parameters,
+            cfg!(feature = "odbc")
+        );
+        assert!(created_capabilities.supports_incremental);
+        assert!(!created_capabilities.can_infer_schema);
+        assert!(!created_capabilities.can_write_workflow);
+
+        catalog
+            .update_status(&source_id, DataSourceStatus::Active, None)
+            .await
+            .unwrap();
+
+        let response = catalog.get_source(&source_id).await.unwrap();
+        let capabilities = response
+            .capabilities
+            .expect("capabilities should be populated");
+        assert_eq!(capabilities.supports_parameters, cfg!(feature = "odbc"));
+        assert!(capabilities.supports_incremental);
+        assert_eq!(capabilities.can_infer_schema, cfg!(feature = "odbc"));
+        assert_eq!(capabilities.can_query, cfg!(feature = "odbc"));
+        assert_eq!(capabilities.can_read_workflow, cfg!(feature = "odbc"));
+        assert!(!capabilities.can_write_workflow);
     }
 
     #[tokio::test]

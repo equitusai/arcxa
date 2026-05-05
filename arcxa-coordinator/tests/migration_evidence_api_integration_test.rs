@@ -36,11 +36,15 @@ use graphica_coordinator::{
 use graphica_core::migration_evidence::{
     ApprovalEvent, ApprovalStatus, ConnectorAuth, ConnectorEndpoint, ConnectorRunRequest,
     ConnectorTransport, ControlStatus, ExecutionEvent, ExecutionStatus, ExceptionRecord,
-    ExceptionSeverity, ExceptionStatus, GrpcMigrationEvidenceEventForwarder,
-    MigrationConnector, MigrationConnectorRole, MigrationConnectorVendor,
-    MigrationEvidenceArtifactType, MigrationEvidenceDeliveryMode, MigrationEvidenceEvent,
-    MigrationObject, MigrationObjectType, MigrationProgram, SourceFieldRef, TargetFieldRef,
-    TransformationRule, TransformationRuleType, VerificationRequest, VerificationSource,
+    ExceptionSeverity, ExceptionStatus, GrpcMigrationEvidenceEventForwarder, MigrationConnector,
+    MigrationConnectorRole, MigrationConnectorVendor, MigrationEvidenceArtifactType,
+    MigrationEvidenceDeliveryMode, MigrationEvidenceEvent, MigrationObject, MigrationObjectType,
+    MigrationProgram, SapEccStagedControlEvidence, SapEccStagedExceptionEvidence,
+    SapEccStagedExportBundle, SapEccStagedExportDataFormat, SapEccStagedExportDataSet,
+    SapEccStagedExportManifest, SapEccStagedRuleEvidence, SapIdocExtractorBundle,
+    SapIdocExtractorDataFormat, SapIdocExtractorDataSet, SapIdocExtractorManifest,
+    SourceFieldRef, TargetFieldRef, TransformationRule, TransformationRuleType,
+    VerificationRequest, VerificationSource,
 };
 use graphica_core::distributed::proto::migration_evidence::{
     evidence_ingestion_service_server::EvidenceIngestionServiceServer,
@@ -352,6 +356,564 @@ async fn migration_evidence_error_paths_return_not_found_and_bad_request() {
     let invalid_payload: MigrationEvidenceErrorResponse =
         assert_json_response(invalid_connector, StatusCode::BAD_REQUEST).await;
     assert!(invalid_payload.error.contains("program_id cannot be empty"));
+}
+
+#[tokio::test]
+async fn migration_evidence_supports_s4_odata_verification_transport() {
+    let harness = setup_authenticated_app().await;
+
+    let mut connector = sample_verification_connector();
+    connector.connector_id = "s4-odata-verification".to_string();
+    connector.name = "SAP S/4 OData Verification Source".to_string();
+    connector.vendor = MigrationConnectorVendor::SapS4;
+    connector.transport = ConnectorTransport::SapS4OData;
+    connector.endpoint.path = "/sap/opu/odata4/API_SALES_ORDER/A_SalesOrder?$top=1".to_string();
+
+    let create = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors",
+            &harness.token,
+            connector_payload(connector),
+        ))
+        .await
+        .expect("s4 verification connector create should succeed");
+    let created: UpsertMigrationConnectorResponse =
+        assert_json_response(create, StatusCode::OK).await;
+    assert_eq!(created.connector.transport, ConnectorTransport::SapS4OData);
+
+    let verification_endpoint = spawn_verification_source(json!({
+        "value": [
+            {
+                "SalesOrder": "SO-1",
+                "NetAmount": "100.00",
+                "TransactionCurrency": "USD"
+            }
+        ]
+    }))
+    .await;
+
+    let run = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors/s4-odata-verification/runs",
+            &harness.token,
+            json!(ConnectorRunRequest {
+                run_label: Some("s4-odata-verify".to_string()),
+                manual_events: vec![],
+                verification: Some(VerificationRequest {
+                    control_name: "sales-order-projection-match".to_string(),
+                    program_id: "program-rise-1".to_string(),
+                    object_id: "object-sales-order".to_string(),
+                    source_field: SourceFieldRef {
+                        system: "SAP ECC".to_string(),
+                        object_name: "VBAK".to_string(),
+                        field_name: "DOCUMENT".to_string(),
+                        field_path: "$.projection".to_string(),
+                        semantic_type: None,
+                        record_id: Some("SO-1".to_string()),
+                    },
+                    target_field: TargetFieldRef {
+                        system: "SAP S/4HANA".to_string(),
+                        object_name: "A_SalesOrder".to_string(),
+                        field_name: "projection".to_string(),
+                        field_path: "$.projection".to_string(),
+                        semantic_type: None,
+                        record_id: Some("SO-1".to_string()),
+                    },
+                    expected_value: Some(json!({
+                        "SalesOrder": "SO-1",
+                        "NetAmount": 100.0,
+                        "TransactionCurrency": "USD"
+                    })),
+                    tolerance: Some(0.0),
+                    metadata: HashMap::from([("value_key".to_string(), "SO-1::$.projection".to_string())]),
+                    source: VerificationSource {
+                        transport: ConnectorTransport::SapS4OData,
+                        query: None,
+                        endpoint: Some(ConnectorEndpoint {
+                            base_url: verification_endpoint,
+                            path: "/sap/opu/odata4/API_SALES_ORDER/A_SalesOrder?$top=1".to_string(),
+                            method: "GET".to_string(),
+                            headers: HashMap::new(),
+                        }),
+                        auth: ConnectorAuth::default(),
+                        connection: HashMap::new(),
+                    },
+                }),
+                request_body: None,
+                request_headers: HashMap::new(),
+            }),
+        ))
+        .await
+        .expect("s4 odata verification run should succeed");
+    let response: RunMigrationConnectorResponse = assert_json_response(run, StatusCode::OK).await;
+
+    assert_eq!(response.summary.ingested_event_count, 2);
+    let control_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("control_result")))
+        .expect("control event should be present");
+    let metadata = control_event
+        .get("payload")
+        .and_then(|payload| payload.get("metadata"))
+        .and_then(|metadata| metadata.as_object())
+        .expect("control metadata should be present");
+    assert_eq!(
+        metadata.get("comparison_scope"),
+        Some(&json!("record_projection"))
+    );
+    assert_eq!(metadata.get("verified_field_count"), Some(&json!("3")));
+    assert_eq!(
+        metadata.get("odata_projection_metadata_validated"),
+        Some(&json!("true"))
+    );
+    assert_eq!(
+        metadata.get("odata_entity_set"),
+        Some(&json!("A_SalesOrder"))
+    );
+    assert_eq!(
+        metadata.get("odata_requested_fields_json"),
+        Some(&json!("[\"NetAmount\",\"SalesOrder\",\"TransactionCurrency\"]"))
+    );
+}
+
+#[tokio::test]
+async fn migration_evidence_supports_sap_ecc_adapter_verification_transport() {
+    let harness = setup_authenticated_app().await;
+
+    let mut connector = sample_verification_connector();
+    connector.connector_id = "sap-ecc-adapter-verification".to_string();
+    connector.name = "SAP ECC Adapter Verification Source".to_string();
+    connector.vendor = MigrationConnectorVendor::SapEcc;
+    connector.transport = ConnectorTransport::SapEccAdapter;
+    connector.endpoint.path = "/adapter/v1/records/VBAK?record_id=500000001".to_string();
+
+    let create = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors",
+            &harness.token,
+            connector_payload(connector),
+        ))
+        .await
+        .expect("sap ecc adapter verification connector create should succeed");
+    let created: UpsertMigrationConnectorResponse =
+        assert_json_response(create, StatusCode::OK).await;
+    assert_eq!(created.connector.transport, ConnectorTransport::SapEccAdapter);
+
+    let verification_endpoint = spawn_ecc_adapter_source(
+        json!({
+            "record": {
+                "VBELN": "500000001",
+                "NETWR": "100.00",
+                "WAERK": "USD"
+            }
+        }),
+        json!({
+            "capabilities": {
+                "adapter_version": "0.1.0",
+                "system_id": "PRD",
+                "client": "100",
+                "object_name": "VBAK",
+                "key_fields": ["VBELN"],
+                "supports_record_projection": true,
+                "supports_rowset_projection": true,
+                "supports_key_lookup": true,
+                "fields": [
+                    {"name": "VBELN", "abap_type": "CHAR", "nullable": false},
+                    {"name": "NETWR", "abap_type": "CURR", "nullable": true},
+                    {"name": "WAERK", "abap_type": "CUKY", "nullable": true}
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let run = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors/sap-ecc-adapter-verification/runs",
+            &harness.token,
+            json!(ConnectorRunRequest {
+                run_label: Some("sap-ecc-adapter-verify".to_string()),
+                manual_events: vec![],
+                verification: Some(VerificationRequest {
+                    control_name: "vbak-projection-match".to_string(),
+                    program_id: "program-rise-1".to_string(),
+                    object_id: "object-sales-order".to_string(),
+                    source_field: SourceFieldRef {
+                        system: "SAP ECC".to_string(),
+                        object_name: "VBAK".to_string(),
+                        field_name: "projection".to_string(),
+                        field_path: "$.projection".to_string(),
+                        semantic_type: None,
+                        record_id: Some("500000001".to_string()),
+                    },
+                    target_field: TargetFieldRef {
+                        system: "ARCXA ECC Adapter".to_string(),
+                        object_name: "VBAK".to_string(),
+                        field_name: "projection".to_string(),
+                        field_path: "$.projection".to_string(),
+                        semantic_type: None,
+                        record_id: Some("500000001".to_string()),
+                    },
+                    expected_value: Some(json!({
+                        "VBELN": "500000001",
+                        "NETWR": 100.0,
+                        "WAERK": "USD"
+                    })),
+                    tolerance: Some(0.0),
+                    metadata: HashMap::from([("value_key".to_string(), "500000001::$.projection".to_string())]),
+                    source: VerificationSource {
+                        transport: ConnectorTransport::SapEccAdapter,
+                        query: None,
+                        endpoint: Some(ConnectorEndpoint {
+                            base_url: verification_endpoint,
+                            path: "/adapter/v1/records/VBAK?record_id=500000001".to_string(),
+                            method: "GET".to_string(),
+                            headers: HashMap::new(),
+                        }),
+                        auth: ConnectorAuth::default(),
+                        connection: HashMap::new(),
+                    },
+                }),
+                request_body: None,
+                request_headers: HashMap::new(),
+            }),
+        ))
+        .await
+        .expect("sap ecc adapter verification run should succeed");
+    let response: RunMigrationConnectorResponse = assert_json_response(run, StatusCode::OK).await;
+
+    assert_eq!(response.summary.ingested_event_count, 2);
+    let control_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("control_result")))
+        .expect("control event should be present");
+    let metadata = control_event
+        .get("payload")
+        .and_then(|payload| payload.get("metadata"))
+        .and_then(|metadata| metadata.as_object())
+        .expect("control metadata should be present");
+    assert_eq!(
+        metadata.get("ecc_projection_metadata_validated"),
+        Some(&json!("true"))
+    );
+    assert_eq!(metadata.get("ecc_object_name"), Some(&json!("VBAK")));
+    assert_eq!(
+        metadata.get("ecc_requested_fields_json"),
+        Some(&json!("[\"NETWR\",\"VBELN\",\"WAERK\"]"))
+    );
+}
+
+#[tokio::test]
+async fn migration_evidence_supports_sap_ecc_rfc_bapi_verification_transport() {
+    let harness = setup_authenticated_app().await;
+
+    let mut connector = sample_verification_connector();
+    connector.connector_id = "sap-ecc-rfc-verification".to_string();
+    connector.name = "SAP ECC RFC/BAPI Verification Source".to_string();
+    connector.vendor = MigrationConnectorVendor::SapEcc;
+    connector.transport = ConnectorTransport::SapEccRfcBapi;
+    connector.endpoint.path = "/bridge/v1/read/VBAK?record_id=500000001".to_string();
+
+    let create = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors",
+            &harness.token,
+            connector_payload(connector),
+        ))
+        .await
+        .expect("sap ecc rfc verification connector create should succeed");
+    let created: UpsertMigrationConnectorResponse =
+        assert_json_response(create, StatusCode::OK).await;
+    assert_eq!(created.connector.transport, ConnectorTransport::SapEccRfcBapi);
+
+    let verification_endpoint = spawn_ecc_rfc_source(
+        json!({
+            "result": {
+                "VBELN": "500000001",
+                "NETWR": "100.00",
+                "WAERK": "USD"
+            }
+        }),
+        json!({
+            "capabilities": {
+                "bridge_version": "0.2.0",
+                "system_id": "PRD",
+                "client": "100",
+                "function_module": "RFC_READ_TABLE",
+                "bapi_name": "BAPI_SALESORDER_GETDETAIL",
+                "export_structure": "ORDER_ITEMS_OUT",
+                "key_fields": ["VBELN"],
+                "supports_record_projection": true,
+                "supports_rowset_projection": true,
+                "supports_key_lookup": true,
+                "supports_cursor_pagination": true,
+                "fields": [
+                    {"name": "VBELN", "abap_type": "CHAR", "nullable": false},
+                    {"name": "NETWR", "abap_type": "CURR", "nullable": true},
+                    {"name": "WAERK", "abap_type": "CUKY", "nullable": true}
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let run = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors/sap-ecc-rfc-verification/runs",
+            &harness.token,
+            json!(ConnectorRunRequest {
+                run_label: Some("sap-ecc-rfc-verify".to_string()),
+                manual_events: vec![],
+                verification: Some(VerificationRequest {
+                    control_name: "vbak-rfc-projection-match".to_string(),
+                    program_id: "program-rise-1".to_string(),
+                    object_id: "object-sales-order".to_string(),
+                    source_field: SourceFieldRef {
+                        system: "SAP ECC".to_string(),
+                        object_name: "VBAK".to_string(),
+                        field_name: "projection".to_string(),
+                        field_path: "$.projection".to_string(),
+                        semantic_type: None,
+                        record_id: Some("500000001".to_string()),
+                    },
+                    target_field: TargetFieldRef {
+                        system: "ARCXA ECC RFC".to_string(),
+                        object_name: "VBAK".to_string(),
+                        field_name: "projection".to_string(),
+                        field_path: "$.projection".to_string(),
+                        semantic_type: None,
+                        record_id: Some("500000001".to_string()),
+                    },
+                    expected_value: Some(json!({
+                        "VBELN": "500000001",
+                        "NETWR": 100.0,
+                        "WAERK": "USD"
+                    })),
+                    tolerance: Some(0.0),
+                    metadata: HashMap::from([("value_key".to_string(), "500000001::$.projection".to_string())]),
+                    source: VerificationSource {
+                        transport: ConnectorTransport::SapEccRfcBapi,
+                        query: None,
+                        endpoint: Some(ConnectorEndpoint {
+                            base_url: verification_endpoint,
+                            path: "/bridge/v1/read/VBAK?record_id=500000001".to_string(),
+                            method: "GET".to_string(),
+                            headers: HashMap::new(),
+                        }),
+                        auth: ConnectorAuth::default(),
+                        connection: HashMap::new(),
+                    },
+                }),
+                request_body: None,
+                request_headers: HashMap::new(),
+            }),
+        ))
+        .await
+        .expect("sap ecc rfc verification run should succeed");
+    let response: RunMigrationConnectorResponse = assert_json_response(run, StatusCode::OK).await;
+
+    assert_eq!(response.summary.ingested_event_count, 2);
+    let control_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("control_result")))
+        .expect("control event should be present");
+    let metadata = control_event
+        .get("payload")
+        .and_then(|payload| payload.get("metadata"))
+        .and_then(|metadata| metadata.as_object())
+        .expect("control metadata should be present");
+    assert_eq!(
+        metadata.get("ecc_rfc_projection_metadata_validated"),
+        Some(&json!("true"))
+    );
+    assert_eq!(
+        metadata.get("ecc_rfc_bapi_name"),
+        Some(&json!("BAPI_SALESORDER_GETDETAIL"))
+    );
+    assert_eq!(
+        metadata.get("ecc_rfc_requested_fields_json"),
+        Some(&json!("[\"NETWR\",\"VBELN\",\"WAERK\"]"))
+    );
+}
+
+#[tokio::test]
+async fn migration_evidence_supports_sap_ecc_staged_export_transport() {
+    let harness = setup_authenticated_app().await;
+
+    let mut connector = sample_artifact_connector();
+    connector.connector_id = "sap-ecc-staged-export".to_string();
+    connector.name = "SAP ECC Staged Export".to_string();
+    connector.vendor = MigrationConnectorVendor::SapEcc;
+    connector.transport = ConnectorTransport::SapEccStagedExport;
+    connector.endpoint.base_url = String::new();
+    connector.endpoint.path = "inline-bundle".to_string();
+
+    let create = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors",
+            &harness.token,
+            connector_payload(connector),
+        ))
+        .await
+        .expect("sap ecc staged export connector create should succeed");
+    let created: UpsertMigrationConnectorResponse =
+        assert_json_response(create, StatusCode::OK).await;
+    assert_eq!(created.connector.transport, ConnectorTransport::SapEccStagedExport);
+
+    let run = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors/sap-ecc-staged-export/runs",
+            &harness.token,
+            json!(ConnectorRunRequest {
+                run_label: Some("ecc-wave-1".to_string()),
+                manual_events: vec![],
+                verification: None,
+                request_body: Some(sap_ecc_staged_export_bundle_payload()),
+                request_headers: HashMap::new(),
+            }),
+        ))
+        .await
+        .expect("sap ecc staged export run should succeed");
+    let response: RunMigrationConnectorResponse = assert_json_response(run, StatusCode::OK).await;
+
+    assert!(response.summary.ingested_event_count >= 6);
+    let integrity_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("control_result"))
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("control_name"))
+                == Some(&json!("sap_ecc_staged_export_integrity")))
+        .expect("integrity control event should be present");
+    let metadata = integrity_event
+        .get("payload")
+        .and_then(|payload| payload.get("metadata"))
+        .and_then(|metadata| metadata.as_object())
+        .expect("integrity metadata should be present");
+    assert_eq!(metadata.get("checksum_verified"), Some(&json!("true")));
+    assert_eq!(metadata.get("actual_row_count"), Some(&json!("2")));
+    assert_eq!(metadata.get("data_format"), Some(&json!("json_rows")));
+
+    let execution_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("execution_event")))
+        .expect("execution event should be present");
+    assert_eq!(
+        execution_event
+            .get("payload")
+            .and_then(|payload| payload.get("tool_name")),
+        Some(&json!("sap_ecc_staged_export"))
+    );
+}
+
+#[tokio::test]
+async fn migration_evidence_supports_sap_idoc_extractor_package_transport() {
+    let harness = setup_authenticated_app().await;
+
+    let mut connector = sample_artifact_connector();
+    connector.connector_id = "sap-idoc-extractor".to_string();
+    connector.name = "SAP IDoc Extractor Package".to_string();
+    connector.vendor = MigrationConnectorVendor::SapEcc;
+    connector.transport = ConnectorTransport::SapIdocExtractorPackage;
+    connector.endpoint.base_url = String::new();
+    connector.endpoint.path = "inline-bundle".to_string();
+
+    let create = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors",
+            &harness.token,
+            connector_payload(connector),
+        ))
+        .await
+        .expect("sap idoc extractor connector create should succeed");
+    let created: UpsertMigrationConnectorResponse =
+        assert_json_response(create, StatusCode::OK).await;
+    assert_eq!(
+        created.connector.transport,
+        ConnectorTransport::SapIdocExtractorPackage
+    );
+
+    let run = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors/sap-idoc-extractor/runs",
+            &harness.token,
+            json!(ConnectorRunRequest {
+                run_label: Some("idoc-wave-1".to_string()),
+                manual_events: vec![],
+                verification: None,
+                request_body: Some(sap_idoc_extractor_bundle_payload()),
+                request_headers: HashMap::new(),
+            }),
+        ))
+        .await
+        .expect("sap idoc extractor run should succeed");
+    let response: RunMigrationConnectorResponse = assert_json_response(run, StatusCode::OK).await;
+
+    assert!(response.summary.ingested_event_count >= 4);
+    let integrity_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("control_result"))
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("control_name"))
+                == Some(&json!("sap_idoc_extractor_integrity")))
+        .expect("integrity control event should be present");
+    let metadata = integrity_event
+        .get("payload")
+        .and_then(|payload| payload.get("metadata"))
+        .and_then(|metadata| metadata.as_object())
+        .expect("integrity metadata should be present");
+    assert_eq!(metadata.get("checksum_verified"), Some(&json!("true")));
+    assert_eq!(metadata.get("actual_row_count"), Some(&json!("2")));
+    assert_eq!(metadata.get("idoc_type"), Some(&json!("ORDERS05")));
+
+    let execution_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("execution_event")))
+        .expect("execution event should be present");
+    assert_eq!(
+        execution_event
+            .get("payload")
+            .and_then(|payload| payload.get("tool_name")),
+        Some(&json!("sap_idoc_extractor_package"))
+    );
 }
 
 #[tokio::test]
@@ -946,25 +1508,240 @@ fn verification_run_payload(verification_endpoint: &str) -> Value {
     })
 }
 
+fn sap_ecc_staged_export_bundle_payload() -> Value {
+    let rows = json!([
+        {"VBELN": "500000001", "NETWR": 125.5, "WAERK": "USD"},
+        {"VBELN": "500000002", "NETWR": 130.0, "WAERK": "USD"}
+    ]);
+    let rows_sha = sha256_hex(&serde_json::to_vec(&rows).expect("rows should serialize"));
+
+    serde_json::to_value(SapEccStagedExportBundle {
+        manifest: SapEccStagedExportManifest {
+            schema_version: "1.0".to_string(),
+            export_id: "ecc-export-1".to_string(),
+            program_id: "program-rise-1".to_string(),
+            object_id: "object-sales-order".to_string(),
+            object_name: "VBAK".to_string(),
+            source_system_id: "ECC-PRD".to_string(),
+            source_client: "100".to_string(),
+            extracted_at: Utc::now(),
+            key_fields: vec!["VBELN".to_string()],
+            data_set: Some(SapEccStagedExportDataSet {
+                format: SapEccStagedExportDataFormat::JsonRows,
+                path: None,
+                inline_payload: Some(rows),
+                expected_row_count: Some(2),
+                sha256: Some(rows_sha),
+                metadata: HashMap::new(),
+            }),
+            metadata: HashMap::from([("cutover_wave".to_string(), "wave-1".to_string())]),
+        },
+        program: None,
+        object: None,
+        transformation_rules: vec![SapEccStagedRuleEvidence {
+            value_key: Some("500000001::$.NetAmount".to_string()),
+            rule: TransformationRule {
+                rule_id: "rule-netwr".to_string(),
+                rule_type: TransformationRuleType::Mapping,
+                name: "NETWR to NetAmount".to_string(),
+                description: None,
+                source_fields: vec![SourceFieldRef {
+                    system: "SAP ECC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: Some("currency_amount".to_string()),
+                    record_id: Some("500000001".to_string()),
+                }],
+                target_fields: vec![TargetFieldRef {
+                    system: "SAP S/4HANA".to_string(),
+                    object_name: "A_SalesOrder".to_string(),
+                    field_name: "NetAmount".to_string(),
+                    field_path: "$.NetAmount".to_string(),
+                    semantic_type: Some("currency_amount".to_string()),
+                    record_id: Some("500000001".to_string()),
+                }],
+                expression: Some("NETWR".to_string()),
+                filter_predicate: None,
+                default_value: None,
+                aggregation: None,
+                metadata: HashMap::new(),
+            },
+        }],
+        executions: vec![],
+        exceptions: vec![SapEccStagedExceptionEvidence {
+            value_key: Some("500000001::$.NetAmount".to_string()),
+            exception: ExceptionRecord {
+                exception_id: "exception-1".to_string(),
+                program_id: "program-rise-1".to_string(),
+                object_id: "object-sales-order".to_string(),
+                severity: ExceptionSeverity::Warning,
+                status: ExceptionStatus::Accepted,
+                category: "rounding".to_string(),
+                message: "Rounded during target harmonization".to_string(),
+                source_value: None,
+                target_value: None,
+                remediation: None,
+                detected_at: Utc::now(),
+                resolved_at: None,
+                metadata: HashMap::new(),
+            },
+        }],
+        controls: vec![SapEccStagedControlEvidence {
+            value_key: Some("500000001::$.NetAmount".to_string()),
+            control: graphica_core::migration_evidence::ControlResult {
+                control_id: "control-1".to_string(),
+                program_id: "program-rise-1".to_string(),
+                object_id: "object-sales-order".to_string(),
+                control_name: "sample_record_reconciled".to_string(),
+                control_type: "field_reconciliation".to_string(),
+                status: ControlStatus::Passed,
+                summary: "Sample record reconciled".to_string(),
+                expected_value: Some(json!(125.5)),
+                actual_value: Some(json!(125.5)),
+                tolerance: Some(0.0),
+                executed_at: Utc::now(),
+                evidence_refs: vec![],
+                metadata: HashMap::new(),
+            },
+        }],
+        approvals: vec![],
+    })
+    .expect("bundle should serialize")
+}
+
+fn sap_idoc_extractor_bundle_payload() -> Value {
+    let docs = json!([
+        {"DOCNUM": "000000000000001", "SEGMENT": "E1EDK01", "BELNR": "900000001"},
+        {"DOCNUM": "000000000000002", "SEGMENT": "E1EDK01", "BELNR": "900000002"}
+    ]);
+    let docs_sha = sha256_hex(docs.to_string().as_bytes());
+
+    serde_json::to_value(SapIdocExtractorBundle {
+        manifest: SapIdocExtractorManifest {
+            schema_version: "1.0".to_string(),
+            package_id: "idoc-package-1".to_string(),
+            program_id: "program-rise-1".to_string(),
+            object_id: "object-sales-order".to_string(),
+            object_name: "ORDERS05".to_string(),
+            source_system_id: "ECC-PRD".to_string(),
+            source_client: "100".to_string(),
+            extractor_name: "control-m-extractor".to_string(),
+            extractor_run_id: "run-1".to_string(),
+            extracted_at: Utc::now(),
+            idoc_type: Some("ORDERS05".to_string()),
+            message_type: Some("ORDERS".to_string()),
+            segment_counts: [("E1EDK01".to_string(), 2u64)].into_iter().collect(),
+            data_set: Some(SapIdocExtractorDataSet {
+                format: SapIdocExtractorDataFormat::JsonDocuments,
+                path: None,
+                inline_payload: Some(docs.to_string()),
+                expected_row_count: Some(2),
+                sha256: Some(docs_sha),
+            }),
+        },
+        executions: vec![],
+        exceptions: vec![],
+        controls: vec![],
+        approvals: vec![],
+    })
+    .expect("IDoc bundle should serialize")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
+}
+
 async fn spawn_verification_source(payload: Value) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("local addr should resolve");
     let body = payload.to_string();
+    let metadata_body = r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="API_SALES_ORDER" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="A_SalesOrderType">
+        <Key><PropertyRef Name="SalesOrder"/></Key>
+        <Property Name="SalesOrder" Type="Edm.String" Nullable="false"/>
+        <Property Name="NetAmount" Type="Edm.Decimal" Nullable="true"/>
+        <Property Name="TransactionCurrency" Type="Edm.String" Nullable="true"/>
+      </EntityType>
+      <EntityContainer Name="Container">
+        <EntitySet Name="A_SalesOrder" EntityType="API_SALES_ORDER.A_SalesOrderType"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"#
+        .to_string();
     tokio::spawn(async move {
-        if let Ok((mut socket, _)) = listener.accept().await {
-            let mut buffer = vec![0u8; 4096];
-            let _ = socket.read(&mut buffer).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
+        for _ in 0..4 {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 4096];
+                let bytes_read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let (content_type, response_body) = if request.contains("$metadata") {
+                    ("application/xml", metadata_body.clone())
+                } else {
+                    ("application/json", body.clone())
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\n\r\n{}",
+                    content_type,
+                    response_body.len(),
+                    response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else {
+                break;
+            }
         }
     });
     format!("http://{}", addr)
+}
+
+async fn spawn_ecc_adapter_source(payload: Value, capabilities: Value) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("local addr should resolve");
+    let body = payload.to_string();
+    let capabilities_body = capabilities.to_string();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 4096];
+                let bytes_read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let response_body = if request.contains("/capabilities") {
+                    capabilities_body.clone()
+                } else {
+                    body.clone()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else {
+                break;
+            }
+        }
+    });
+    format!("http://{}", addr)
+}
+
+async fn spawn_ecc_rfc_source(payload: Value, capabilities: Value) -> String {
+    spawn_ecc_adapter_source(payload, capabilities).await
 }
 
 fn connector_payload(connector: MigrationConnector) -> Value {

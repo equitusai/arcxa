@@ -122,6 +122,11 @@ Traceability behavior implemented today:
 Verification behavior implemented today:
 - HTTP JSON verification sources
 - SAP HANA read-only SQL verification path through the existing connector seam
+- SAP S/4HANA OData read verification path with response normalization for common OData v2 and v4 envelopes
+- `$metadata`-driven validation for S/4 projection checks, so ARCXA can tell when a requested field is not actually exposed by the API contract
+- paged S/4 rowset verification that follows OData next-link pagination for larger reads instead of treating the first page as the whole answer
+- typed record-projection and aggregate-projection verification, not just single-scalar spot checks
+- connector capability discovery from SAP S/4HANA `$metadata`, including entity-set, entity-type, key-field, and property-type summaries persisted on the connector record
 - generation of `ControlResult`, `ExecutionEvent`, and optional `ExceptionRecord`
 - canonical migration-evidence event emission directly from the verification service
 - the same `direct` or `kafka` delivery posture used by ingestion, so verification can publish onto the shared evidence backbone without depending on ingestion-side translation
@@ -169,12 +174,14 @@ The first operator slice now supports:
 - connector-run summaries that report whether delivery was `direct` or `kafka`, plus whether traceability acknowledged the write synchronously
 - runtime inspection of backend type, event-log availability, replay support, read-model counts, and event-bus consumer posture
 - operator-triggered local read-model rebuild when replay-backed recovery is needed
+- controlled ECC staged-export ingest with manifest-backed integrity checks for row counts and checksums
 
 Notable current behavior:
 - connector create/update is upsert-style
 - connector runs can ingest manual canonical events or execute verification flows
 - explain-value responses can trigger evidence packet generation if no packet exists yet
 - object-level evidence packet lookup can resolve either a fully-qualified value key or a bare field path when the object already carries record identifiers
+- staged ECC export runs can accept either an inline evidence bundle or a local manifest plus dataset package, and they will fail closed on integrity mismatches instead of silently downgrading assurance
 
 ## Service Topology
 
@@ -199,8 +206,21 @@ Implemented service responsibilities:
   - evidence packet signing
 - `arcxa-verification`
   - read-only verification against external systems
-  - current focus on HTTP JSON and SAP HANA SQL reads
+  - current focus on HTTP JSON, SAP HANA SQL, SAP S/4HANA OData, and bounded SAP ECC live-read bridges
+  - SAP S/4HANA OData verification with `$metadata`-driven projection validation and paged rowset handling
+  - bounded SAP ECC adapter verification with capability-driven projection validation and paged rowset handling
+  - bounded SAP ECC RFC/BAPI bridge verification with capability-driven projection validation and cursor-based rowset handling
   - canonical `ExecutionEvent` / `ControlResult` / `ExceptionRecord` emission onto the same shared evidence backbone used by ingestion
+
+Current SAP transport posture:
+- `sap_hana_sql` is the read-side SQL and reconciliation lane
+- `sap_s4_odata` is the S/4HANA application read and verification lane
+- `sap_ecc_adapter` is the bounded live ECC adapter lane
+- `sap_ecc_rfc_bapi` is the narrower live ECC dispute-resolution and spot-check lane
+- `sap_ecc_staged_export` is the controlled ECC extract and evidence-ingest lane
+- `sap_idoc_extractor_package` is the structured ECC extractor and IDoc evidence-ingest lane
+
+That separation is deliberate. ARCXA no longer treats HANA as a stand-in for all SAP semantics.
 
 Current deployment direction:
 - REST at the coordinator boundary
@@ -262,11 +282,15 @@ Verification is deliberately read-only in this wedge.
 Implemented behavior:
 - compare expected and actual values
 - support numeric tolerance when provided
+- support single-field, multi-field record projection, and aggregate projection comparisons
 - emit `Passed`, `Warning`, or `Failed` control states
 - emit exception records for warning/failure cases
 
-SAP HANA focus:
+SAP verification focus:
 - the verification service uses the existing HANA connector seam for SQL reads
+- the verification service can also read SAP S/4HANA OData JSON payloads, normalize common OData wrappers before comparison, validate requested fields against discovered `$metadata`, and follow paginated rowsets for larger verification controls
+- the verification service now also supports a bounded SAP ECC adapter transport, with adapter-advertised field metadata, projection validation, and paged rowset checks so ECC verification is no longer modeled as if HANA SQL were the same thing
+- the verification service additionally supports a bounded SAP ECC RFC/BAPI bridge transport for targeted dispute resolution and spot checks, including capability-driven projection validation and cursor pagination for larger rowset reads
 - phase 1 is about spot-checking and control evidence, not taking ownership of load/write execution
 
 This distinction matters. The product story is explainability and defensibility, not replacing the migration engine.
@@ -279,7 +303,9 @@ Important current boundaries:
 - traceability now has replayable RocksDB-backed read models, Kafka-backed delivery is available, and connector persistence has moved onto a service-owned RocksDB path with legacy JSON import compatibility
 - runtime status now exposes richer consumer health, broker reachability, partition assignment, and connector-store posture, but it is still focused on service-local observability rather than cluster-wide SLO dashboards
 - traceability can optionally project triples to shard, but the full evidence-graph query story is still early
-- SAP HANA verification exists as a connector path, but broader SAP ECC and S/4-specific live verification coverage still needs to deepen
+- SAP HANA verification, an SAP S/4HANA OData read path, a bounded SAP ECC adapter path, and a bounded SAP ECC RFC/BAPI bridge now exist, including metadata-aware projection checks and paged rowset verification
+- controlled ECC evidence-ingest lanes now also exist for staged exports and IDoc/extractor packages
+- broader S/4 business-object coverage, deeper ECC-native runtime options, and richer extractor families still need to deepen over time
 - evidence packet HTML and PDF renderers are not yet the canonical operational path
 - reusable cross-engagement control packs and pattern libraries are still future work
 

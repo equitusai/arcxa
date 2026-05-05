@@ -673,13 +673,13 @@ impl ConnectorRegistry {
             name: "SAP HANA".to_string(),
             version: "1.0.0".to_string(),
             description:
-                "SAP HANA connector with connection testing support; query execution and schema inference are not yet implemented"
+                "SAP HANA connector with ODBC connection testing and query execution support; coordinator-driven schema discovery is available when HANA discovery and ODBC support are enabled"
                     .to_string(),
             source_type: "SAPHANA".to_string(),
             capabilities: ConnectorCapabilities {
-                parameterized_queries: false,
+                parameterized_queries: cfg!(feature = "odbc"),
                 schema_inference: false,
-                query_timeout: false,
+                query_timeout: cfg!(feature = "odbc"),
                 streaming: false,
                 transactions: false,
                 max_batch_size: Some(10000),
@@ -735,6 +735,38 @@ impl ConnectorRegistry {
                     field_type: FieldType::String,
                     default_value: None,
                     validation_regex: Some(r"^[0-9]{2}$".to_string()),
+                },
+                ConfigField {
+                    name: "metadata.odbc_driver".to_string(),
+                    description: "Optional SAP HANA ODBC driver override".to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "metadata.odbc_dsn".to_string(),
+                    description: "Optional SAP HANA ODBC DSN override".to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "metadata.odbc_connection_string".to_string(),
+                    description:
+                        "Optional raw SAP HANA ODBC connection string override. When provided, it takes precedence over host/port/database assembly."
+                            .to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
+                },
+                ConfigField {
+                    name: "metadata.odbc_options".to_string(),
+                    description:
+                        "Optional extra SAP HANA ODBC connection-string segments appended to the resolved connection."
+                            .to_string(),
+                    field_type: FieldType::String,
+                    default_value: None,
+                    validation_regex: None,
                 },
             ],
             registered_at: Utc::now(),

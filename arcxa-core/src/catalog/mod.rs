@@ -8,6 +8,7 @@ pub mod client;
 pub mod connector;
 pub mod connector_v2; // Phase 2: V2 connector with profiling and streaming
 pub mod connectors;
+pub mod hana_runtime;
 pub mod ontology;
 pub mod ontology_extensions; // Phase 1: Semantic type ontology extensions
 pub mod ontology_registry; // Phase 1: Custom ontology management
@@ -25,6 +26,10 @@ pub use connector_v2::{
     DataStream, ExportConfig, ExportFormat, ParquetExportOptions, RowBatch,
 };
 pub use connectors::ConnectorRegistry;
+pub use hana_runtime::{
+    coerce_hana_scalar, resolve_hana_odbc_resolution, HanaConnectionParams, HanaOdbcResolution,
+    DEFAULT_HANA_ODBC_DRIVER,
+};
 pub use ontology::{namespaces, DataSourceType, CATALOG_ONTOLOGY};
 pub use ontology_extensions::{
     cardinality_class_to_uri, semantic_type_to_uri, EXTENDED_CATALOG_ONTOLOGY,

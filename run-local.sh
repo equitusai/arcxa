@@ -16,7 +16,7 @@
 
 set -e
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 MIN_RUST_VERSION="1.91.1"
 RUST_TOOLCHAIN="stable"
 

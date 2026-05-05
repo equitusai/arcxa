@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use graphica_core::catalog::{resolve_hana_odbc_resolution, HanaConnectionParams};
 use graphica_core::catalog::connector::Credentials;
 use graphica_core::catalog::types::{DataSource, SourceConfig};
 use std::collections::HashMap;
@@ -31,90 +32,154 @@ impl SAPHANAExtractor {
         }
     }
 
-    fn validate_identifier(value: &str, field: &str) -> Result<()> {
-        if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    fn normalize_identifier(value: &str, field: &str) -> Result<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("Invalid {}: value cannot be empty", field));
+        }
+
+        let normalized = if trimmed.starts_with('"') {
+            if !trimmed.ends_with('"') || trimmed.len() < 2 {
+                return Err(anyhow!(
+                    "Invalid {} '{}': quoted SAP HANA identifiers must have balanced double quotes",
+                    field,
+                    value
+                ));
+            }
+            trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
+        } else {
+            trimmed.to_string()
+        };
+
+        if normalized.chars().any(|c| c == '\0' || c.is_control()) {
             return Err(anyhow!(
-                "Invalid {} '{}': only [A-Za-z0-9_] allowed",
+                "Invalid {} '{}': control characters are not allowed",
                 field,
                 value
             ));
         }
-        Ok(())
+
+        Ok(normalized)
+    }
+
+    fn canonical_identifier_for_lookup(identifier: &str) -> String {
+        if identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            identifier.to_ascii_uppercase()
+        } else {
+            identifier.to_string()
+        }
+    }
+
+    fn quote_identifier(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
+    fn quote_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn split_qualified_identifier(value: &str, field: &str) -> Result<Vec<String>> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut chars = value.chars().peekable();
+        let mut in_quotes = false;
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    current.push(ch);
+                    if in_quotes && chars.peek() == Some(&'"') {
+                        current.push(chars.next().expect("peeked double quote"));
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                }
+                '.' if !in_quotes => {
+                    let part = current.trim();
+                    if part.is_empty() {
+                        return Err(anyhow!(
+                            "Invalid {} '{}': empty identifier segment",
+                            field,
+                            value
+                        ));
+                    }
+                    parts.push(part.to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        if in_quotes {
+            return Err(anyhow!(
+                "Invalid {} '{}': unterminated quoted identifier",
+                field,
+                value
+            ));
+        }
+
+        let tail = current.trim();
+        if tail.is_empty() {
+            return Err(anyhow!(
+                "Invalid {} '{}': empty identifier segment",
+                field,
+                value
+            ));
+        }
+        parts.push(tail.to_string());
+        Ok(parts)
+    }
+
+    fn resolve_table_reference(
+        default_schema: &str,
+        table_name: &str,
+    ) -> Result<(String, String)> {
+        let parts = Self::split_qualified_identifier(table_name, "table_name")?;
+        match parts.as_slice() {
+            [table] => Ok((
+                Self::canonical_identifier_for_lookup(&Self::normalize_identifier(
+                    default_schema,
+                    "schema",
+                )?),
+                Self::canonical_identifier_for_lookup(&Self::normalize_identifier(
+                    table,
+                    "table_name",
+                )?),
+            )),
+            [schema, table] => Ok((
+                Self::canonical_identifier_for_lookup(&Self::normalize_identifier(
+                    schema,
+                    "schema",
+                )?),
+                Self::canonical_identifier_for_lookup(&Self::normalize_identifier(
+                    table,
+                    "table_name",
+                )?),
+            )),
+            _ => Err(anyhow!(
+                "Invalid table_name '{}': expected TABLE or SCHEMA.TABLE",
+                table_name
+            )),
+        }
     }
 
     pub fn build_connection_string(
         source: &DataSource,
         credentials: &Credentials,
     ) -> Result<String> {
-        let (host, port, database, _schema) = Self::get_hana_config(source)?;
-
-        if let Some(raw) = source.metadata.get("odbc_connection_string") {
-            return Ok(Self::apply_credentials_to_connection_string(
-                raw,
-                credentials,
-            ));
-        }
-
-        let driver = source
-            .metadata
-            .get("odbc_driver")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_HANA_ODBC_DRIVER").ok())
-            .unwrap_or_else(|| "HDBODBC".to_string());
-
-        let dsn = source
-            .metadata
-            .get("odbc_dsn")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_HANA_ODBC_DSN").ok());
-
-        let mut conn = if let Some(dsn) = dsn {
-            format!(
-                "DSN={};UID={};PWD={}",
-                dsn, credentials.username, credentials.password
-            )
-        } else {
-            format!(
-                "DRIVER={{{}}};SERVERNODE={}:{};DATABASE={};UID={};PWD={};",
-                driver, host, port, database, credentials.username, credentials.password
-            )
+        let params = match &source.connection.config {
+            SourceConfig::SAPHANA(config) => HanaConnectionParams::from(config),
+            _ => return Err(anyhow!("Expected SAP HANA configuration")),
         };
-
-        if let Some(options) = source.metadata.get("odbc_options") {
-            if !options.is_empty() {
-                if !conn.ends_with(';') {
-                    conn.push(';');
-                }
-                conn.push_str(options);
-            }
-        }
-
-        Ok(conn)
-    }
-
-    fn apply_credentials_to_connection_string(
-        connection_string: &str,
-        credentials: &Credentials,
-    ) -> String {
-        let mut conn = connection_string.to_string();
-        let upper = conn.to_uppercase();
-        if !upper.contains("UID=") {
-            if !conn.ends_with(';') {
-                conn.push(';');
-            }
-            conn.push_str(&format!("UID={}", credentials.username));
-        }
-        if !upper.contains("PWD=") {
-            if !conn.ends_with(';') {
-                conn.push(';');
-            }
-            conn.push_str(&format!("PWD={}", credentials.password));
-        }
-        conn
+        let resolution = resolve_hana_odbc_resolution(&params, &source.metadata)
+            .map_err(|e| anyhow!(e.to_string()))?;
+        Ok(resolution.build_connection_string(&credentials.username, &credentials.password))
     }
 
     fn build_metadata_query(schema: &str, table_filter: Option<&str>) -> String {
-        let upper_schema = schema.to_uppercase();
         let mut query = format!(
             r#"
 SELECT
@@ -141,14 +206,16 @@ LEFT JOIN (
     ON c.SCHEMA_NAME = pk.SCHEMA_NAME
     AND c.TABLE_NAME = pk.TABLE_NAME
     AND c.COLUMN_NAME = pk.COLUMN_NAME
-WHERE t.SCHEMA_NAME = '{}'
+WHERE t.SCHEMA_NAME = {}
 "#,
-            upper_schema
+            Self::quote_literal(schema)
         );
 
         if let Some(table) = table_filter {
-            let upper_table = table.to_uppercase();
-            query.push_str(&format!("  AND t.TABLE_NAME = '{}'\n", upper_table));
+            query.push_str(&format!(
+                "  AND t.TABLE_NAME = {}\n",
+                Self::quote_literal(table)
+            ));
         }
 
         query.push_str("ORDER BY t.TABLE_NAME, c.POSITION");
@@ -159,10 +226,12 @@ WHERE t.SCHEMA_NAME = '{}'
         format!(
             r#"
 SELECT *
-FROM "{}"."{}"
+FROM {}.{}
 LIMIT {}
 "#,
-            schema, table_name, sample_size
+            Self::quote_identifier(schema),
+            Self::quote_identifier(table_name),
+            sample_size
         )
     }
 
@@ -175,15 +244,14 @@ SELECT
     COUNT(*) AS total_count
 FROM "{schema}"."{table}"
 "#,
-            schema = schema,
-            table = table_name,
-            col = column_name
+            schema = schema.replace('"', "\"\""),
+            table = table_name.replace('"', "\"\""),
+            col = column_name.replace('"', "\"\"")
         )
     }
 
     /// Build query for foreign key relationships
     fn build_relationships_query(schema: &str, table_filter: Option<&str>) -> String {
-        let upper_schema = schema.to_uppercase();
         let mut query = format!(
             r#"
 SELECT
@@ -194,14 +262,16 @@ SELECT
     rc.REFERENCED_TABLE_NAME as target_table,
     rc.REFERENCED_COLUMN_NAME as target_column
 FROM SYS.REFERENTIAL_CONSTRAINTS rc
-WHERE rc.SCHEMA_NAME = '{}'
+WHERE rc.SCHEMA_NAME = {}
 "#,
-            upper_schema
+            Self::quote_literal(schema)
         );
 
         if let Some(table) = table_filter {
-            let upper_table = table.to_uppercase();
-            query.push_str(&format!("  AND rc.TABLE_NAME = '{}'\n", upper_table));
+            query.push_str(&format!(
+                "  AND rc.TABLE_NAME = {}\n",
+                Self::quote_literal(table)
+            ));
         }
 
         query.push_str("ORDER BY rc.CONSTRAINT_NAME, rc.POSITION");
@@ -375,19 +445,17 @@ impl SchemaExtractor for SAPHANAExtractor {
         info!("Extracting SAP HANA schema metadata via ODBC");
         let (_host, _port, _database, default_schema) = Self::get_hana_config(source)?;
 
-        if let Some(schema) = schema_filter {
-            Self::validate_identifier(schema, "schema_filter")?;
-        }
-        if let Some(table) = table_filter {
-            Self::validate_identifier(table, "table_filter")?;
-        }
+        let schema_name = Self::canonical_identifier_for_lookup(&Self::normalize_identifier(
+            schema_filter.or(default_schema).unwrap_or("PUBLIC"),
+            "schema_filter",
+        )?);
 
-        let schema_name = schema_filter
-            .or(default_schema)
-            .unwrap_or("PUBLIC")
-            .to_uppercase();
+        let normalized_table_filter = table_filter
+            .map(|table| Self::normalize_identifier(table, "table_filter"))
+            .map(|result| result.map(|table| Self::canonical_identifier_for_lookup(&table)))
+            .transpose()?;
 
-        let query = Self::build_metadata_query(&schema_name, table_filter);
+        let query = Self::build_metadata_query(&schema_name, normalized_table_filter.as_deref());
         let connection_string = Self::build_connection_string(source, credentials)?;
 
         let rows = execute_odbc_query(&connection_string, &query, true)
@@ -397,7 +465,8 @@ impl SchemaExtractor for SAPHANAExtractor {
         let mut metadata = Self::map_metadata_results(rows, &schema_name)?;
 
         // Extract foreign key relationships
-        let relationship_query = Self::build_relationships_query(&schema_name, table_filter);
+        let relationship_query =
+            Self::build_relationships_query(&schema_name, normalized_table_filter.as_deref());
         match execute_odbc_query(&connection_string, &relationship_query, true).await {
             Ok(relationship_rows) => {
                 metadata.relationships = Self::map_relationship_results(relationship_rows)
@@ -424,12 +493,12 @@ impl SchemaExtractor for SAPHANAExtractor {
         sample_size: usize,
     ) -> Result<Vec<SampleRow>> {
         debug!("Extracting SAP HANA samples for table '{}'", table_name);
-        Self::validate_identifier(table_name, "table_name")?;
 
         let (_host, _port, _database, default_schema) = Self::get_hana_config(source)?;
-        let schema_name = default_schema.unwrap_or("PUBLIC").to_uppercase();
+        let (schema_name, resolved_table_name) =
+            Self::resolve_table_reference(default_schema.unwrap_or("PUBLIC"), table_name)?;
 
-        let query = Self::build_sample_query(&schema_name, table_name, sample_size);
+        let query = Self::build_sample_query(&schema_name, &resolved_table_name, sample_size);
         let connection_string = Self::build_connection_string(source, credentials)?;
 
         let rows = execute_odbc_query(&connection_string, &query, false)
@@ -450,13 +519,18 @@ impl SchemaExtractor for SAPHANAExtractor {
             "Extracting SAP HANA statistics for {}.{}",
             table_name, column_name
         );
-        Self::validate_identifier(table_name, "table_name")?;
-        Self::validate_identifier(column_name, "column_name")?;
 
         let (_host, _port, _database, default_schema) = Self::get_hana_config(source)?;
-        let schema_name = default_schema.unwrap_or("PUBLIC").to_uppercase();
+        let (schema_name, resolved_table_name) =
+            Self::resolve_table_reference(default_schema.unwrap_or("PUBLIC"), table_name)?;
+        let resolved_column_name =
+            Self::canonical_identifier_for_lookup(&Self::normalize_identifier(
+                column_name,
+                "column_name",
+            )?);
 
-        let query = Self::build_statistics_query(&schema_name, table_name, column_name);
+        let query =
+            Self::build_statistics_query(&schema_name, &resolved_table_name, &resolved_column_name);
         let connection_string = Self::build_connection_string(source, credentials)?;
 
         let rows = match execute_odbc_query(&connection_string, &query, true).await {
@@ -464,7 +538,7 @@ impl SchemaExtractor for SAPHANAExtractor {
             Err(e) => {
                 warn!(
                     "SAP HANA statistics query failed for {}.{}: {}. Returning defaults.",
-                    table_name, column_name, e
+                    resolved_table_name, resolved_column_name, e
                 );
                 return Ok(ColumnStats::default());
             }
@@ -498,7 +572,42 @@ mod tests {
 
     #[test]
     fn validates_identifier_rules() {
-        assert!(SAPHANAExtractor::validate_identifier("CUSTOMER_ID", "column").is_ok());
-        assert!(SAPHANAExtractor::validate_identifier("bad-name", "column").is_err());
+        assert_eq!(
+            SAPHANAExtractor::normalize_identifier("CUSTOMER_ID", "column").unwrap(),
+            "CUSTOMER_ID"
+        );
+        assert_eq!(
+            SAPHANAExtractor::normalize_identifier("\"/BIC/ZSALES-ITEM\"", "table").unwrap(),
+            "/BIC/ZSALES-ITEM"
+        );
+        assert!(SAPHANAExtractor::normalize_identifier("bad\nname", "column").is_err());
+    }
+
+    #[test]
+    fn resolves_qualified_table_references() {
+        let (schema, table) =
+            SAPHANAExtractor::resolve_table_reference("PUBLIC", "sapabap1.bseg").unwrap();
+        assert_eq!(schema, "SAPABAP1");
+        assert_eq!(table, "BSEG");
+
+        let (schema, table) = SAPHANAExtractor::resolve_table_reference(
+            "PUBLIC",
+            "\"SAPABAP1\".\"/BIC/ZSALES-ITEM\"",
+        )
+        .unwrap();
+        assert_eq!(schema, "SAPABAP1");
+        assert_eq!(table, "/BIC/ZSALES-ITEM");
+    }
+
+    #[test]
+    fn quotes_metadata_filters_and_object_references_safely() {
+        let metadata_query =
+            SAPHANAExtractor::build_metadata_query("SAPABAP1", Some("/BIC/ZSALES-ITEM"));
+        assert!(metadata_query.contains("t.SCHEMA_NAME = 'SAPABAP1'"));
+        assert!(metadata_query.contains("t.TABLE_NAME = '/BIC/ZSALES-ITEM'"));
+
+        let sample_query =
+            SAPHANAExtractor::build_sample_query("SAPABAP1", "/BIC/ZSALES-ITEM", 25);
+        assert!(sample_query.contains("FROM \"SAPABAP1\".\"/BIC/ZSALES-ITEM\""));
     }
 }

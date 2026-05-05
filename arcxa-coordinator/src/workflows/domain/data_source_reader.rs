@@ -36,7 +36,10 @@ use crate::common::oracle::build_workflow_connection_string as build_oracle_work
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::{stream::Stream, StreamExt, TryStreamExt};
-use graphica_core::catalog::connectors::databricks::DatabricksSqlClient;
+use graphica_core::catalog::{
+    connectors::databricks::DatabricksSqlClient, resolve_hana_odbc_resolution,
+    HanaConnectionParams,
+};
 use graphica_core::catalog::postgres_tls::connect_postgres_client;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -304,85 +307,19 @@ impl DatabaseQueryReader {
     fn build_hana_connection_string(
         connection_config: &DatabaseConnectionConfig,
     ) -> Result<String> {
-        if let Some(raw) = connection_config.extra_params.get("odbc_connection_string") {
-            return Ok(Self::apply_credentials_to_connection_string(
-                raw,
-                connection_config,
-            ));
-        }
-
-        let driver = connection_config
-            .extra_params
-            .get("odbc_driver")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_HANA_ODBC_DRIVER").ok())
-            .unwrap_or_else(|| "HDBODBC".to_string());
-
-        let dsn = connection_config
-            .extra_params
-            .get("odbc_dsn")
-            .cloned()
-            .or_else(|| std::env::var("GRAPHICA_HANA_ODBC_DSN").ok());
-
-        let mut conn = if let Some(dsn) = dsn {
-            format!(
-                "DSN={};UID={};PWD={}",
-                dsn, connection_config.username, connection_config.password
-            )
-        } else {
-            let mut conn = format!(
-                "DRIVER={{{}}};SERVERNODE={}:{};UID={};PWD={};",
-                driver,
-                connection_config.host,
-                connection_config.port,
-                connection_config.username,
-                connection_config.password
-            );
-
-            if !connection_config.database.is_empty() {
-                conn.push_str(&format!("DATABASENAME={};", connection_config.database));
-            }
-
-            conn
+        let params = HanaConnectionParams {
+            host: connection_config.host.clone(),
+            port: connection_config.port,
+            database: connection_config.database.clone(),
+            schema: connection_config.extra_params.get("schema").cloned(),
+            instance_number: connection_config.extra_params.get("instance_number").cloned(),
         };
-
-        Self::append_odbc_options(&mut conn, connection_config);
-        Ok(conn)
-    }
-
-    fn append_odbc_options(conn: &mut String, connection_config: &DatabaseConnectionConfig) {
-        if let Some(options) = connection_config.extra_params.get("odbc_options") {
-            if !options.is_empty() {
-                if !conn.ends_with(';') {
-                    conn.push(';');
-                }
-                conn.push_str(options);
-            }
-        }
-    }
-
-    fn apply_credentials_to_connection_string(
-        raw: &str,
-        connection_config: &DatabaseConnectionConfig,
-    ) -> String {
-        let mut conn = raw.to_string();
-        let upper = conn.to_uppercase();
-
-        if !upper.contains("UID=") {
-            if !conn.ends_with(';') {
-                conn.push(';');
-            }
-            conn.push_str(&format!("UID={}", connection_config.username));
-        }
-
-        if !upper.contains("PWD=") {
-            if !conn.ends_with(';') {
-                conn.push(';');
-            }
-            conn.push_str(&format!("PWD={}", connection_config.password));
-        }
-
-        conn
+        let resolution = resolve_hana_odbc_resolution(&params, &connection_config.extra_params)
+            .map_err(|e| anyhow!(e.to_string()))?;
+        Ok(resolution.build_connection_string(
+            &connection_config.username,
+            &connection_config.password,
+        ))
     }
 }
 
