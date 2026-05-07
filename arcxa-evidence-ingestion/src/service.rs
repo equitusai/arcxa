@@ -5,28 +5,30 @@ use chrono::Utc;
 use graphica_core::distributed::proto::migration_evidence::{
     evidence_ingestion_service_server::EvidenceIngestionService,
     verification_service_client::VerificationServiceClient, ConnectorReply, GetConnectorRequest,
-    HealthRequest, HealthResponse, RunConnectorRequest, RunConnectorResponse, RuntimeStatusReply,
-    RuntimeStatusRequest,
-    RunVerificationAndEmitRequest, UpsertConnectorRequest,
+    HealthRequest, HealthResponse, RunConnectorRequest, RunConnectorResponse,
+    RunVerificationAndEmitRequest, RuntimeStatusReply, RuntimeStatusRequest,
+    UpsertConnectorRequest,
 };
 use graphica_core::migration_evidence::{
     discover_sap_ecc_adapter_capabilities, discover_sap_ecc_rfc_bapi_capabilities,
     discover_sap_s4_odata_capabilities, field_types_by_name, infer_sap_s4_odata_metadata_path,
-    rfc_field_types_by_name, ConnectorAuthKind, ConnectorRunRequest as DomainConnectorRunRequest,
+    resolve_connector_auth, rfc_field_types_by_name, ConnectorAuthKind,
+    ConnectorAuthResolutionMetadata, ConnectorRunRequest as DomainConnectorRunRequest,
     ConnectorRunSummary, ConnectorTransport, ControlResult, EvidenceIngestionRuntimeStatus,
     ExecutionEvent, ExecutionStatus, MigrationConnector, MigrationConnectorRole,
     MigrationEvidenceArtifactType, MigrationEvidenceDeliveryMode, MigrationEvidenceEvent,
     MigrationEvidenceEventForwarder, MigrationObject, MigrationObjectType, MigrationProgram,
-    SapEccAdapterCapabilities, SapEccRfcBapiCapabilities, SapEccStagedApprovalEvidence,
-    SapEccStagedControlEvidence, SapEccStagedExceptionEvidence, SapEccStagedExecutionEvidence,
-    SapEccStagedExportBundle, SapEccStagedExportDataFormat, SapEccStagedExportDataSet,
-    SapEccStagedExportManifest, SapEccStagedRuleEvidence, SapIdocExtractorApprovalEvidence,
-    SapIdocExtractorBundle, SapIdocExtractorControlEvidence, SapIdocExtractorDataFormat,
-    SapIdocExtractorDataSet, SapIdocExtractorExceptionEvidence,
-    SapIdocExtractorExecutionEvidence, SapIdocExtractorManifest, SapS4ODataCapabilities,
-    SapS4ODataVersion, VerificationDispatchRequest, VerificationDispatchResult,
-    VerificationRequest,
+    SapEccAdapterCapabilities, SapEccRfcBapiCapabilities, SapEccRfcBapiProfile,
+    SapEccStagedApprovalEvidence, SapEccStagedControlEvidence, SapEccStagedExceptionEvidence,
+    SapEccStagedExecutionEvidence, SapEccStagedExportBundle, SapEccStagedExportDataFormat,
+    SapEccStagedExportDataSet, SapEccStagedExportManifest, SapEccStagedRuleEvidence,
+    SapExtractorFamily, SapIdocExtractorApprovalEvidence, SapIdocExtractorBundle,
+    SapIdocExtractorControlEvidence, SapIdocExtractorDataFormat, SapIdocExtractorDataSet,
+    SapIdocExtractorExceptionEvidence, SapIdocExtractorExecutionEvidence, SapIdocExtractorManifest,
+    SapS4ODataCapabilities, SapS4ODataVersion, VerificationDispatchRequest,
+    VerificationDispatchResult, VerificationRequest,
 };
+use graphica_core::secrets::providers::SecretStoreRegistry;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -81,6 +83,7 @@ pub struct EvidenceIngestionManager {
     traceability: std::sync::Arc<dyn MigrationEvidenceEventForwarder>,
     verification: std::sync::Arc<dyn VerificationProvider>,
     delivery_mode: MigrationEvidenceDeliveryMode,
+    secret_store_registry: Option<std::sync::Arc<SecretStoreRegistry>>,
 }
 
 impl EvidenceIngestionManager {
@@ -95,10 +98,22 @@ impl EvidenceIngestionManager {
             traceability,
             verification,
             delivery_mode,
+            secret_store_registry: None,
         }
     }
 
-    pub async fn upsert_connector(&self, mut connector: MigrationConnector) -> Result<MigrationConnector> {
+    pub fn with_secret_store_registry(
+        mut self,
+        registry: std::sync::Arc<SecretStoreRegistry>,
+    ) -> Self {
+        self.secret_store_registry = Some(registry);
+        self
+    }
+
+    pub async fn upsert_connector(
+        &self,
+        mut connector: MigrationConnector,
+    ) -> Result<MigrationConnector> {
         validate_connector(&connector)?;
         connector.updated_at = Utc::now();
         self.store.upsert(connector).await
@@ -118,40 +133,57 @@ impl EvidenceIngestionManager {
     ) -> Result<(ConnectorRunSummary, Vec<MigrationEvidenceEvent>)> {
         let mut connector = self.get_connector(connector_id).await?;
         if !connector.enabled {
-            return Err(anyhow!("connector '{}' is disabled", connector.connector_id));
+            return Err(anyhow!(
+                "connector '{}' is disabled",
+                connector.connector_id
+            ));
         }
-        if let Some(discovered) = discover_connector_capabilities(&connector, &request).await? {
+        if let Some(discovered) = discover_connector_capabilities(
+            &connector,
+            &request,
+            self.secret_store_registry.clone(),
+        )
+        .await?
+        {
             connector = self.store.upsert(discovered).await?;
         }
         let started_at = Utc::now();
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
 
-        let (mut events, dispatch_override) = if connector.role == MigrationConnectorRole::VerificationSource {
-            let mut verification = request
-                .verification
-                .ok_or_else(|| anyhow!("verification connector runs require a verification payload"))?;
-            enrich_verification_source_from_connector(&connector, &mut verification);
-            let verification_dispatch = self
-                .verification
-                .run_verification_and_emit(VerificationDispatchRequest {
-                    connector_id: connector.connector_id.clone(),
-                    run_id: run_id.clone(),
-                    vendor: connector.vendor.clone(),
-                    verification,
-                })
-                .await?;
-            (
-                verification_dispatch.emitted_events,
-                Some(verification_dispatch.dispatch_summary),
-            )
-        } else if !request.manual_events.is_empty() {
-            (request.manual_events, None)
-        } else {
-            (
-                fetch_connector_events(&connector, &run_id, request.request_body, request.request_headers).await?,
-                None,
-            )
-        };
+        let (mut events, dispatch_override) =
+            if connector.role == MigrationConnectorRole::VerificationSource {
+                let mut verification = request.verification.ok_or_else(|| {
+                    anyhow!("verification connector runs require a verification payload")
+                })?;
+                enrich_verification_source_from_connector(&connector, &mut verification);
+                let verification_dispatch = self
+                    .verification
+                    .run_verification_and_emit(VerificationDispatchRequest {
+                        connector_id: connector.connector_id.clone(),
+                        run_id: run_id.clone(),
+                        vendor: connector.vendor.clone(),
+                        verification,
+                    })
+                    .await?;
+                (
+                    verification_dispatch.emitted_events,
+                    Some(verification_dispatch.dispatch_summary),
+                )
+            } else if !request.manual_events.is_empty() {
+                (request.manual_events, None)
+            } else {
+                (
+                    fetch_connector_events(
+                        &connector,
+                        &run_id,
+                        request.request_body,
+                        request.request_headers,
+                        self.secret_store_registry.clone(),
+                    )
+                    .await?,
+                    None,
+                )
+            };
 
         normalize_events(&connector, &run_id, &mut events)?;
         let dispatch = if let Some(dispatch) = dispatch_override {
@@ -194,12 +226,15 @@ fn validate_connector(connector: &MigrationConnector) -> Result<()> {
     if connector.program_id.is_empty() {
         return Err(anyhow!("program_id cannot be empty"));
     }
-    if matches!(connector.role, MigrationConnectorRole::MigrationArtifactSource)
-        && connector.endpoint.base_url.is_empty()
+    if matches!(
+        connector.role,
+        MigrationConnectorRole::MigrationArtifactSource
+    ) && connector.endpoint.base_url.is_empty()
         && !matches!(
             connector.transport,
             ConnectorTransport::SapEccStagedExport
                 | ConnectorTransport::SapIdocExtractorPackage
+                | ConnectorTransport::SapOdpExtractorPackage
                 | ConnectorTransport::ManualDrop
         )
     {
@@ -211,6 +246,7 @@ fn validate_connector(connector: &MigrationConnector) -> Result<()> {
 async fn discover_connector_capabilities(
     connector: &MigrationConnector,
     request: &DomainConnectorRunRequest,
+    secret_store_registry: Option<std::sync::Arc<SecretStoreRegistry>>,
 ) -> Result<Option<MigrationConnector>> {
     let endpoint = request
         .verification
@@ -223,6 +259,7 @@ async fn discover_connector_capabilities(
         .map(|verification| &verification.source.auth)
         .filter(|auth| auth.kind != ConnectorAuthKind::None)
         .unwrap_or(&connector.auth);
+    let resolved_auth = resolve_connector_auth(auth, secret_store_registry).await?;
     let extra_headers = request
         .verification
         .as_ref()
@@ -244,14 +281,23 @@ async fn discover_connector_capabilities(
                 return Ok(None);
             }
 
-            let document =
-                fetch_s4_metadata_document(endpoint, auth, &connector.metadata, extra_headers)
-                    .await?;
+            let document = fetch_s4_metadata_document(
+                endpoint,
+                &resolved_auth.auth,
+                &connector.metadata,
+                extra_headers,
+            )
+            .await?;
             let capabilities = discover_sap_s4_odata_capabilities(&document, &endpoint.path)
                 .context("failed to derive SAP S/4HANA OData connector capabilities")?;
 
             let mut enriched = connector.clone();
             apply_s4_capabilities_metadata(&mut enriched, endpoint, &capabilities)?;
+            apply_auth_resolution_metadata(
+                &mut enriched.metadata,
+                "auth_",
+                &resolved_auth.metadata,
+            );
             enriched.updated_at = Utc::now();
             Ok(Some(enriched))
         }
@@ -269,13 +315,32 @@ async fn discover_connector_capabilities(
                 return Ok(None);
             }
 
-            let payload = fetch_ecc_capabilities_document(endpoint, auth, &connector.metadata)
-                .await?;
+            let payload =
+                fetch_ecc_capabilities_document(endpoint, &resolved_auth.auth, &connector.metadata)
+                    .await?;
             let capabilities = discover_sap_ecc_adapter_capabilities(&payload)
                 .context("failed to derive SAP ECC adapter connector capabilities")?;
+            let health = fetch_optional_json_document(
+                build_optional_health_url(
+                    endpoint,
+                    &connector.metadata,
+                    capabilities.health_path.as_deref(),
+                    "ecc_health_path",
+                    "/adapter/v1/health",
+                ),
+                &resolved_auth.auth,
+                &endpoint.headers,
+            )
+            .await;
 
             let mut enriched = connector.clone();
             apply_ecc_capabilities_metadata(&mut enriched, endpoint, &capabilities)?;
+            apply_connector_health_metadata(&mut enriched, "ecc", health)?;
+            apply_auth_resolution_metadata(
+                &mut enriched.metadata,
+                "auth_",
+                &resolved_auth.metadata,
+            );
             enriched.updated_at = Utc::now();
             Ok(Some(enriched))
         }
@@ -293,13 +358,35 @@ async fn discover_connector_capabilities(
                 return Ok(None);
             }
 
-            let payload = fetch_ecc_rfc_capabilities_document(endpoint, auth, &connector.metadata)
-                .await?;
+            let payload = fetch_ecc_rfc_capabilities_document(
+                endpoint,
+                &resolved_auth.auth,
+                &connector.metadata,
+            )
+            .await?;
             let capabilities = discover_sap_ecc_rfc_bapi_capabilities(&payload)
                 .context("failed to derive SAP ECC RFC/BAPI bridge connector capabilities")?;
+            let health = fetch_optional_json_document(
+                build_optional_health_url(
+                    endpoint,
+                    &connector.metadata,
+                    capabilities.health_path.as_deref(),
+                    "ecc_rfc_health_path",
+                    "/bridge/v1/health",
+                ),
+                &resolved_auth.auth,
+                &endpoint.headers,
+            )
+            .await;
 
             let mut enriched = connector.clone();
             apply_ecc_rfc_capabilities_metadata(&mut enriched, endpoint, &capabilities)?;
+            apply_connector_health_metadata(&mut enriched, "ecc_rfc", health)?;
+            apply_auth_resolution_metadata(
+                &mut enriched.metadata,
+                "auth_",
+                &resolved_auth.metadata,
+            );
             enriched.updated_at = Utc::now();
             Ok(Some(enriched))
         }
@@ -312,17 +399,27 @@ async fn fetch_connector_events(
     run_id: &str,
     request_body: Option<Value>,
     request_headers: HashMap<String, String>,
+    secret_store_registry: Option<std::sync::Arc<SecretStoreRegistry>>,
 ) -> Result<Vec<MigrationEvidenceEvent>> {
     if matches!(connector.transport, ConnectorTransport::SapEccStagedExport) {
         return fetch_sap_ecc_staged_export_events(connector, run_id, request_body).await;
     }
-    if matches!(connector.transport, ConnectorTransport::SapIdocExtractorPackage) {
+    if matches!(
+        connector.transport,
+        ConnectorTransport::SapIdocExtractorPackage | ConnectorTransport::SapOdpExtractorPackage
+    ) {
         return fetch_sap_idoc_extractor_events(connector, run_id, request_body).await;
     }
 
+    let resolved_auth = resolve_connector_auth(&connector.auth, secret_store_registry).await?;
     let client = reqwest::Client::new();
-    let method = Method::from_bytes(connector.endpoint.method.as_bytes()).context("invalid connector HTTP method")?;
-    let url = format!("{}{}", connector.endpoint.base_url.trim_end_matches('/'), connector.endpoint.path);
+    let method = Method::from_bytes(connector.endpoint.method.as_bytes())
+        .context("invalid connector HTTP method")?;
+    let url = format!(
+        "{}{}",
+        connector.endpoint.base_url.trim_end_matches('/'),
+        connector.endpoint.path
+    );
     let mut request = client.request(method, &url);
     for (key, value) in &connector.endpoint.headers {
         request = request.header(key, value);
@@ -330,7 +427,7 @@ async fn fetch_connector_events(
     for (key, value) in request_headers {
         request = request.header(key, value);
     }
-    request = apply_auth(request, &connector.auth);
+    request = apply_auth(request, &resolved_auth.auth);
     if let Some(body) = request_body {
         request = request.json(&body);
     }
@@ -374,11 +471,19 @@ async fn load_sap_ecc_staged_export_bundle(
     }
 
     let manifest_path = resolve_staged_export_manifest_path(&connector.endpoint)?;
-    let manifest_bytes = tokio::fs::read(&manifest_path)
-        .await
-        .with_context(|| format!("failed to read staged export manifest '{}'", manifest_path.display()))?;
-    let bundle: SapEccStagedExportBundle = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("failed to parse staged export manifest '{}'", manifest_path.display()))?;
+    let manifest_bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
+        format!(
+            "failed to read staged export manifest '{}'",
+            manifest_path.display()
+        )
+    })?;
+    let bundle: SapEccStagedExportBundle =
+        serde_json::from_slice(&manifest_bytes).with_context(|| {
+            format!(
+                "failed to parse staged export manifest '{}'",
+                manifest_path.display()
+            )
+        })?;
     let bundle_dir = manifest_path.parent().map(Path::to_path_buf);
     Ok((bundle, bundle_dir))
 }
@@ -468,11 +573,7 @@ async fn build_sap_ecc_staged_export_events(
         0,
         SapEccStagedControlEvidence {
             value_key: None,
-            control: integrity_control_from_manifest(
-                &bundle.manifest,
-                &object,
-                &data_assessment,
-            ),
+            control: integrity_control_from_manifest(&bundle.manifest, &object, &data_assessment),
         },
     );
 
@@ -493,12 +594,17 @@ async fn build_sap_ecc_staged_export_events(
 
 fn validate_staged_export_manifest(manifest: &SapEccStagedExportManifest) -> Result<()> {
     if manifest.schema_version.is_empty() {
-        return Err(anyhow!("sap_ecc_staged_export manifest requires schema_version"));
+        return Err(anyhow!(
+            "sap_ecc_staged_export manifest requires schema_version"
+        ));
     }
     if manifest.export_id.is_empty() {
         return Err(anyhow!("sap_ecc_staged_export manifest requires export_id"));
     }
-    if manifest.program_id.is_empty() || manifest.object_id.is_empty() || manifest.object_name.is_empty() {
+    if manifest.program_id.is_empty()
+        || manifest.object_id.is_empty()
+        || manifest.object_name.is_empty()
+    {
         return Err(anyhow!(
             "sap_ecc_staged_export manifest requires program_id, object_id, and object_name"
         ));
@@ -558,7 +664,10 @@ async fn load_staged_export_data_bytes(
     bundle_dir: Option<&Path>,
 ) -> Result<(Vec<u8>, String)> {
     if let Some(inline) = &data_set.inline_payload {
-        return Ok((serialize_inline_data_set(data_set, inline)?, "inline_payload".to_string()));
+        return Ok((
+            serialize_inline_data_set(data_set, inline)?,
+            "inline_payload".to_string(),
+        ));
     }
 
     let Some(path) = data_set.path.as_deref() else {
@@ -567,9 +676,12 @@ async fn load_staged_export_data_bytes(
         ));
     };
     let resolved = resolve_relative_bundle_path(bundle_dir, path);
-    let bytes = tokio::fs::read(&resolved)
-        .await
-        .with_context(|| format!("failed to read staged export data file '{}'", resolved.display()))?;
+    let bytes = tokio::fs::read(&resolved).await.with_context(|| {
+        format!(
+            "failed to read staged export data file '{}'",
+            resolved.display()
+        )
+    })?;
     Ok((bytes, resolved.display().to_string()))
 }
 
@@ -578,9 +690,8 @@ fn serialize_inline_data_set(
     payload: &Value,
 ) -> Result<Vec<u8>> {
     match data_set.format {
-        SapEccStagedExportDataFormat::JsonRows => {
-            serde_json::to_vec(payload).context("failed to serialize staged export inline JSON payload")
-        }
+        SapEccStagedExportDataFormat::JsonRows => serde_json::to_vec(payload)
+            .context("failed to serialize staged export inline JSON payload"),
         SapEccStagedExportDataFormat::Csv | SapEccStagedExportDataFormat::Tsv => payload
             .as_str()
             .map(|text| text.as_bytes().to_vec())
@@ -609,7 +720,9 @@ fn count_staged_export_rows(data_set: &SapEccStagedExportDataSet, bytes: &[u8]) 
                 Value::Object(mut object) => object
                     .remove("rows")
                     .and_then(|rows| rows.as_array().map(|items| items.len() as u64))
-                    .ok_or_else(|| anyhow!("staged export JSON payload must be an array or object with 'rows'")),
+                    .ok_or_else(|| {
+                        anyhow!("staged export JSON payload must be an array or object with 'rows'")
+                    }),
                 _ => Err(anyhow!(
                     "staged export JSON payload must be an array or object with 'rows'"
                 )),
@@ -644,7 +757,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn default_staged_export_program(manifest: &SapEccStagedExportManifest) -> MigrationProgram {
     let mut metadata = manifest.metadata.clone();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("export_id".to_string(), manifest.export_id.clone());
     MigrationProgram {
@@ -653,7 +769,11 @@ fn default_staged_export_program(manifest: &SapEccStagedExportManifest) -> Migra
         customer_name: None,
         source_landscape: Some(format!("SAP ECC {}", manifest.source_system_id)),
         target_landscape: None,
-        tags: vec!["sap".to_string(), "ecc".to_string(), "staged_export".to_string()],
+        tags: vec![
+            "sap".to_string(),
+            "ecc".to_string(),
+            "staged_export".to_string(),
+        ],
         metadata,
         created_at: manifest.extracted_at,
         updated_at: manifest.extracted_at,
@@ -662,7 +782,10 @@ fn default_staged_export_program(manifest: &SapEccStagedExportManifest) -> Migra
 
 fn default_staged_export_object(manifest: &SapEccStagedExportManifest) -> MigrationObject {
     let mut metadata = manifest.metadata.clone();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("export_id".to_string(), manifest.export_id.clone());
     MigrationObject {
@@ -676,7 +799,11 @@ fn default_staged_export_object(manifest: &SapEccStagedExportManifest) -> Migrat
         )),
         source_record_id: None,
         target_record_id: None,
-        tags: vec!["sap".to_string(), "ecc".to_string(), "staged_export".to_string()],
+        tags: vec![
+            "sap".to_string(),
+            "ecc".to_string(),
+            "staged_export".to_string(),
+        ],
         metadata,
     }
 }
@@ -688,10 +815,16 @@ fn default_staged_export_execution(
     assessment: &StagedExportDataAssessment,
 ) -> ExecutionEvent {
     let mut metadata = manifest.metadata.clone();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("export_id".to_string(), manifest.export_id.clone());
-    metadata.insert("connector_transport".to_string(), "sap_ecc_staged_export".to_string());
+    metadata.insert(
+        "connector_transport".to_string(),
+        "sap_ecc_staged_export".to_string(),
+    );
     metadata.insert("data_source_ref".to_string(), assessment.source_ref.clone());
     metadata.insert("data_sha256".to_string(), assessment.sha256.clone());
     metadata.insert(
@@ -727,12 +860,18 @@ fn integrity_control_from_manifest(
     assessment: &StagedExportDataAssessment,
 ) -> ControlResult {
     let mut metadata = manifest.metadata.clone();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("export_id".to_string(), manifest.export_id.clone());
     metadata.insert("data_source_ref".to_string(), assessment.source_ref.clone());
     metadata.insert("data_sha256".to_string(), assessment.sha256.clone());
-    metadata.insert("actual_row_count".to_string(), assessment.row_count.to_string());
+    metadata.insert(
+        "actual_row_count".to_string(),
+        assessment.row_count.to_string(),
+    );
     metadata.insert("checksum_verified".to_string(), "true".to_string());
     metadata.insert(
         "data_format".to_string(),
@@ -743,7 +882,11 @@ fn integrity_control_from_manifest(
         }
         .to_string(),
     );
-    if let Some(expected) = manifest.data_set.as_ref().and_then(|set| set.expected_row_count) {
+    if let Some(expected) = manifest
+        .data_set
+        .as_ref()
+        .and_then(|set| set.expected_row_count)
+    {
         metadata.insert("expected_row_count".to_string(), expected.to_string());
     }
 
@@ -903,7 +1046,6 @@ fn push_event(
     ));
 }
 
-
 async fn fetch_sap_idoc_extractor_events(
     connector: &MigrationConnector,
     run_id: &str,
@@ -913,22 +1055,98 @@ async fn fetch_sap_idoc_extractor_events(
     build_sap_idoc_extractor_events(connector, run_id, bundle, bundle_dir.as_deref()).await
 }
 
+fn effective_extractor_family(
+    connector: &MigrationConnector,
+    manifest: &SapIdocExtractorManifest,
+) -> SapExtractorFamily {
+    match connector.transport {
+        ConnectorTransport::SapOdpExtractorPackage => SapExtractorFamily::Odp,
+        ConnectorTransport::SapIdocExtractorPackage => manifest.extractor_family.clone(),
+        _ => manifest.extractor_family.clone(),
+    }
+}
+
+fn extractor_transport_name(
+    connector: &MigrationConnector,
+    family: &SapExtractorFamily,
+) -> &'static str {
+    match connector.transport {
+        ConnectorTransport::SapOdpExtractorPackage => "sap_odp_extractor_package",
+        ConnectorTransport::SapIdocExtractorPackage => match family {
+            SapExtractorFamily::Odp => "sap_odp_extractor_package",
+            _ => "sap_idoc_extractor_package",
+        },
+        _ => match family {
+            SapExtractorFamily::Odp => "sap_odp_extractor_package",
+            _ => "sap_idoc_extractor_package",
+        },
+    }
+}
+
+fn extractor_stage_name(family: &SapExtractorFamily) -> &'static str {
+    match family {
+        SapExtractorFamily::Idoc => "idoc_extractor_ingest",
+        SapExtractorFamily::Odp => "odp_extractor_ingest",
+        SapExtractorFamily::Generic => "extractor_package_ingest",
+    }
+}
+
+fn extractor_integrity_control_name(family: &SapExtractorFamily) -> &'static str {
+    match family {
+        SapExtractorFamily::Idoc => "sap_idoc_extractor_integrity",
+        SapExtractorFamily::Odp => "sap_odp_extractor_integrity",
+        SapExtractorFamily::Generic => "sap_extractor_package_integrity",
+    }
+}
+
+fn extractor_integrity_control_type(family: &SapExtractorFamily) -> &'static str {
+    match family {
+        SapExtractorFamily::Idoc => "idoc_extractor_integrity",
+        SapExtractorFamily::Odp => "odp_extractor_integrity",
+        SapExtractorFamily::Generic => "extractor_package_integrity",
+    }
+}
+
+fn extractor_family_tag(family: &SapExtractorFamily) -> &'static str {
+    match family {
+        SapExtractorFamily::Idoc => "idoc_extractor",
+        SapExtractorFamily::Odp => "odp_extractor",
+        SapExtractorFamily::Generic => "extractor_package",
+    }
+}
+
+fn extractor_family_label(family: &SapExtractorFamily) -> &'static str {
+    match family {
+        SapExtractorFamily::Idoc => "IDoc / extractor",
+        SapExtractorFamily::Odp => "ODP extractor",
+        SapExtractorFamily::Generic => "extractor",
+    }
+}
+
 async fn load_sap_idoc_extractor_bundle(
     connector: &MigrationConnector,
     request_body: Option<Value>,
 ) -> Result<(SapIdocExtractorBundle, Option<PathBuf>)> {
     if let Some(body) = request_body {
         let bundle: SapIdocExtractorBundle = serde_json::from_value(body)
-            .context("failed to deserialize SAP IDoc extractor bundle")?;
+            .context("failed to deserialize SAP extractor package bundle")?;
         return Ok((bundle, None));
     }
 
     let manifest_path = resolve_idoc_extractor_manifest_path(&connector.endpoint)?;
-    let manifest_bytes = tokio::fs::read(&manifest_path)
-        .await
-        .with_context(|| format!("failed to read IDoc extractor manifest '{}'", manifest_path.display()))?;
-    let bundle: SapIdocExtractorBundle = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("failed to parse IDoc extractor manifest '{}'", manifest_path.display()))?;
+    let manifest_bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
+        format!(
+            "failed to read SAP extractor manifest '{}'",
+            manifest_path.display()
+        )
+    })?;
+    let bundle: SapIdocExtractorBundle =
+        serde_json::from_slice(&manifest_bytes).with_context(|| {
+            format!(
+                "failed to parse SAP extractor manifest '{}'",
+                manifest_path.display()
+            )
+        })?;
     let bundle_dir = manifest_path.parent().map(Path::to_path_buf);
     Ok((bundle, bundle_dir))
 }
@@ -938,7 +1156,7 @@ fn resolve_idoc_extractor_manifest_path(
 ) -> Result<PathBuf> {
     if endpoint.path.is_empty() {
         return Err(anyhow!(
-            "sap_idoc_extractor_package connectors require either inline request_body or endpoint.path"
+            "SAP extractor package connectors require either inline request_body or endpoint.path"
         ));
     }
 
@@ -951,7 +1169,7 @@ fn resolve_idoc_extractor_manifest_path(
     }
 
     Err(anyhow!(
-        "sap_idoc_extractor_package only supports inline request bodies or file:// endpoints"
+        "SAP extractor package transports only support inline request bodies or file:// endpoints"
     ))
 }
 
@@ -961,17 +1179,18 @@ async fn build_sap_idoc_extractor_events(
     bundle: SapIdocExtractorBundle,
     bundle_dir: Option<&Path>,
 ) -> Result<Vec<MigrationEvidenceEvent>> {
-    validate_idoc_extractor_manifest(&bundle.manifest)?;
+    let family = effective_extractor_family(connector, &bundle.manifest);
+    validate_idoc_extractor_manifest(&bundle.manifest, &connector.transport, &family)?;
     let data_set = bundle
         .manifest
         .data_set
         .clone()
-        .ok_or_else(|| anyhow!("sap_idoc_extractor_package manifest requires data_set"))?;
+        .ok_or_else(|| anyhow!("SAP extractor package manifest requires data_set"))?;
 
     let data_assessment = load_idoc_extractor_data_set(&data_set, bundle_dir).await?;
 
-    let program = default_idoc_extractor_program(&bundle.manifest);
-    let object = default_idoc_extractor_object(&bundle.manifest);
+    let program = default_idoc_extractor_program(&bundle.manifest, &family);
+    let object = default_idoc_extractor_object(&bundle.manifest, &family);
 
     let mut events = vec![
         MigrationEvidenceEvent::new(
@@ -1005,6 +1224,7 @@ async fn build_sap_idoc_extractor_events(
                 run_id,
                 connector,
                 &data_assessment,
+                &family,
             ),
         });
     }
@@ -1018,6 +1238,7 @@ async fn build_sap_idoc_extractor_events(
                 &bundle.manifest,
                 &object,
                 &data_assessment,
+                &family,
             ),
         },
     );
@@ -1030,27 +1251,124 @@ async fn build_sap_idoc_extractor_events(
     Ok(events)
 }
 
-fn validate_idoc_extractor_manifest(manifest: &SapIdocExtractorManifest) -> Result<()> {
+fn validate_idoc_extractor_manifest(
+    manifest: &SapIdocExtractorManifest,
+    transport: &ConnectorTransport,
+    family: &SapExtractorFamily,
+) -> Result<()> {
     if manifest.schema_version.is_empty() {
-        return Err(anyhow!("sap_idoc_extractor_package manifest requires schema_version"));
+        return Err(anyhow!(
+            "SAP extractor package manifest requires schema_version"
+        ));
     }
     if manifest.package_id.is_empty() {
-        return Err(anyhow!("sap_idoc_extractor_package manifest requires package_id"));
-    }
-    if manifest.program_id.is_empty() || manifest.object_id.is_empty() || manifest.object_name.is_empty() {
         return Err(anyhow!(
-            "sap_idoc_extractor_package manifest requires program_id, object_id, and object_name"
+            "SAP extractor package manifest requires package_id"
+        ));
+    }
+    if manifest.program_id.is_empty()
+        || manifest.object_id.is_empty()
+        || manifest.object_name.is_empty()
+    {
+        return Err(anyhow!(
+            "SAP extractor package manifest requires program_id, object_id, and object_name"
         ));
     }
     if manifest.source_system_id.is_empty() || manifest.source_client.is_empty() {
         return Err(anyhow!(
-            "sap_idoc_extractor_package manifest requires source_system_id and source_client"
+            "SAP extractor package manifest requires source_system_id and source_client"
         ));
     }
     if manifest.extractor_name.is_empty() || manifest.extractor_run_id.is_empty() {
         return Err(anyhow!(
-            "sap_idoc_extractor_package manifest requires extractor_name and extractor_run_id"
+            "SAP extractor package manifest requires extractor_name and extractor_run_id"
         ));
+    }
+    if matches!(transport, ConnectorTransport::SapOdpExtractorPackage)
+        && !matches!(family, SapExtractorFamily::Odp)
+    {
+        return Err(anyhow!(
+            "sap_odp_extractor_package manifests must declare extractor_family='odp'"
+        ));
+    }
+    if matches!(family, SapExtractorFamily::Odp)
+        && (manifest
+            .extractor_context
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+            || manifest
+                .extractor_object
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty())
+    {
+        return Err(anyhow!(
+            "ODP extractor packages require extractor_context and extractor_object"
+        ));
+    }
+    match family {
+        SapExtractorFamily::Idoc => {
+            if manifest.idoc_type.as_deref().unwrap_or_default().is_empty()
+                && manifest
+                    .message_type
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(anyhow!(
+                    "IDoc extractor packages require idoc_type or message_type"
+                ));
+            }
+        }
+        SapExtractorFamily::Odp => {
+            let has_subscriber = manifest
+                .subscriber_name
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            let has_queue = manifest
+                .queue_name
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            if has_subscriber != has_queue {
+                return Err(anyhow!(
+                    "ODP extractor packages require subscriber_name and queue_name together"
+                ));
+            }
+            if matches!(
+                manifest.extraction_mode,
+                Some(graphica_core::migration_evidence::SapExtractorMode::Delta)
+            ) && manifest
+                .delta_token
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                && !(has_subscriber && has_queue)
+            {
+                return Err(anyhow!(
+                    "ODP delta extractor packages require delta_token or subscriber/queue context"
+                ));
+            }
+        }
+        SapExtractorFamily::Generic => {
+            if manifest
+                .extractor_object
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                && manifest
+                    .extractor_context
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(anyhow!(
+                    "generic extractor packages require extractor_object or extractor_context"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1072,7 +1390,7 @@ async fn load_idoc_extractor_data_set(
     if let Some(expected) = data_set.expected_row_count {
         if row_count != expected {
             return Err(anyhow!(
-                "sap_idoc_extractor_package row count mismatch: expected {}, found {}",
+                "SAP extractor package row count mismatch: expected {}, found {}",
                 expected,
                 row_count
             ));
@@ -1083,7 +1401,7 @@ async fn load_idoc_extractor_data_set(
     if let Some(expected_sha) = data_set.sha256.as_deref() {
         if !expected_sha.eq_ignore_ascii_case(&sha256) {
             return Err(anyhow!(
-                "sap_idoc_extractor_package checksum mismatch for {}",
+                "SAP extractor package checksum mismatch for {}",
                 source_ref
             ));
         }
@@ -1102,18 +1420,24 @@ async fn load_idoc_extractor_data_bytes(
     bundle_dir: Option<&Path>,
 ) -> Result<(Vec<u8>, String)> {
     if let Some(inline) = &data_set.inline_payload {
-        return Ok((serialize_inline_idoc_data_set(data_set, inline)?, "inline_payload".to_string()));
+        return Ok((
+            serialize_inline_idoc_data_set(data_set, inline)?,
+            "inline_payload".to_string(),
+        ));
     }
 
     let Some(path) = data_set.path.as_deref() else {
         return Err(anyhow!(
-            "sap_idoc_extractor_package data_set requires either inline_payload or path"
+            "SAP extractor package data_set requires either inline_payload or path"
         ));
     };
     let resolved = resolve_relative_bundle_path(bundle_dir, path);
-    let bytes = tokio::fs::read(&resolved)
-        .await
-        .with_context(|| format!("failed to read IDoc extractor data file '{}'", resolved.display()))?;
+    let bytes = tokio::fs::read(&resolved).await.with_context(|| {
+        format!(
+            "failed to read IDoc extractor data file '{}'",
+            resolved.display()
+        )
+    })?;
     Ok((bytes, resolved.display().to_string()))
 }
 
@@ -1151,12 +1475,55 @@ fn count_idoc_extractor_rows(data_set: &SapIdocExtractorDataSet, bytes: &[u8]) -
     }
 }
 
-fn default_idoc_extractor_program(manifest: &SapIdocExtractorManifest) -> MigrationProgram {
+fn default_idoc_extractor_program(
+    manifest: &SapIdocExtractorManifest,
+    family: &SapExtractorFamily,
+) -> MigrationProgram {
     let mut metadata = BTreeMap::new();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("package_id".to_string(), manifest.package_id.clone());
-    metadata.insert("extractor_name".to_string(), manifest.extractor_name.clone());
+    metadata.insert(
+        "extractor_name".to_string(),
+        manifest.extractor_name.clone(),
+    );
+    metadata.insert(
+        "extractor_family".to_string(),
+        serde_json::to_value(family)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "generic".to_string()),
+    );
+    if let Some(extractor_object) = manifest.extractor_object.as_deref() {
+        metadata.insert("extractor_object".to_string(), extractor_object.to_string());
+    }
+    if let Some(extractor_context) = manifest.extractor_context.as_deref() {
+        metadata.insert(
+            "extractor_context".to_string(),
+            extractor_context.to_string(),
+        );
+    }
+    if let Some(extraction_mode) = manifest.extraction_mode.as_ref() {
+        metadata.insert(
+            "extraction_mode".to_string(),
+            serde_json::to_value(extraction_mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "full".to_string()),
+        );
+    }
+    if let Some(delta_token) = manifest.delta_token.as_deref() {
+        metadata.insert("delta_token".to_string(), delta_token.to_string());
+    }
+    if let Some(subscriber_name) = manifest.subscriber_name.as_deref() {
+        metadata.insert("subscriber_name".to_string(), subscriber_name.to_string());
+    }
+    if let Some(queue_name) = manifest.queue_name.as_deref() {
+        metadata.insert("queue_name".to_string(), queue_name.to_string());
+    }
     if let Some(idoc_type) = manifest.idoc_type.as_deref() {
         metadata.insert("idoc_type".to_string(), idoc_type.to_string());
     }
@@ -1165,27 +1532,62 @@ fn default_idoc_extractor_program(manifest: &SapIdocExtractorManifest) -> Migrat
     }
     MigrationProgram {
         program_id: manifest.program_id.clone(),
-        name: format!("IDoc Extract {}", manifest.program_id),
+        name: format!("{} {}", extractor_family_label(family), manifest.program_id),
         customer_name: None,
         source_landscape: Some(format!("SAP ECC {}", manifest.source_system_id)),
         target_landscape: None,
-        tags: vec!["sap".to_string(), "ecc".to_string(), "idoc_extractor".to_string()],
+        tags: vec![
+            "sap".to_string(),
+            "ecc".to_string(),
+            extractor_family_tag(family).to_string(),
+        ],
         metadata: metadata.into_iter().collect(),
         created_at: manifest.extracted_at,
         updated_at: manifest.extracted_at,
     }
 }
 
-fn default_idoc_extractor_object(manifest: &SapIdocExtractorManifest) -> MigrationObject {
+fn default_idoc_extractor_object(
+    manifest: &SapIdocExtractorManifest,
+    family: &SapExtractorFamily,
+) -> MigrationObject {
     let mut metadata = BTreeMap::new();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("package_id".to_string(), manifest.package_id.clone());
-    metadata.insert("extractor_name".to_string(), manifest.extractor_name.clone());
+    metadata.insert(
+        "extractor_name".to_string(),
+        manifest.extractor_name.clone(),
+    );
+    metadata.insert(
+        "extractor_family".to_string(),
+        serde_json::to_value(family)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "generic".to_string()),
+    );
     metadata.insert(
         "segment_counts_json".to_string(),
         serde_json::to_string(&manifest.segment_counts).unwrap_or_else(|_| "{}".to_string()),
     );
+    if let Some(extractor_object) = manifest.extractor_object.as_deref() {
+        metadata.insert("extractor_object".to_string(), extractor_object.to_string());
+    }
+    if let Some(extractor_context) = manifest.extractor_context.as_deref() {
+        metadata.insert(
+            "extractor_context".to_string(),
+            extractor_context.to_string(),
+        );
+    }
+    if let Some(subscriber_name) = manifest.subscriber_name.as_deref() {
+        metadata.insert("subscriber_name".to_string(), subscriber_name.to_string());
+    }
+    if let Some(queue_name) = manifest.queue_name.as_deref() {
+        metadata.insert("queue_name".to_string(), queue_name.to_string());
+    }
     if let Some(idoc_type) = manifest.idoc_type.as_deref() {
         metadata.insert("idoc_type".to_string(), idoc_type.to_string());
     }
@@ -1198,12 +1600,18 @@ fn default_idoc_extractor_object(manifest: &SapIdocExtractorManifest) -> Migrati
         object_type: MigrationObjectType::Interface,
         name: manifest.object_name.clone(),
         description: Some(format!(
-            "SAP IDoc / extractor package for {} from client {}",
-            manifest.object_name, manifest.source_client
+            "SAP {} package for {} from client {}",
+            extractor_family_label(family),
+            manifest.object_name,
+            manifest.source_client
         )),
         source_record_id: None,
         target_record_id: None,
-        tags: vec!["sap".to_string(), "ecc".to_string(), "idoc_extractor".to_string()],
+        tags: vec![
+            "sap".to_string(),
+            "ecc".to_string(),
+            extractor_family_tag(family).to_string(),
+        ],
         metadata: metadata.into_iter().collect(),
     }
 }
@@ -1213,14 +1621,34 @@ fn default_idoc_extractor_execution(
     run_id: &str,
     connector: &MigrationConnector,
     assessment: &IdocExtractorDataAssessment,
+    family: &SapExtractorFamily,
 ) -> ExecutionEvent {
     let mut metadata = HashMap::new();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("package_id".to_string(), manifest.package_id.clone());
-    metadata.insert("extractor_name".to_string(), manifest.extractor_name.clone());
-    metadata.insert("extractor_run_id".to_string(), manifest.extractor_run_id.clone());
-    metadata.insert("connector_transport".to_string(), "sap_idoc_extractor_package".to_string());
+    metadata.insert(
+        "extractor_name".to_string(),
+        manifest.extractor_name.clone(),
+    );
+    metadata.insert(
+        "extractor_run_id".to_string(),
+        manifest.extractor_run_id.clone(),
+    );
+    metadata.insert(
+        "connector_transport".to_string(),
+        extractor_transport_name(connector, family).to_string(),
+    );
+    metadata.insert(
+        "extractor_family".to_string(),
+        serde_json::to_value(family)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "generic".to_string()),
+    );
     metadata.insert("data_source_ref".to_string(), assessment.source_ref.clone());
     metadata.insert("data_sha256".to_string(), assessment.sha256.clone());
     metadata.insert(
@@ -1235,17 +1663,44 @@ fn default_idoc_extractor_execution(
     if let Some(idoc_type) = manifest.idoc_type.as_deref() {
         metadata.insert("idoc_type".to_string(), idoc_type.to_string());
     }
+    if let Some(extractor_object) = manifest.extractor_object.as_deref() {
+        metadata.insert("extractor_object".to_string(), extractor_object.to_string());
+    }
+    if let Some(extractor_context) = manifest.extractor_context.as_deref() {
+        metadata.insert(
+            "extractor_context".to_string(),
+            extractor_context.to_string(),
+        );
+    }
+    if let Some(extraction_mode) = manifest.extraction_mode.as_ref() {
+        metadata.insert(
+            "extraction_mode".to_string(),
+            serde_json::to_value(extraction_mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "full".to_string()),
+        );
+    }
+    if let Some(delta_token) = manifest.delta_token.as_deref() {
+        metadata.insert("delta_token".to_string(), delta_token.to_string());
+    }
+    if let Some(subscriber_name) = manifest.subscriber_name.as_deref() {
+        metadata.insert("subscriber_name".to_string(), subscriber_name.to_string());
+    }
+    if let Some(queue_name) = manifest.queue_name.as_deref() {
+        metadata.insert("queue_name".to_string(), queue_name.to_string());
+    }
     if let Some(message_type) = manifest.message_type.as_deref() {
         metadata.insert("message_type".to_string(), message_type.to_string());
     }
     ExecutionEvent {
-        execution_id: format!("idoc-package-{}", manifest.package_id),
+        execution_id: format!("extractor-package-{}", manifest.package_id),
         program_id: manifest.program_id.clone(),
         object_id: manifest.object_id.clone(),
         connector_run_id: run_id.to_string(),
-        tool_name: "sap_idoc_extractor_package".to_string(),
+        tool_name: extractor_transport_name(connector, family).to_string(),
         tool_run_id: connector.connector_id.clone(),
-        stage: "idoc_extractor_ingest".to_string(),
+        stage: extractor_stage_name(family).to_string(),
         status: ExecutionStatus::Succeeded,
         happened_at: manifest.extracted_at,
         source_snapshot_ref: Some(format!("sha256:{}", assessment.sha256)),
@@ -1260,16 +1715,36 @@ fn idoc_integrity_control_from_manifest(
     manifest: &SapIdocExtractorManifest,
     object: &MigrationObject,
     assessment: &IdocExtractorDataAssessment,
+    family: &SapExtractorFamily,
 ) -> ControlResult {
     let mut metadata = HashMap::new();
-    metadata.insert("source_system_id".to_string(), manifest.source_system_id.clone());
+    metadata.insert(
+        "source_system_id".to_string(),
+        manifest.source_system_id.clone(),
+    );
     metadata.insert("source_client".to_string(), manifest.source_client.clone());
     metadata.insert("package_id".to_string(), manifest.package_id.clone());
-    metadata.insert("extractor_name".to_string(), manifest.extractor_name.clone());
-    metadata.insert("extractor_run_id".to_string(), manifest.extractor_run_id.clone());
+    metadata.insert(
+        "extractor_name".to_string(),
+        manifest.extractor_name.clone(),
+    );
+    metadata.insert(
+        "extractor_run_id".to_string(),
+        manifest.extractor_run_id.clone(),
+    );
+    metadata.insert(
+        "extractor_family".to_string(),
+        serde_json::to_value(family)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "generic".to_string()),
+    );
     metadata.insert("data_source_ref".to_string(), assessment.source_ref.clone());
     metadata.insert("data_sha256".to_string(), assessment.sha256.clone());
-    metadata.insert("actual_row_count".to_string(), assessment.row_count.to_string());
+    metadata.insert(
+        "actual_row_count".to_string(),
+        assessment.row_count.to_string(),
+    );
     metadata.insert("checksum_verified".to_string(), "true".to_string());
     metadata.insert(
         "data_format".to_string(),
@@ -1286,7 +1761,38 @@ fn idoc_integrity_control_from_manifest(
     if let Some(message_type) = manifest.message_type.as_deref() {
         metadata.insert("message_type".to_string(), message_type.to_string());
     }
-    if let Some(expected) = manifest.data_set.as_ref().and_then(|set| set.expected_row_count) {
+    if let Some(extractor_object) = manifest.extractor_object.as_deref() {
+        metadata.insert("extractor_object".to_string(), extractor_object.to_string());
+    }
+    if let Some(extractor_context) = manifest.extractor_context.as_deref() {
+        metadata.insert(
+            "extractor_context".to_string(),
+            extractor_context.to_string(),
+        );
+    }
+    if let Some(extraction_mode) = manifest.extraction_mode.as_ref() {
+        metadata.insert(
+            "extraction_mode".to_string(),
+            serde_json::to_value(extraction_mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "full".to_string()),
+        );
+    }
+    if let Some(delta_token) = manifest.delta_token.as_deref() {
+        metadata.insert("delta_token".to_string(), delta_token.to_string());
+    }
+    if let Some(subscriber_name) = manifest.subscriber_name.as_deref() {
+        metadata.insert("subscriber_name".to_string(), subscriber_name.to_string());
+    }
+    if let Some(queue_name) = manifest.queue_name.as_deref() {
+        metadata.insert("queue_name".to_string(), queue_name.to_string());
+    }
+    if let Some(expected) = manifest
+        .data_set
+        .as_ref()
+        .and_then(|set| set.expected_row_count)
+    {
         metadata.insert("expected_row_count".to_string(), expected.to_string());
     }
 
@@ -1294,12 +1800,15 @@ fn idoc_integrity_control_from_manifest(
         control_id: format!("control-{}-integrity", manifest.package_id),
         program_id: manifest.program_id.clone(),
         object_id: object.object_id.clone(),
-        control_name: "sap_idoc_extractor_integrity".to_string(),
-        control_type: "idoc_extractor_integrity".to_string(),
+        control_name: extractor_integrity_control_name(family).to_string(),
+        control_type: extractor_integrity_control_type(family).to_string(),
         status: graphica_core::migration_evidence::ControlStatus::Passed,
         summary: format!(
-            "Verified IDoc / extractor package integrity for {} rows from {} client {}",
-            assessment.row_count, manifest.source_system_id, manifest.source_client
+            "Verified SAP {} package integrity for {} rows from {} client {}",
+            extractor_family_label(family),
+            assessment.row_count,
+            manifest.source_system_id,
+            manifest.source_client
         ),
         expected_value: manifest
             .data_set
@@ -1435,6 +1944,112 @@ async fn fetch_ecc_rfc_capabilities_document(
         .context("failed to read SAP ECC RFC/BAPI bridge capabilities response")
 }
 
+fn build_optional_health_url(
+    endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
+    connector_metadata: &HashMap<String, String>,
+    discovered_health_path: Option<&str>,
+    metadata_key: &str,
+    default_path: &str,
+) -> Option<String> {
+    let path = connector_metadata
+        .get(metadata_key)
+        .cloned()
+        .or_else(|| discovered_health_path.map(str::to_string))
+        .unwrap_or_else(|| default_path.to_string());
+    if path.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}{}",
+        endpoint.base_url.trim_end_matches('/'),
+        path
+    ))
+}
+
+async fn fetch_optional_json_document(
+    url: Option<String>,
+    auth: &graphica_core::migration_evidence::ConnectorAuth,
+    headers: &HashMap<String, String>,
+) -> Option<Value> {
+    let url = url?;
+    let client = reqwest::Client::new();
+    let mut request = client.get(&url);
+    request = request.header("accept", "application/json");
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    request = apply_auth(request, auth);
+    let response = request.send().await.ok()?.error_for_status().ok()?;
+    response.json().await.ok()
+}
+
+fn apply_connector_health_metadata(
+    connector: &mut MigrationConnector,
+    prefix: &str,
+    health: Option<Value>,
+) -> Result<()> {
+    connector.metadata.insert(
+        format!("{prefix}_health_checked_at"),
+        Utc::now().to_rfc3339(),
+    );
+    match health {
+        Some(Value::Object(object)) => {
+            let status = object
+                .get("status")
+                .or_else(|| object.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("ready");
+            let ready = object
+                .get("ready")
+                .or_else(|| object.get("healthy"))
+                .and_then(Value::as_bool)
+                .unwrap_or(status == "ready" || status == "ok");
+            connector
+                .metadata
+                .insert(format!("{prefix}_health_status"), status.to_string());
+            connector
+                .metadata
+                .insert(format!("{prefix}_health_ready"), ready.to_string());
+            if let Some(version) = object.get("version").and_then(Value::as_str) {
+                connector
+                    .metadata
+                    .insert(format!("{prefix}_health_version"), version.to_string());
+            }
+            if let Some(build) = object.get("build").and_then(Value::as_str) {
+                connector
+                    .metadata
+                    .insert(format!("{prefix}_health_build"), build.to_string());
+            }
+            connector.metadata.insert(
+                format!("{prefix}_health_payload_json"),
+                serde_json::to_string(&Value::Object(object))?,
+            );
+        }
+        Some(other) => {
+            connector.metadata.insert(
+                format!("{prefix}_health_status"),
+                "unexpected_payload".to_string(),
+            );
+            connector
+                .metadata
+                .insert(format!("{prefix}_health_ready"), "false".to_string());
+            connector.metadata.insert(
+                format!("{prefix}_health_payload_json"),
+                serde_json::to_string(&other)?,
+            );
+        }
+        None => {
+            connector
+                .metadata
+                .insert(format!("{prefix}_health_status"), "unavailable".to_string());
+            connector
+                .metadata
+                .insert(format!("{prefix}_health_ready"), "false".to_string());
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_s4_metadata_document(
     endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
     auth: &graphica_core::migration_evidence::ConnectorAuth,
@@ -1448,7 +2063,13 @@ async fn fetch_s4_metadata_document(
     let metadata_url = connector_metadata
         .get("odata_metadata_url")
         .cloned()
-        .unwrap_or_else(|| format!("{}{}", endpoint.base_url.trim_end_matches('/'), metadata_path));
+        .unwrap_or_else(|| {
+            format!(
+                "{}{}",
+                endpoint.base_url.trim_end_matches('/'),
+                metadata_path
+            )
+        });
     let client = reqwest::Client::new();
     let mut request = client.get(&metadata_url);
     request = request.header("accept", "application/xml, text/xml");
@@ -1499,7 +2120,9 @@ async fn fetch_ecc_capabilities_document(
         .context("failed to read SAP ECC adapter capabilities response")
 }
 
-fn build_odata_headers_from_connection(connection: &HashMap<String, String>) -> HashMap<String, String> {
+fn build_odata_headers_from_connection(
+    connection: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     if let Some(client) = connection.get("odata_client") {
         headers.insert("sap-client".to_string(), client.clone());
@@ -1605,6 +2228,15 @@ fn apply_ecc_capabilities_metadata(
             capabilities_path
         ),
     );
+    if let Some(health_path) = capabilities.health_path.as_deref() {
+        connector
+            .metadata
+            .insert("ecc_health_path".to_string(), health_path.to_string());
+        connector.metadata.insert(
+            "ecc_health_url".to_string(),
+            format!("{}{}", endpoint.base_url.trim_end_matches('/'), health_path),
+        );
+    }
     if let Some(version) = capabilities.adapter_version.as_deref() {
         connector
             .metadata
@@ -1630,9 +2262,72 @@ fn apply_ecc_capabilities_metadata(
         serde_json::to_string(&capabilities.key_fields)?,
     );
     connector.metadata.insert(
+        "ecc_required_parameters_json".to_string(),
+        serde_json::to_string(&capabilities.required_parameters)?,
+    );
+    connector.metadata.insert(
         "ecc_field_types_json".to_string(),
         serde_json::to_string(&field_types_by_name(&capabilities.fields))?,
     );
+    connector.metadata.insert(
+        "ecc_supported_auth_modes_json".to_string(),
+        serde_json::to_string(&capabilities.supported_auth_modes)?,
+    );
+    connector.metadata.insert(
+        "ecc_supported_session_modes_json".to_string(),
+        serde_json::to_string(&capabilities.supported_session_modes)?,
+    );
+    if let Some(session_id_path) = capabilities.session_id_path.as_deref() {
+        connector.metadata.insert(
+            "ecc_session_id_path".to_string(),
+            session_id_path.to_string(),
+        );
+    }
+    if let Some(session_id_parameter_name) = capabilities.session_id_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_session_id_parameter_name".to_string(),
+            session_id_parameter_name.to_string(),
+        );
+    }
+    if let Some(close_session_path) = capabilities.close_session_path.as_deref() {
+        connector.metadata.insert(
+            "ecc_close_session_path".to_string(),
+            close_session_path.to_string(),
+        );
+    }
+    if let Some(close_session_method) = capabilities.close_session_method.as_deref() {
+        connector.metadata.insert(
+            "ecc_close_session_method".to_string(),
+            close_session_method.to_string(),
+        );
+    }
+    connector.metadata.insert(
+        "ecc_requires_explicit_session_close".to_string(),
+        capabilities.requires_explicit_session_close.to_string(),
+    );
+    if let Some(session_ttl_seconds) = capabilities.session_ttl_seconds {
+        connector.metadata.insert(
+            "ecc_session_ttl_seconds".to_string(),
+            session_ttl_seconds.to_string(),
+        );
+    }
+    if let Some(max_page_size) = capabilities.max_page_size {
+        connector
+            .metadata
+            .insert("ecc_max_page_size".to_string(), max_page_size.to_string());
+    }
+    if let Some(page_size_parameter_name) = capabilities.page_size_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_page_size_parameter_name".to_string(),
+            page_size_parameter_name.to_string(),
+        );
+    }
+    if let Some(language_parameter_name) = capabilities.language_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_language_parameter_name".to_string(),
+            language_parameter_name.to_string(),
+        );
+    }
     connector.metadata.insert(
         "ecc_field_count".to_string(),
         capabilities.fields.len().to_string(),
@@ -1678,6 +2373,25 @@ fn apply_ecc_rfc_capabilities_metadata(
             capabilities_path
         ),
     );
+    if let Some(health_path) = capabilities.health_path.as_deref() {
+        connector
+            .metadata
+            .insert("ecc_rfc_health_path".to_string(), health_path.to_string());
+        connector.metadata.insert(
+            "ecc_rfc_health_url".to_string(),
+            format!("{}{}", endpoint.base_url.trim_end_matches('/'), health_path),
+        );
+    }
+    connector.metadata.insert(
+        "ecc_rfc_profile".to_string(),
+        match capabilities.profile {
+            SapEccRfcBapiProfile::BapiRecordLookup => "bapi_record_lookup",
+            SapEccRfcBapiProfile::FunctionModuleExport => "function_module_export",
+            SapEccRfcBapiProfile::TableReadRowset => "table_read_rowset",
+            SapEccRfcBapiProfile::QueryBridge => "query_bridge",
+        }
+        .to_string(),
+    );
     if let Some(version) = capabilities.bridge_version.as_deref() {
         connector
             .metadata
@@ -1715,9 +2429,85 @@ fn apply_ecc_rfc_capabilities_metadata(
         serde_json::to_string(&capabilities.key_fields)?,
     );
     connector.metadata.insert(
+        "ecc_rfc_required_parameters_json".to_string(),
+        serde_json::to_string(&capabilities.required_parameters)?,
+    );
+    connector.metadata.insert(
+        "ecc_rfc_supported_auth_modes_json".to_string(),
+        serde_json::to_string(&capabilities.supported_auth_modes)?,
+    );
+    connector.metadata.insert(
+        "ecc_rfc_supported_session_modes_json".to_string(),
+        serde_json::to_string(&capabilities.supported_session_modes)?,
+    );
+    if let Some(session_id_path) = capabilities.session_id_path.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_session_id_path".to_string(),
+            session_id_path.to_string(),
+        );
+    }
+    if let Some(session_id_parameter_name) = capabilities.session_id_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_session_id_parameter_name".to_string(),
+            session_id_parameter_name.to_string(),
+        );
+    }
+    if let Some(close_session_path) = capabilities.close_session_path.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_close_session_path".to_string(),
+            close_session_path.to_string(),
+        );
+    }
+    if let Some(close_session_method) = capabilities.close_session_method.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_close_session_method".to_string(),
+            close_session_method.to_string(),
+        );
+    }
+    connector.metadata.insert(
+        "ecc_rfc_requires_explicit_session_close".to_string(),
+        capabilities.requires_explicit_session_close.to_string(),
+    );
+    if let Some(session_ttl_seconds) = capabilities.session_ttl_seconds {
+        connector.metadata.insert(
+            "ecc_rfc_session_ttl_seconds".to_string(),
+            session_ttl_seconds.to_string(),
+        );
+    }
+    connector.metadata.insert(
         "ecc_rfc_field_types_json".to_string(),
         serde_json::to_string(&rfc_field_types_by_name(&capabilities.fields))?,
     );
+    if let Some(max_page_size) = capabilities.max_page_size {
+        connector.metadata.insert(
+            "ecc_rfc_max_page_size".to_string(),
+            max_page_size.to_string(),
+        );
+    }
+    if let Some(page_size_parameter_name) = capabilities.page_size_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_page_size_parameter_name".to_string(),
+            page_size_parameter_name.to_string(),
+        );
+    }
+    if let Some(language_parameter_name) = capabilities.language_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_language_parameter_name".to_string(),
+            language_parameter_name.to_string(),
+        );
+    }
+    if let Some(cursor_parameter_name) = capabilities.cursor_parameter_name.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_cursor_parameter_name".to_string(),
+            cursor_parameter_name.to_string(),
+        );
+    }
+    if let Some(next_cursor_path) = capabilities.next_cursor_path.as_deref() {
+        connector.metadata.insert(
+            "ecc_rfc_next_cursor_path".to_string(),
+            next_cursor_path.to_string(),
+        );
+    }
     connector.metadata.insert(
         "ecc_rfc_field_count".to_string(),
         capabilities.fields.len().to_string(),
@@ -1756,7 +2546,9 @@ fn apply_auth(
             }
         }
         ConnectorAuthKind::ApiKey => {
-            if let (Some(header), Some(key)) = (auth.header_name.as_deref(), auth.api_key.as_deref()) {
+            if let (Some(header), Some(key)) =
+                (auth.header_name.as_deref(), auth.api_key.as_deref())
+            {
                 request = request.header(header, key);
             }
         }
@@ -1771,10 +2563,49 @@ fn apply_auth(
     request
 }
 
+fn apply_auth_resolution_metadata(
+    metadata: &mut HashMap<String, String>,
+    prefix: &str,
+    resolution: &ConnectorAuthResolutionMetadata,
+) {
+    if let Some(secret_ref) = resolution.secret_ref.as_deref() {
+        metadata.insert(format!("{prefix}secret_ref"), secret_ref.to_string());
+    }
+    if let Some(secret_store) = resolution.secret_store.as_deref() {
+        metadata.insert(format!("{prefix}secret_store"), secret_store.to_string());
+    }
+    if let Some(secret_version) = resolution.secret_version.as_deref() {
+        metadata.insert(
+            format!("{prefix}secret_version"),
+            secret_version.to_string(),
+        );
+    }
+    if let Some(interval_days) = resolution.rotation_interval_days {
+        metadata.insert(
+            format!("{prefix}rotation_interval_days"),
+            interval_days.to_string(),
+        );
+    }
+    if let Some(next_rotation) = resolution.next_rotation {
+        metadata.insert(format!("{prefix}next_rotation"), next_rotation.to_rfc3339());
+    }
+    if let Some(last_rotated) = resolution.last_rotated {
+        metadata.insert(format!("{prefix}last_rotated"), last_rotated.to_rfc3339());
+    }
+}
+
 fn enrich_verification_source_from_connector(
     connector: &MigrationConnector,
     verification: &mut VerificationRequest,
 ) {
+    if verification.source.endpoint.is_none() {
+        verification.source.endpoint = Some(connector.endpoint.clone());
+    }
+    if verification.source.auth.kind == ConnectorAuthKind::None
+        && verification.source.auth.secret_ref.is_none()
+    {
+        verification.source.auth = connector.auth.clone();
+    }
     let prefix = match connector.transport {
         ConnectorTransport::SapS4OData => Some("odata_"),
         ConnectorTransport::SapEccAdapter => Some("ecc_"),
@@ -1842,8 +2673,13 @@ impl EvidenceIngestionService for EvidenceIngestionServiceImpl {
         &self,
         request: Request<UpsertConnectorRequest>,
     ) -> Result<Response<ConnectorReply>, Status> {
-        let connector: MigrationConnector = deserialize(&request.into_inner().connector_json).map_err(internal_status)?;
-        let stored = self.manager.upsert_connector(connector).await.map_err(internal_status)?;
+        let connector: MigrationConnector =
+            deserialize(&request.into_inner().connector_json).map_err(internal_status)?;
+        let stored = self
+            .manager
+            .upsert_connector(connector)
+            .await
+            .map_err(internal_status)?;
         Ok(Response::new(ConnectorReply {
             connector_json: serialize(&stored).map_err(internal_status)?,
         }))
@@ -1868,7 +2704,8 @@ impl EvidenceIngestionService for EvidenceIngestionServiceImpl {
         request: Request<RunConnectorRequest>,
     ) -> Result<Response<RunConnectorResponse>, Status> {
         let req = request.into_inner();
-        let run_request: DomainConnectorRunRequest = deserialize(&req.run_request_json).map_err(internal_status)?;
+        let run_request: DomainConnectorRunRequest =
+            deserialize(&req.run_request_json).map_err(internal_status)?;
         let (summary, events) = self
             .manager
             .run_connector(&req.connector_id, run_request)
@@ -1926,18 +2763,20 @@ fn internal_status(error: impl std::fmt::Display) -> Status {
 mod tests {
     use super::*;
     use graphica_core::migration_evidence::{
-        ConnectorAuth, ConnectorEndpoint, ConnectorTransport, ControlResult, ControlStatus,
-        ExceptionRecord, ExceptionSeverity, ExceptionStatus, ExecutionEvent, MigrationConnector,
-        MigrationConnectorVendor, MigrationEvidenceArtifactType, MigrationEvidenceDispatchSummary,
-        MigrationEvidenceDeliveryMode, MigrationEvidenceEventForwarder, SapEccStagedControlEvidence,
-        SapEccStagedExceptionEvidence, SapEccStagedExportBundle,
+        verification_result_to_events, ConnectorAuth, ConnectorAuthKind, ConnectorEndpoint,
+        ConnectorTransport, ControlResult, ControlStatus, ExceptionRecord, ExceptionSeverity,
+        ExceptionStatus, ExecutionEvent, MigrationConnector, MigrationConnectorVendor,
+        MigrationEvidenceArtifactType, MigrationEvidenceDeliveryMode,
+        MigrationEvidenceDispatchSummary, MigrationEvidenceEventForwarder,
+        SapEccStagedControlEvidence, SapEccStagedExceptionEvidence, SapEccStagedExportBundle,
         SapEccStagedExportDataFormat, SapEccStagedExportDataSet, SapEccStagedExportManifest,
         SapEccStagedRuleEvidence, SapIdocExtractorBundle, SapIdocExtractorDataFormat,
         SapIdocExtractorDataSet, SapIdocExtractorManifest, SourceFieldRef, TargetFieldRef,
         TransformationRule, TransformationRuleType, VerificationDispatchRequest,
         VerificationDispatchResult, VerificationRequest, VerificationResult, VerificationSource,
-        verification_result_to_events,
     };
+    use graphica_core::secrets::providers::{InlineSecretStore, SecretStoreRegistry};
+    use graphica_core::secrets::{put_secret_by_ref, SecretValue};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2003,7 +2842,10 @@ mod tests {
                     tolerance: verification.tolerance,
                     executed_at: Utc::now(),
                     evidence_refs: vec![],
-                    metadata: HashMap::from([("value_key".to_string(), "SO-1::$.amount".to_string())]),
+                    metadata: HashMap::from([(
+                        "value_key".to_string(),
+                        "SO-1::$.amount".to_string(),
+                    )]),
                 },
                 exception_record: None,
             };
@@ -2282,12 +3124,16 @@ mod tests {
                             query: None,
                             endpoint: Some(ConnectorEndpoint {
                                 base_url: format!("http://{}", addr),
-                                path: "/sap/opu/odata4/API_SALES_ORDER/A_SalesOrder?$top=1".to_string(),
+                                path: "/sap/opu/odata4/API_SALES_ORDER/A_SalesOrder?$top=1"
+                                    .to_string(),
                                 method: "GET".to_string(),
                                 headers: HashMap::new(),
                             }),
                             auth: ConnectorAuth::default(),
-                            connection: HashMap::from([("odata_client".to_string(), "100".to_string())]),
+                            connection: HashMap::from([(
+                                "odata_client".to_string(),
+                                "100".to_string(),
+                            )]),
                         },
                     }),
                     request_body: None,
@@ -2298,8 +3144,14 @@ mod tests {
             .unwrap();
 
         let stored = manager.get_connector("s4-connector").await.unwrap();
-        assert_eq!(stored.metadata.get("odata_metadata_version"), Some(&"v4".to_string()));
-        assert_eq!(stored.metadata.get("odata_entity_set"), Some(&"A_SalesOrder".to_string()));
+        assert_eq!(
+            stored.metadata.get("odata_metadata_version"),
+            Some(&"v4".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("odata_entity_set"),
+            Some(&"A_SalesOrder".to_string())
+        );
         assert_eq!(
             stored.metadata.get("odata_entity_type"),
             Some(&"API_SALES_ORDER.A_SalesOrderType".to_string())
@@ -2415,7 +3267,8 @@ mod tests {
                             query: None,
                             endpoint: Some(ConnectorEndpoint {
                                 base_url: format!("http://{}", addr),
-                                path: "/sap/opu/odata4/API_SALES_ORDER/A_SalesOrder?$top=1".to_string(),
+                                path: "/sap/opu/odata4/API_SALES_ORDER/A_SalesOrder?$top=1"
+                                    .to_string(),
                                 method: "GET".to_string(),
                                 headers: HashMap::new(),
                             }),
@@ -2457,18 +3310,40 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buffer = vec![0u8; 2048];
                 let _ = socket.read(&mut buffer).await;
                 let request = String::from_utf8_lossy(&buffer);
-                assert!(request.contains("/adapter/v1/capabilities"));
-                let body = r#"{
+                assert!(
+                    request.contains("Authorization: Bearer adapter-secret-token")
+                        || request.contains("authorization: Bearer adapter-secret-token")
+                );
+                let (expected_path, body) = if request.contains("/adapter/v1/capabilities") {
+                    (
+                        "/adapter/v1/capabilities",
+                        r#"{
   "capabilities": {
     "adapter_version": "0.1.0",
     "system_id": "PRD",
     "client": "100",
     "object_name": "VBAK",
     "key_fields": ["VBELN"],
+    "required_parameters": ["record_id"],
+    "supported_auth_modes": ["destination"],
+    "supported_session_modes": ["stateful"],
+    "health_path": "/adapter/v1/health",
+    "session_id_path": "$.session.id",
+    "session_id_parameter_name": "sessionId",
+    "close_session_path": "/adapter/v1/session/close",
+    "close_session_method": "post",
+    "requires_explicit_session_close": true,
+    "session_ttl_seconds": 900,
+    "max_page_size": 200,
+    "page_size_parameter_name": "pageSize",
+    "language_parameter_name": "spras",
     "supports_record_projection": true,
     "supports_rowset_projection": true,
     "supports_key_lookup": true,
@@ -2477,7 +3352,15 @@ mod tests {
       {"name": "NETWR", "abap_type": "CURR", "nullable": true}
     ]
   }
-}"#;
+}"#,
+                    )
+                } else {
+                    (
+                        "/adapter/v1/health",
+                        r#"{"status":"ok","ready":true,"version":"0.1.0","build":"ecc-adapter-build-1"}"#,
+                    )
+                };
+                assert!(request.contains(expected_path));
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
@@ -2492,12 +3375,25 @@ mod tests {
             .await
             .unwrap();
         let verification = CapturingVerification::default();
+        let registry = Arc::new(SecretStoreRegistry::new());
+        let secret_store = Arc::new(InlineSecretStore::new());
+        registry.register("default", secret_store.clone());
+        registry.set_default(secret_store.clone());
+        let stored_secret_version = put_secret_by_ref(
+            secret_store.as_ref(),
+            "vault://migration/ecc/adapter-token",
+            SecretValue::String("adapter-secret-token".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
         let manager = EvidenceIngestionManager::new(
             store,
             Arc::new(CapturingForwarder::default()),
             Arc::new(verification.clone()),
             MigrationEvidenceDeliveryMode::Direct,
-        );
+        )
+        .with_secret_store_registry(registry);
         manager
             .upsert_connector(MigrationConnector {
                 connector_id: "ecc-connector".to_string(),
@@ -2512,7 +3408,15 @@ mod tests {
                     method: "GET".to_string(),
                     headers: HashMap::new(),
                 },
-                auth: ConnectorAuth::default(),
+                auth: ConnectorAuth {
+                    kind: ConnectorAuthKind::Bearer,
+                    secret_ref: Some("vault://migration/ecc/adapter-token".to_string()),
+                    token: None,
+                    api_key: None,
+                    header_name: None,
+                    username: None,
+                    password: None,
+                },
                 schedule: None,
                 enabled: true,
                 metadata: HashMap::new(),
@@ -2572,12 +3476,87 @@ mod tests {
             .unwrap();
 
         let stored = manager.get_connector("ecc-connector").await.unwrap();
-        assert_eq!(stored.metadata.get("ecc_adapter_version"), Some(&"0.1.0".to_string()));
-        assert_eq!(stored.metadata.get("ecc_object_name"), Some(&"VBAK".to_string()));
-        assert_eq!(stored.metadata.get("ecc_key_fields_json"), Some(&"[\"VBELN\"]".to_string()));
+        assert_eq!(
+            stored.metadata.get("ecc_adapter_version"),
+            Some(&"0.1.0".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_object_name"),
+            Some(&"VBAK".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_key_fields_json"),
+            Some(&"[\"VBELN\"]".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_supported_auth_modes_json"),
+            Some(&r#"["destination"]"#.to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_supported_session_modes_json"),
+            Some(&r#"["stateful"]"#.to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_session_id_path"),
+            Some(&"$.session.id".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_session_id_parameter_name"),
+            Some(&"sessionId".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_close_session_path"),
+            Some(&"/adapter/v1/session/close".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_requires_explicit_session_close"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_session_ttl_seconds"),
+            Some(&"900".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_required_parameters_json"),
+            Some(&r#"["record_id"]"#.to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_max_page_size"),
+            Some(&"200".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_page_size_parameter_name"),
+            Some(&"pageSize".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_language_parameter_name"),
+            Some(&"spras".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_health_status"),
+            Some(&"ok".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_health_ready"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("auth_secret_ref"),
+            Some(&"vault://migration/ecc/adapter-token".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("auth_secret_store"),
+            Some(&"inline".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("auth_secret_version"),
+            Some(&stored_secret_version)
+        );
 
         let captured = verification.captured.lock().unwrap();
-        let forwarded = captured.first().expect("verification request should be captured");
+        let forwarded = captured
+            .first()
+            .expect("verification request should be captured");
         assert_eq!(
             forwarded
                 .verification
@@ -2593,6 +3572,22 @@ mod tests {
                 .connection
                 .get("ecc_object_name"),
             Some(&"VBAK".to_string())
+        );
+        assert_eq!(
+            forwarded
+                .verification
+                .source
+                .connection
+                .get("ecc_supported_auth_modes_json"),
+            Some(&r#"["destination"]"#.to_string())
+        );
+        assert_eq!(
+            forwarded
+                .verification
+                .source
+                .connection
+                .get("ecc_language_parameter_name"),
+            Some(&"spras".to_string())
         );
     }
 
@@ -2751,9 +3746,7 @@ mod tests {
         assert_eq!(summary.ingested_event_count, events.len());
         assert!(events.iter().any(|event| {
             event.artifact_type == MigrationEvidenceArtifactType::ExecutionEvent
-                && event
-                    .payload
-                    .get("tool_name")
+                && event.payload.get("tool_name")
                     == Some(&Value::String("sap_ecc_staged_export".to_string()))
         }));
         let integrity = events
@@ -2761,7 +3754,9 @@ mod tests {
             .find(|event| {
                 event.artifact_type == MigrationEvidenceArtifactType::ControlResult
                     && event.payload.get("control_name")
-                        == Some(&Value::String("sap_ecc_staged_export_integrity".to_string()))
+                        == Some(&Value::String(
+                            "sap_ecc_staged_export_integrity".to_string(),
+                        ))
             })
             .expect("integrity control should be emitted");
         assert_eq!(
@@ -2880,7 +3875,9 @@ mod tests {
             .find(|event| {
                 event.artifact_type == MigrationEvidenceArtifactType::ControlResult
                     && event.payload.get("control_name")
-                        == Some(&Value::String("sap_ecc_staged_export_integrity".to_string()))
+                        == Some(&Value::String(
+                            "sap_ecc_staged_export_integrity".to_string(),
+                        ))
             })
             .expect("integrity control should be emitted");
         assert_eq!(
@@ -2957,13 +3954,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buffer = vec![0u8; 2048];
                 let _ = socket.read(&mut buffer).await;
                 let request = String::from_utf8_lossy(&buffer);
-                assert!(request.contains("/bridge/v1/capabilities"));
-                let body = r#"{
+                let (expected_path, body) = if request.contains("/bridge/v1/capabilities") {
+                    (
+                        "/bridge/v1/capabilities",
+                        r#"{
   "capabilities": {
+    "profile": "function_module_export",
     "bridge_version": "0.2.0",
     "system_id": "PRD",
     "client": "100",
@@ -2971,6 +3974,21 @@ mod tests {
     "bapi_name": "BAPI_SALESORDER_GETDETAIL",
     "export_structure": "ORDER_ITEMS_OUT",
     "key_fields": ["VBELN"],
+    "required_parameters": ["record_id"],
+    "supported_auth_modes": ["destination"],
+    "supported_session_modes": ["stateful"],
+    "health_path": "/bridge/v1/health",
+    "session_id_path": "$.session.id",
+    "session_id_parameter_name": "sessionId",
+    "close_session_path": "/bridge/v1/session/close",
+    "close_session_method": "post",
+    "requires_explicit_session_close": true,
+    "session_ttl_seconds": 600,
+    "max_page_size": 500,
+    "page_size_parameter_name": "pageSize",
+    "language_parameter_name": "LANGU",
+    "cursor_parameter_name": "cursorToken",
+    "next_cursor_path": "$.pagination.token",
     "supports_record_projection": true,
     "supports_rowset_projection": true,
     "supports_key_lookup": true,
@@ -2980,7 +3998,15 @@ mod tests {
       {"name": "NETWR", "abap_type": "CURR", "nullable": true}
     ]
   }
-}"#;
+}"#,
+                    )
+                } else {
+                    (
+                        "/bridge/v1/health",
+                        r#"{"status":"ok","ready":true,"version":"0.2.0","build":"ecc-rfc-bridge-build-2"}"#,
+                    )
+                };
+                assert!(request.contains(expected_path));
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
@@ -3087,9 +4113,65 @@ mod tests {
             stored.metadata.get("ecc_rfc_function_module"),
             Some(&"RFC_READ_TABLE".to_string())
         );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_profile"),
+            Some(&"function_module_export".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_required_parameters_json"),
+            Some(&r#"["record_id"]"#.to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_cursor_parameter_name"),
+            Some(&"cursorToken".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_supported_auth_modes_json"),
+            Some(&r#"["destination"]"#.to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_supported_session_modes_json"),
+            Some(&r#"["stateful"]"#.to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_session_id_path"),
+            Some(&"$.session.id".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_close_session_path"),
+            Some(&"/bridge/v1/session/close".to_string())
+        );
+        assert_eq!(
+            stored
+                .metadata
+                .get("ecc_rfc_requires_explicit_session_close"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_session_ttl_seconds"),
+            Some(&"600".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_max_page_size"),
+            Some(&"500".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_language_parameter_name"),
+            Some(&"LANGU".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_health_status"),
+            Some(&"ok".to_string())
+        );
+        assert_eq!(
+            stored.metadata.get("ecc_rfc_health_ready"),
+            Some(&"true".to_string())
+        );
 
         let captured = verification.captured.lock().unwrap();
-        let forwarded = captured.first().expect("verification request should be captured");
+        let forwarded = captured
+            .first()
+            .expect("verification request should be captured");
         assert_eq!(
             forwarded
                 .verification
@@ -3105,6 +4187,30 @@ mod tests {
                 .connection
                 .get("ecc_rfc_bapi_name"),
             Some(&"BAPI_SALESORDER_GETDETAIL".to_string())
+        );
+        assert_eq!(
+            forwarded
+                .verification
+                .source
+                .connection
+                .get("ecc_rfc_profile"),
+            Some(&"function_module_export".to_string())
+        );
+        assert_eq!(
+            forwarded
+                .verification
+                .source
+                .connection
+                .get("ecc_rfc_supported_auth_modes_json"),
+            Some(&r#"["destination"]"#.to_string())
+        );
+        assert_eq!(
+            forwarded
+                .verification
+                .source
+                .connection
+                .get("ecc_rfc_language_parameter_name"),
+            Some(&"LANGU".to_string())
         );
     }
 
@@ -3160,17 +4266,19 @@ mod tests {
                 object_name: "ORDERS05".to_string(),
                 source_system_id: "ECC-PRD".to_string(),
                 source_client: "100".to_string(),
+                extractor_family: SapExtractorFamily::Idoc,
                 extractor_name: "control-m-extractor".to_string(),
                 extractor_run_id: "run-1".to_string(),
                 extracted_at: Utc::now(),
+                extractor_object: None,
+                extractor_context: None,
+                extraction_mode: None,
+                delta_token: None,
+                subscriber_name: None,
+                queue_name: None,
                 idoc_type: Some("ORDERS05".to_string()),
                 message_type: Some("ORDERS".to_string()),
-                segment_counts: [(
-                    "E1EDK01".to_string(),
-                    2u64,
-                )]
-                .into_iter()
-                .collect(),
+                segment_counts: [("E1EDK01".to_string(), 2u64)].into_iter().collect(),
                 data_set: Some(SapIdocExtractorDataSet {
                     format: SapIdocExtractorDataFormat::JsonDocuments,
                     path: None,
@@ -3227,4 +4335,218 @@ mod tests {
         assert!(forwarder.captured.lock().unwrap().len() >= 3);
     }
 
+    #[tokio::test]
+    async fn sap_odp_extractor_package_inline_bundle_emits_canonical_events() {
+        let temp = tempdir().unwrap();
+        let store = PersistedConnectorStore::open(temp.path().join("connectors.json"))
+            .await
+            .unwrap();
+        let forwarder = CapturingForwarder::default();
+        let manager = EvidenceIngestionManager::new(
+            store,
+            Arc::new(forwarder.clone()),
+            Arc::new(StubVerification),
+            MigrationEvidenceDeliveryMode::Direct,
+        );
+
+        manager
+            .upsert_connector(MigrationConnector {
+                connector_id: "odp-inline".to_string(),
+                name: "sap odp extractor inline".to_string(),
+                vendor: MigrationConnectorVendor::SapEcc,
+                role: MigrationConnectorRole::MigrationArtifactSource,
+                transport: ConnectorTransport::SapOdpExtractorPackage,
+                program_id: "program-odp-1".to_string(),
+                endpoint: ConnectorEndpoint {
+                    base_url: String::new(),
+                    path: "inline-bundle".to_string(),
+                    method: "POST".to_string(),
+                    headers: HashMap::new(),
+                },
+                auth: ConnectorAuth::default(),
+                schedule: None,
+                enabled: true,
+                metadata: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let inline_rows = serde_json::json!([
+            {"VBELN": "500000001", "NETWR": "125.50", "WAERK": "USD"},
+            {"VBELN": "500000002", "NETWR": "130.00", "WAERK": "USD"}
+        ]);
+        let inline_sha = sha256_hex(&serde_json::to_vec(&inline_rows).unwrap());
+        let bundle = SapIdocExtractorBundle {
+            manifest: SapIdocExtractorManifest {
+                schema_version: "1.0".to_string(),
+                package_id: "odp-package-1".to_string(),
+                program_id: "program-odp-1".to_string(),
+                object_id: "object-odp-vbak".to_string(),
+                object_name: "VBAK".to_string(),
+                source_system_id: "ECC-PRD".to_string(),
+                source_client: "100".to_string(),
+                extractor_family: SapExtractorFamily::Odp,
+                extractor_name: "odq-customer-open-items".to_string(),
+                extractor_run_id: "run-odp-1".to_string(),
+                extracted_at: Utc::now(),
+                extractor_object: Some("2LIS_11_VAHDR".to_string()),
+                extractor_context: Some("SAPI".to_string()),
+                extraction_mode: Some(graphica_core::migration_evidence::SapExtractorMode::Delta),
+                delta_token: Some("delta-token-1".to_string()),
+                subscriber_name: Some("ARCXA_DEMO".to_string()),
+                queue_name: Some("ODQ_QUEUE_001".to_string()),
+                idoc_type: None,
+                message_type: None,
+                segment_counts: BTreeMap::new(),
+                data_set: Some(SapIdocExtractorDataSet {
+                    format: SapIdocExtractorDataFormat::JsonDocuments,
+                    path: None,
+                    inline_payload: Some(inline_rows.to_string()),
+                    expected_row_count: Some(2),
+                    sha256: Some(inline_sha),
+                }),
+            },
+            executions: vec![],
+            exceptions: vec![],
+            controls: vec![],
+            approvals: vec![],
+        };
+
+        let (summary, events) = manager
+            .run_connector(
+                "odp-inline",
+                DomainConnectorRunRequest {
+                    run_label: Some("odp-wave-1".to_string()),
+                    manual_events: vec![],
+                    verification: None,
+                    request_body: Some(serde_json::to_value(bundle).unwrap()),
+                    request_headers: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.ingested_event_count, events.len());
+        let integrity = events
+            .iter()
+            .find(|event| {
+                event.artifact_type == MigrationEvidenceArtifactType::ControlResult
+                    && event.payload.get("control_name")
+                        == Some(&Value::String("sap_odp_extractor_integrity".to_string()))
+            })
+            .expect("ODP integrity control should be emitted");
+        assert_eq!(
+            integrity
+                .payload
+                .get("metadata")
+                .and_then(|metadata| metadata.get("extractor_family"))
+                .and_then(Value::as_str),
+            Some("odp")
+        );
+        assert_eq!(
+            integrity
+                .payload
+                .get("metadata")
+                .and_then(|metadata| metadata.get("queue_name"))
+                .and_then(Value::as_str),
+            Some("ODQ_QUEUE_001")
+        );
+
+        let execution = events
+            .iter()
+            .find(|event| event.artifact_type == MigrationEvidenceArtifactType::ExecutionEvent)
+            .expect("ODP execution event should exist");
+        assert_eq!(
+            execution.payload.get("tool_name"),
+            Some(&Value::String("sap_odp_extractor_package".to_string()))
+        );
+    }
+
+    #[test]
+    fn odp_delta_extractor_requires_delta_token_or_subscriber_queue_context() {
+        let manifest = SapIdocExtractorManifest {
+            schema_version: "1.0".to_string(),
+            package_id: "odp-package-invalid".to_string(),
+            program_id: "program-odp-1".to_string(),
+            object_id: "object-odp".to_string(),
+            object_name: "VBAK".to_string(),
+            source_system_id: "ECC-PRD".to_string(),
+            source_client: "100".to_string(),
+            extractor_family: SapExtractorFamily::Odp,
+            extractor_name: "odq-vbak".to_string(),
+            extractor_run_id: "run-odp-invalid".to_string(),
+            extracted_at: Utc::now(),
+            extractor_object: Some("2LIS_11_VAHDR".to_string()),
+            extractor_context: Some("SAPI".to_string()),
+            extraction_mode: Some(graphica_core::migration_evidence::SapExtractorMode::Delta),
+            delta_token: None,
+            subscriber_name: Some("ONLY_SUBSCRIBER".to_string()),
+            queue_name: None,
+            idoc_type: None,
+            message_type: None,
+            segment_counts: BTreeMap::new(),
+            data_set: Some(SapIdocExtractorDataSet {
+                format: SapIdocExtractorDataFormat::JsonDocuments,
+                inline_payload: Some("[]".to_string()),
+                path: None,
+                expected_row_count: Some(0),
+                sha256: Some(sha256_hex(b"[]")),
+            }),
+        };
+
+        let error = validate_idoc_extractor_manifest(
+            &manifest,
+            &ConnectorTransport::SapOdpExtractorPackage,
+            &SapExtractorFamily::Odp,
+        )
+        .expect_err("ODP delta manifests should fail without complete delta context");
+        assert!(error
+            .to_string()
+            .contains("subscriber_name and queue_name together"));
+    }
+
+    #[test]
+    fn idoc_extractor_requires_message_identity() {
+        let manifest = SapIdocExtractorManifest {
+            schema_version: "1.0".to_string(),
+            package_id: "idoc-package-invalid".to_string(),
+            program_id: "program-idoc-1".to_string(),
+            object_id: "object-idoc".to_string(),
+            object_name: "generic-idoc".to_string(),
+            source_system_id: "ECC-PRD".to_string(),
+            source_client: "100".to_string(),
+            extractor_family: SapExtractorFamily::Idoc,
+            extractor_name: "idoc-export".to_string(),
+            extractor_run_id: "run-idoc-invalid".to_string(),
+            extracted_at: Utc::now(),
+            extractor_object: None,
+            extractor_context: None,
+            extraction_mode: Some(graphica_core::migration_evidence::SapExtractorMode::Snapshot),
+            delta_token: None,
+            subscriber_name: None,
+            queue_name: None,
+            idoc_type: None,
+            message_type: None,
+            segment_counts: BTreeMap::new(),
+            data_set: Some(SapIdocExtractorDataSet {
+                format: SapIdocExtractorDataFormat::JsonDocuments,
+                inline_payload: Some("[]".to_string()),
+                path: None,
+                expected_row_count: Some(0),
+                sha256: Some(sha256_hex(b"[]")),
+            }),
+        };
+
+        let error = validate_idoc_extractor_manifest(
+            &manifest,
+            &ConnectorTransport::SapIdocExtractorPackage,
+            &SapExtractorFamily::Idoc,
+        )
+        .expect_err("IDoc manifests should require a message identity");
+        assert!(error
+            .to_string()
+            .contains("require idoc_type or message_type"));
+    }
 }

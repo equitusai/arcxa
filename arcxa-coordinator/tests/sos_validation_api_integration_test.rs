@@ -7,6 +7,7 @@ use axum::http::{Method, StatusCode};
 use graphica_coordinator::api::sos_validation::types::{
     ValidationHistoryResponse, ValidationReportResponse, ValidationResponse,
 };
+use serde_json::json;
 use sos_api::{
     assert_json_response, assert_status, authed_json_request, empty_request,
     interface_pair_validation_payload, json_request, seed_minimal_catalog,
@@ -69,6 +70,20 @@ async fn validate_persisted_and_dry_run_semantics_over_http() {
         .expect("persisted validation should return a report id");
 
     assert!(persisted.passed, "persisted validation should pass");
+    assert_eq!(
+        persisted.compatibility_state,
+        Some(graphica_coordinator::api::sos_validation::types::CompatibilityState::SemanticallyEquivalent)
+    );
+    assert_eq!(persisted.confidence, 1.0);
+    assert!(
+        persisted
+            .confidence_assessment
+            .as_ref()
+            .expect("confidence assessment should be present")
+            .contributors
+            .is_empty(),
+        "fully aligned fixture should not need downgraded confidence contributors"
+    );
 
     let report_response = harness
         .app
@@ -84,6 +99,11 @@ async fn validate_persisted_and_dry_run_semantics_over_http() {
     assert_eq!(report.subject_type, "interface_pair");
     assert_eq!(report.subject_key, INTERFACE_PAIR_SUBJECT_KEY);
     assert_eq!(report.validation_type, "interface_compatibility");
+    assert_eq!(report.compatibility_state, persisted.compatibility_state);
+    assert!(
+        report.confidence_assessment.is_some(),
+        "persisted report should retain confidence explainability"
+    );
 }
 
 #[tokio::test]
@@ -109,6 +129,25 @@ async fn validate_schema_endpoint_persists_data_validation_report() {
         validation.report_id.is_some(),
         "schema validation endpoint should persist a data-validation report"
     );
+    assert_eq!(validation.compatibility_state, None);
+    let schema_check = validation
+        .checks
+        .iter()
+        .find(|check| check.check_name == "schema_validation")
+        .expect("schema validation check should be present");
+    let schema_details = schema_check
+        .details
+        .as_ref()
+        .expect("schema validation should expose confidence details");
+    assert_eq!(schema_details.get("confidence_score"), Some(&json!(1.0)));
+    assert_eq!(
+        schema_details.get("confidence_category"),
+        Some(&json!("passed_check"))
+    );
+    assert!(
+        validation.confidence_assessment.is_some(),
+        "validation response should include confidence explainability"
+    );
 
     let history_response = harness
         .app
@@ -124,6 +163,11 @@ async fn validate_schema_endpoint_persists_data_validation_report() {
     assert_eq!(history.subject_key, PROVIDER_INTERFACE_SUBJECT_KEY);
     assert_eq!(history.reports.len(), 1);
     assert_eq!(history.reports[0].validation_type, "data_validation");
+    assert_eq!(history.reports[0].compatibility_state, None);
+    assert!(
+        history.reports[0].confidence_assessment.is_some(),
+        "history report should preserve confidence explainability"
+    );
 }
 
 #[tokio::test]

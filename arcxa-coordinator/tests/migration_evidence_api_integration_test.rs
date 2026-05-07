@@ -1,19 +1,19 @@
 #![allow(deprecated)]
 
-use axum::{
-    body::{to_bytes, Body},
-    http::{Method, Request, Response, StatusCode},
-    Router,
-};
 use arcxa_evidence_ingestion::{
     EvidenceIngestionManager, EvidenceIngestionServiceImpl, GrpcTraceabilityForwarder,
     GrpcVerificationForwarder, PersistedConnectorStore,
 };
 use arcxa_traceability::{
-    EventBusRuntimeMonitor, GraphProjectionConfig, PersistedTraceabilityStore,
-    TraceabilityManager, TraceabilityServiceImpl,
+    EventBusRuntimeMonitor, GraphProjectionConfig, PersistedTraceabilityStore, TraceabilityManager,
+    TraceabilityServiceImpl,
 };
 use arcxa_verification::{VerificationManager, VerificationServiceImpl};
+use axum::{
+    body::{to_bytes, Body},
+    http::{Method, Request, Response, StatusCode},
+    Router,
+};
 use chrono::{Duration, Utc};
 use graphica_coordinator::{
     api::{
@@ -22,10 +22,10 @@ use graphica_coordinator::{
         migration_evidence::{
             EvidencePacketResponse, ExplainValueResponse, MigrationEvidenceErrorResponse,
             MigrationEvidenceGateway, MigrationEvidenceGatewayConfig,
-            MigrationEvidenceRemoteGatewayConfig,
-            MigrationEvidenceRebuildResponse, MigrationEvidenceRuntimeStatusResponse,
-            ObjectControlsResponse, ProgramApprovalsResponse, ProgramExceptionsResponse,
-            RunMigrationConnectorResponse, UpsertMigrationConnectorResponse,
+            MigrationEvidenceRebuildResponse, MigrationEvidenceRemoteGatewayConfig,
+            MigrationEvidenceRuntimeStatusResponse, ObjectControlsResponse,
+            ProgramApprovalsResponse, ProgramExceptionsResponse, RunMigrationConnectorResponse,
+            UpsertMigrationConnectorResponse,
         },
         rest::build_router,
         setup_token::SetupTokenManager,
@@ -33,39 +33,41 @@ use graphica_coordinator::{
     },
     storage::LineageStorage,
 };
-use graphica_core::migration_evidence::{
-    ApprovalEvent, ApprovalStatus, ConnectorAuth, ConnectorEndpoint, ConnectorRunRequest,
-    ConnectorTransport, ControlStatus, ExecutionEvent, ExecutionStatus, ExceptionRecord,
-    ExceptionSeverity, ExceptionStatus, GrpcMigrationEvidenceEventForwarder, MigrationConnector,
-    MigrationConnectorRole, MigrationConnectorVendor, MigrationEvidenceArtifactType,
-    MigrationEvidenceDeliveryMode, MigrationEvidenceEvent, MigrationObject, MigrationObjectType,
-    MigrationProgram, SapEccStagedControlEvidence, SapEccStagedExceptionEvidence,
-    SapEccStagedExportBundle, SapEccStagedExportDataFormat, SapEccStagedExportDataSet,
-    SapEccStagedExportManifest, SapEccStagedRuleEvidence, SapIdocExtractorBundle,
-    SapIdocExtractorDataFormat, SapIdocExtractorDataSet, SapIdocExtractorManifest,
-    SourceFieldRef, TargetFieldRef, TransformationRule, TransformationRuleType,
-    VerificationRequest, VerificationSource,
-};
 use graphica_core::distributed::proto::migration_evidence::{
     evidence_ingestion_service_server::EvidenceIngestionServiceServer,
     traceability_service_server::TraceabilityServiceServer,
     verification_service_server::VerificationServiceServer,
 };
+use graphica_core::migration_evidence::{
+    ApprovalEvent, ApprovalStatus, ConnectorAuth, ConnectorEndpoint, ConnectorRunRequest,
+    ConnectorTransport, ControlStatus, ExceptionRecord, ExceptionSeverity, ExceptionStatus,
+    ExecutionEvent, ExecutionStatus, GrpcMigrationEvidenceEventForwarder, MigrationConnector,
+    MigrationConnectorRole, MigrationConnectorVendor, MigrationEvidenceArtifactType,
+    MigrationEvidenceDeliveryMode, MigrationEvidenceEvent, MigrationObject, MigrationObjectType,
+    MigrationProgram, SapEccStagedControlEvidence, SapEccStagedExceptionEvidence,
+    SapEccStagedExportBundle, SapEccStagedExportDataFormat, SapEccStagedExportDataSet,
+    SapEccStagedExportManifest, SapEccStagedRuleEvidence, SapExtractorFamily, SapExtractorMode,
+    SapIdocExtractorBundle, SapIdocExtractorDataFormat, SapIdocExtractorDataSet,
+    SapIdocExtractorManifest, SourceFieldRef, TargetFieldRef, TransformationRule,
+    TransformationRuleType, VerificationRequest, VerificationSource,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tower::ServiceExt;
 use tonic::transport::Server;
+use tower::ServiceExt;
 
 const TEST_AUTH_SECRET: [u8; 32] = [
-    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc,
-    0xfe, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-    0x11, 0x22,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x11, 0x22,
 ];
 
 struct Harness {
@@ -140,7 +142,10 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         .expect("verification connector create should succeed");
     let verification_connector: UpsertMigrationConnectorResponse =
         assert_json_response(verification_create, StatusCode::OK).await;
-    assert_eq!(verification_connector.connector.connector_id, "sap-verification");
+    assert_eq!(
+        verification_connector.connector.connector_id,
+        "sap-verification"
+    );
 
     let verification_run = harness
         .app
@@ -155,7 +160,10 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         .expect("verification connector run should succeed");
     let verification_run_response: RunMigrationConnectorResponse =
         assert_json_response(verification_run, StatusCode::OK).await;
-    assert_eq!(verification_run_response.summary.connector_id, "sap-verification");
+    assert_eq!(
+        verification_run_response.summary.connector_id,
+        "sap-verification"
+    );
     assert_eq!(verification_run_response.summary.ingested_event_count, 2);
     assert_eq!(
         verification_run_response.summary.delivery_mode,
@@ -173,12 +181,33 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         ))
         .await
         .expect("explain request should succeed");
-    let explain_response: ExplainValueResponse = assert_json_response(explain, StatusCode::OK).await;
+    let explain_response: ExplainValueResponse =
+        assert_json_response(explain, StatusCode::OK).await;
 
-    assert_eq!(explain_response.explanation.source_field.field_name, "NETWR");
-    assert_eq!(explain_response.explanation.target_field.field_name, "NetAmount");
-    assert_eq!(explain_response.explanation.transformation_rule.as_ref().map(|rule| rule.rule_id.as_str()), Some("rule-net-amount"));
-    assert_eq!(explain_response.explanation.execution_event.as_ref().map(|event| event.tool_name.as_str()), Some("ibm_rapid_move"));
+    assert_eq!(
+        explain_response.explanation.source_field.field_name,
+        "NETWR"
+    );
+    assert_eq!(
+        explain_response.explanation.target_field.field_name,
+        "NetAmount"
+    );
+    assert_eq!(
+        explain_response
+            .explanation
+            .transformation_rule
+            .as_ref()
+            .map(|rule| rule.rule_id.as_str()),
+        Some("rule-net-amount")
+    );
+    assert_eq!(
+        explain_response
+            .explanation
+            .execution_event
+            .as_ref()
+            .map(|event| event.tool_name.as_str()),
+        Some("ibm_rapid_move")
+    );
     assert!(!explain_response.explanation.exceptions.is_empty());
     assert!(!explain_response.explanation.controls.is_empty());
     assert!(!explain_response.explanation.approvals.is_empty());
@@ -194,7 +223,8 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         ))
         .await
         .expect("evidence packet request should succeed");
-    let packet_response: EvidencePacketResponse = assert_json_response(packet, StatusCode::OK).await;
+    let packet_response: EvidencePacketResponse =
+        assert_json_response(packet, StatusCode::OK).await;
     assert_eq!(
         packet_response.packet.packet_id,
         explain_response
@@ -208,7 +238,10 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         .signature
         .as_ref()
         .expect("packet should be signed");
-    assert!(arcxa_traceability::verify_evidence_packet_signature(&packet_response.packet, signature));
+    assert!(arcxa_traceability::verify_evidence_packet_signature(
+        &packet_response.packet,
+        signature
+    ));
 
     let controls = harness
         .app
@@ -220,7 +253,8 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         ))
         .await
         .expect("controls request should succeed");
-    let controls_response: ObjectControlsResponse = assert_json_response(controls, StatusCode::OK).await;
+    let controls_response: ObjectControlsResponse =
+        assert_json_response(controls, StatusCode::OK).await;
     assert_eq!(controls_response.controls.len(), 1);
     assert_eq!(controls_response.controls[0].status, ControlStatus::Passed);
 
@@ -251,7 +285,10 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
     let approvals_response: ProgramApprovalsResponse =
         assert_json_response(approvals, StatusCode::OK).await;
     assert_eq!(approvals_response.approvals.len(), 1);
-    assert_eq!(approvals_response.approvals[0].status, ApprovalStatus::Approved);
+    assert_eq!(
+        approvals_response.approvals[0].status,
+        ApprovalStatus::Approved
+    );
 
     let runtime_status = harness
         .app
@@ -275,7 +312,12 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         runtime_status_response.status.event_bus.consumer_state,
         graphica_core::migration_evidence::MigrationEvidenceEventConsumerState::Disabled
     );
-    assert!(!runtime_status_response.status.event_bus.async_delivery_enabled);
+    assert!(
+        !runtime_status_response
+            .status
+            .event_bus
+            .async_delivery_enabled
+    );
     assert!(runtime_status_response.status.read_models.event_log_entries >= 8);
     let ingestion_status = runtime_status_response
         .ingestion_status
@@ -289,7 +331,10 @@ async fn migration_evidence_end_to_end_explains_a_value_over_authenticated_route
         graphica_core::migration_evidence::ConnectorStoreHealth::Healthy
     );
     assert!(ingestion_status.connector_store.connector_count >= 2);
-    assert_eq!(ingestion_status.delivery_mode, MigrationEvidenceDeliveryMode::Direct);
+    assert_eq!(
+        ingestion_status.delivery_mode,
+        MigrationEvidenceDeliveryMode::Direct
+    );
 
     let rebuild = harness
         .app
@@ -431,7 +476,10 @@ async fn migration_evidence_supports_s4_odata_verification_transport() {
                         "TransactionCurrency": "USD"
                     })),
                     tolerance: Some(0.0),
-                    metadata: HashMap::from([("value_key".to_string(), "SO-1::$.projection".to_string())]),
+                    metadata: HashMap::from([(
+                        "value_key".to_string(),
+                        "SO-1::$.projection".to_string()
+                    )]),
                     source: VerificationSource {
                         transport: ConnectorTransport::SapS4OData,
                         query: None,
@@ -479,7 +527,9 @@ async fn migration_evidence_supports_s4_odata_verification_transport() {
     );
     assert_eq!(
         metadata.get("odata_requested_fields_json"),
-        Some(&json!("[\"NetAmount\",\"SalesOrder\",\"TransactionCurrency\"]"))
+        Some(&json!(
+            "[\"NetAmount\",\"SalesOrder\",\"TransactionCurrency\"]"
+        ))
     );
 }
 
@@ -507,7 +557,10 @@ async fn migration_evidence_supports_sap_ecc_adapter_verification_transport() {
         .expect("sap ecc adapter verification connector create should succeed");
     let created: UpsertMigrationConnectorResponse =
         assert_json_response(create, StatusCode::OK).await;
-    assert_eq!(created.connector.transport, ConnectorTransport::SapEccAdapter);
+    assert_eq!(
+        created.connector.transport,
+        ConnectorTransport::SapEccAdapter
+    );
 
     let verification_endpoint = spawn_ecc_adapter_source(
         json!({
@@ -573,7 +626,10 @@ async fn migration_evidence_supports_sap_ecc_adapter_verification_transport() {
                         "WAERK": "USD"
                     })),
                     tolerance: Some(0.0),
-                    metadata: HashMap::from([("value_key".to_string(), "500000001::$.projection".to_string())]),
+                    metadata: HashMap::from([(
+                        "value_key".to_string(),
+                        "500000001::$.projection".to_string()
+                    )]),
                     source: VerificationSource {
                         transport: ConnectorTransport::SapEccAdapter,
                         query: None,
@@ -641,7 +697,10 @@ async fn migration_evidence_supports_sap_ecc_rfc_bapi_verification_transport() {
         .expect("sap ecc rfc verification connector create should succeed");
     let created: UpsertMigrationConnectorResponse =
         assert_json_response(create, StatusCode::OK).await;
-    assert_eq!(created.connector.transport, ConnectorTransport::SapEccRfcBapi);
+    assert_eq!(
+        created.connector.transport,
+        ConnectorTransport::SapEccRfcBapi
+    );
 
     let verification_endpoint = spawn_ecc_rfc_source(
         json!({
@@ -710,7 +769,10 @@ async fn migration_evidence_supports_sap_ecc_rfc_bapi_verification_transport() {
                         "WAERK": "USD"
                     })),
                     tolerance: Some(0.0),
-                    metadata: HashMap::from([("value_key".to_string(), "500000001::$.projection".to_string())]),
+                    metadata: HashMap::from([(
+                        "value_key".to_string(),
+                        "500000001::$.projection".to_string()
+                    )]),
                     source: VerificationSource {
                         transport: ConnectorTransport::SapEccRfcBapi,
                         query: None,
@@ -782,7 +844,10 @@ async fn migration_evidence_supports_sap_ecc_staged_export_transport() {
         .expect("sap ecc staged export connector create should succeed");
     let created: UpsertMigrationConnectorResponse =
         assert_json_response(create, StatusCode::OK).await;
-    assert_eq!(created.connector.transport, ConnectorTransport::SapEccStagedExport);
+    assert_eq!(
+        created.connector.transport,
+        ConnectorTransport::SapEccStagedExport
+    );
 
     let run = harness
         .app
@@ -807,11 +872,13 @@ async fn migration_evidence_supports_sap_ecc_staged_export_transport() {
     let integrity_event = response
         .ingested_events
         .iter()
-        .find(|event| event.get("artifact_type") == Some(&json!("control_result"))
-            && event
-                .get("payload")
-                .and_then(|payload| payload.get("control_name"))
-                == Some(&json!("sap_ecc_staged_export_integrity")))
+        .find(|event| {
+            event.get("artifact_type") == Some(&json!("control_result"))
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("control_name"))
+                    == Some(&json!("sap_ecc_staged_export_integrity"))
+        })
         .expect("integrity control event should be present");
     let metadata = integrity_event
         .get("payload")
@@ -888,11 +955,13 @@ async fn migration_evidence_supports_sap_idoc_extractor_package_transport() {
     let integrity_event = response
         .ingested_events
         .iter()
-        .find(|event| event.get("artifact_type") == Some(&json!("control_result"))
-            && event
-                .get("payload")
-                .and_then(|payload| payload.get("control_name"))
-                == Some(&json!("sap_idoc_extractor_integrity")))
+        .find(|event| {
+            event.get("artifact_type") == Some(&json!("control_result"))
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("control_name"))
+                    == Some(&json!("sap_idoc_extractor_integrity"))
+        })
         .expect("integrity control event should be present");
     let metadata = integrity_event
         .get("payload")
@@ -917,6 +986,90 @@ async fn migration_evidence_supports_sap_idoc_extractor_package_transport() {
 }
 
 #[tokio::test]
+async fn migration_evidence_supports_sap_odp_extractor_package_transport() {
+    let harness = setup_authenticated_app().await;
+
+    let mut connector = sample_artifact_connector();
+    connector.connector_id = "sap-odp-extractor".to_string();
+    connector.name = "SAP ODP Extractor Package".to_string();
+    connector.vendor = MigrationConnectorVendor::SapEcc;
+    connector.transport = ConnectorTransport::SapOdpExtractorPackage;
+    connector.endpoint.base_url = String::new();
+    connector.endpoint.path = "inline-bundle".to_string();
+
+    let create = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors",
+            &harness.token,
+            connector_payload(connector),
+        ))
+        .await
+        .expect("sap odp extractor connector create should succeed");
+    let created: UpsertMigrationConnectorResponse =
+        assert_json_response(create, StatusCode::OK).await;
+    assert_eq!(
+        created.connector.transport,
+        ConnectorTransport::SapOdpExtractorPackage
+    );
+
+    let run = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/migration-evidence/connectors/sap-odp-extractor/runs",
+            &harness.token,
+            json!(ConnectorRunRequest {
+                run_label: Some("odp-wave-1".to_string()),
+                manual_events: vec![],
+                verification: None,
+                request_body: Some(sap_odp_extractor_bundle_payload()),
+                request_headers: HashMap::new(),
+            }),
+        ))
+        .await
+        .expect("sap odp extractor run should succeed");
+    let response: RunMigrationConnectorResponse = assert_json_response(run, StatusCode::OK).await;
+
+    assert!(response.summary.ingested_event_count >= 4);
+    let integrity_event = response
+        .ingested_events
+        .iter()
+        .find(|event| {
+            event.get("artifact_type") == Some(&json!("control_result"))
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("control_name"))
+                    == Some(&json!("sap_odp_extractor_integrity"))
+        })
+        .expect("ODP integrity control event should be present");
+    let metadata = integrity_event
+        .get("payload")
+        .and_then(|payload| payload.get("metadata"))
+        .and_then(|metadata| metadata.as_object())
+        .expect("ODP integrity metadata should be present");
+    assert_eq!(metadata.get("checksum_verified"), Some(&json!("true")));
+    assert_eq!(metadata.get("actual_row_count"), Some(&json!("2")));
+    assert_eq!(metadata.get("extractor_family"), Some(&json!("odp")));
+    assert_eq!(metadata.get("queue_name"), Some(&json!("ODQ_QUEUE_001")));
+
+    let execution_event = response
+        .ingested_events
+        .iter()
+        .find(|event| event.get("artifact_type") == Some(&json!("execution_event")))
+        .expect("ODP execution event should be present");
+    assert_eq!(
+        execution_event
+            .get("payload")
+            .and_then(|payload| payload.get("tool_name")),
+        Some(&json!("sap_odp_extractor_package"))
+    );
+}
+
+#[tokio::test]
 async fn migration_evidence_remote_gateway_routes_verification_through_split_services() {
     let temp_dir = TempDir::new().expect("temp dir should be created");
     let remote = spawn_remote_migration_evidence_stack(temp_dir.path()).await;
@@ -932,6 +1085,7 @@ async fn migration_evidence_remote_gateway_routes_verification_through_split_ser
             evidence_ingestion_endpoint: remote.ingestion_endpoint.clone(),
             traceability_endpoint: remote.traceability_endpoint.clone(),
         }),
+        secret_store_registry: None,
     })
     .await
     .expect("remote migration evidence gateway should be created");
@@ -1022,7 +1176,10 @@ async fn migration_evidence_remote_gateway_routes_verification_through_split_ser
         ingestion_runtime.connector_store.backend,
         graphica_core::migration_evidence::ConnectorStoreBackend::RocksDb
     );
-    assert_eq!(ingestion_runtime.delivery_mode, MigrationEvidenceDeliveryMode::Direct);
+    assert_eq!(
+        ingestion_runtime.delivery_mode,
+        MigrationEvidenceDeliveryMode::Direct
+    );
 }
 
 async fn setup_authenticated_app() -> Harness {
@@ -1031,9 +1188,15 @@ async fn setup_authenticated_app() -> Harness {
     let rocks_path = format!("{temp_path}/lineage_rocks");
     let parquet_path = format!("{temp_path}/lineage_parquet");
     let cold_path = format!("{temp_path}/lineage_cold");
-    let connector_state_path = temp_dir.path().join("migration-evidence/connectors/state.json");
-    let traceability_state_path = temp_dir.path().join("migration-evidence/traceability/state.json");
-    let traceability_rocksdb_path = temp_dir.path().join("migration-evidence/traceability/rocksdb");
+    let connector_state_path = temp_dir
+        .path()
+        .join("migration-evidence/connectors/state.json");
+    let traceability_state_path = temp_dir
+        .path()
+        .join("migration-evidence/traceability/state.json");
+    let traceability_rocksdb_path = temp_dir
+        .path()
+        .join("migration-evidence/traceability/rocksdb");
 
     let auth_config = Arc::new(
         AuthConfig::from_secret_bytes(&TEST_AUTH_SECRET).expect("auth config should be created"),
@@ -1045,13 +1208,18 @@ async fn setup_authenticated_app() -> Harness {
     let gateway = Arc::new(
         MigrationEvidenceGateway::new(MigrationEvidenceGatewayConfig {
             connector_state_path,
-            connector_rocksdb_path: Some(temp_dir.path().join("migration-evidence/connectors/rocksdb")),
+            connector_rocksdb_path: Some(
+                temp_dir
+                    .path()
+                    .join("migration-evidence/connectors/rocksdb"),
+            ),
             traceability_state_path,
             traceability_rocksdb_path: Some(traceability_rocksdb_path),
             signing_key_seed: [9u8; 32],
             shard_endpoint: None,
             event_bus: None,
             remote_services: None,
+            secret_store_registry: None,
         })
         .await
         .expect("migration evidence gateway should be created"),
@@ -1140,7 +1308,9 @@ struct RemoteMigrationEvidenceStack {
     verification_endpoint: String,
 }
 
-async fn spawn_remote_migration_evidence_stack(root: &std::path::Path) -> RemoteMigrationEvidenceStack {
+async fn spawn_remote_migration_evidence_stack(
+    root: &std::path::Path,
+) -> RemoteMigrationEvidenceStack {
     let traceability_store = PersistedTraceabilityStore::open_rocksdb(
         root.join("remote/traceability/rocksdb"),
         Some(root.join("remote/traceability/state.json")),
@@ -1150,14 +1320,18 @@ async fn spawn_remote_migration_evidence_stack(root: &std::path::Path) -> Remote
     let traceability_manager = TraceabilityManager::new(
         traceability_store,
         ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]),
-        GraphProjectionConfig { shard_endpoint: None },
+        GraphProjectionConfig {
+            shard_endpoint: None,
+        },
         EventBusRuntimeMonitor::direct(),
     );
     let traceability_endpoint = spawn_grpc_service(move |incoming| {
         let manager = traceability_manager.clone();
         async move {
             Server::builder()
-                .add_service(TraceabilityServiceServer::new(TraceabilityServiceImpl::new(manager)))
+                .add_service(TraceabilityServiceServer::new(
+                    TraceabilityServiceImpl::new(manager),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("traceability service should run");
@@ -1172,7 +1346,9 @@ async fn spawn_remote_migration_evidence_stack(root: &std::path::Path) -> Remote
         let manager = verification_manager.clone();
         async move {
             Server::builder()
-                .add_service(VerificationServiceServer::new(VerificationServiceImpl::new(manager)))
+                .add_service(VerificationServiceServer::new(
+                    VerificationServiceImpl::new(manager),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("verification service should run");
@@ -1188,17 +1364,21 @@ async fn spawn_remote_migration_evidence_stack(root: &std::path::Path) -> Remote
     .expect("connector store should open");
     let ingestion_manager = EvidenceIngestionManager::new(
         connector_store,
-        Arc::new(GrpcTraceabilityForwarder::new(traceability_endpoint.clone())),
-        Arc::new(GrpcVerificationForwarder::new(verification_endpoint.clone())),
+        Arc::new(GrpcTraceabilityForwarder::new(
+            traceability_endpoint.clone(),
+        )),
+        Arc::new(GrpcVerificationForwarder::new(
+            verification_endpoint.clone(),
+        )),
         MigrationEvidenceDeliveryMode::Direct,
     );
     let ingestion_endpoint = spawn_grpc_service(move |incoming| {
         let manager = ingestion_manager.clone();
         async move {
             Server::builder()
-                .add_service(EvidenceIngestionServiceServer::new(EvidenceIngestionServiceImpl::new(
-                    manager,
-                )))
+                .add_service(EvidenceIngestionServiceServer::new(
+                    EvidenceIngestionServiceImpl::new(manager),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("evidence ingestion service should run");
@@ -1217,11 +1397,7 @@ async fn spawn_grpc_service<F, Fut>(serve: F) -> String
 where
     F: FnOnce(
             std::pin::Pin<
-                Box<
-                    dyn futures::Stream<Item = Result<TcpStream, std::io::Error>>
-                        + Send
-                        + 'static,
-                >,
+                Box<dyn futures::Stream<Item = Result<TcpStream, std::io::Error>> + Send + 'static>,
             >,
         ) -> Fut
         + Send
@@ -1231,7 +1407,9 @@ where
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("grpc listener should bind");
-    let addr = listener.local_addr().expect("grpc listener should expose an address");
+    let addr = listener
+        .local_addr()
+        .expect("grpc listener should expose an address");
     let incoming = Box::pin(async_stream::stream! {
         loop {
             match listener.accept().await {
@@ -1371,7 +1549,8 @@ fn artifact_run_request() -> ConnectorRunRequest {
         severity: ExceptionSeverity::Warning,
         status: ExceptionStatus::Accepted,
         category: "manual_adjustment".to_string(),
-        message: "Cutover team accepted a minor rounding difference during dress rehearsal".to_string(),
+        message: "Cutover team accepted a minor rounding difference during dress rehearsal"
+            .to_string(),
         source_value: Some(json!(100)),
         target_value: Some(json!(101)),
         remediation: Some("Documented for sign-off packet".to_string()),
@@ -1626,9 +1805,16 @@ fn sap_idoc_extractor_bundle_payload() -> Value {
             object_name: "ORDERS05".to_string(),
             source_system_id: "ECC-PRD".to_string(),
             source_client: "100".to_string(),
+            extractor_family: SapExtractorFamily::Idoc,
             extractor_name: "control-m-extractor".to_string(),
             extractor_run_id: "run-1".to_string(),
             extracted_at: Utc::now(),
+            extractor_object: None,
+            extractor_context: None,
+            extraction_mode: None,
+            delta_token: None,
+            subscriber_name: None,
+            queue_name: None,
             idoc_type: Some("ORDERS05".to_string()),
             message_type: Some("ORDERS".to_string()),
             segment_counts: [("E1EDK01".to_string(), 2u64)].into_iter().collect(),
@@ -1646,6 +1832,51 @@ fn sap_idoc_extractor_bundle_payload() -> Value {
         approvals: vec![],
     })
     .expect("IDoc bundle should serialize")
+}
+
+fn sap_odp_extractor_bundle_payload() -> Value {
+    let rows = json!([
+        {"VBELN": "500000001", "NETWR": "125.50", "WAERK": "USD"},
+        {"VBELN": "500000002", "NETWR": "130.00", "WAERK": "USD"}
+    ]);
+    let rows_sha = sha256_hex(rows.to_string().as_bytes());
+
+    serde_json::to_value(SapIdocExtractorBundle {
+        manifest: SapIdocExtractorManifest {
+            schema_version: "1.0".to_string(),
+            package_id: "odp-package-1".to_string(),
+            program_id: "program-rise-1".to_string(),
+            object_id: "object-open-orders".to_string(),
+            object_name: "2LIS_11_VAHDR".to_string(),
+            source_system_id: "ECC-PRD".to_string(),
+            source_client: "100".to_string(),
+            extractor_family: SapExtractorFamily::Odp,
+            extractor_name: "odq-sales-order-header".to_string(),
+            extractor_run_id: "run-odp-1".to_string(),
+            extracted_at: Utc::now(),
+            extractor_object: Some("2LIS_11_VAHDR".to_string()),
+            extractor_context: Some("SAPI".to_string()),
+            extraction_mode: Some(SapExtractorMode::Delta),
+            delta_token: Some("delta-token-1".to_string()),
+            subscriber_name: Some("ARCXA_DEMO".to_string()),
+            queue_name: Some("ODQ_QUEUE_001".to_string()),
+            idoc_type: None,
+            message_type: None,
+            segment_counts: BTreeMap::new(),
+            data_set: Some(SapIdocExtractorDataSet {
+                format: SapIdocExtractorDataFormat::JsonDocuments,
+                path: None,
+                inline_payload: Some(rows.to_string()),
+                expected_row_count: Some(2),
+                sha256: Some(rows_sha),
+            }),
+        },
+        executions: vec![],
+        exceptions: vec![],
+        controls: vec![],
+        approvals: vec![],
+    })
+    .expect("ODP bundle should serialize")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

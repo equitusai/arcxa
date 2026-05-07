@@ -91,6 +91,7 @@ pub(super) fn build_compatibility_matrix(
                     provider_interface_id: provider.interface_id.clone(),
                     consumer_interface_id: consumer.interface_id.clone(),
                     score: report.confidence,
+                    compatibility_state: super::derive_interface_compatibility_state(&report.checks),
                     details: report
                         .checks
                         .iter()
@@ -111,6 +112,7 @@ pub(super) fn build_compatibility_matrix(
                 provider_interface_id: provider.interface_id.clone(),
                 consumer_interface_id: consumer.interface_id.clone(),
                 score: execution.confidence,
+                compatibility_state: super::derive_interface_compatibility_state(&execution.checks),
                 details: execution
                     .checks
                     .iter()

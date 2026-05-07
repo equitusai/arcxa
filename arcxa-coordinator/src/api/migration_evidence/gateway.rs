@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use arcxa_evidence_ingestion::{
-    EventDispatchSummary, EvidenceIngestionManager, KafkaTraceabilityForwarder, TraceabilityForwarder,
-    VerificationProvider,
+    EventDispatchSummary, EvidenceIngestionManager, KafkaTraceabilityForwarder,
+    TraceabilityForwarder, VerificationProvider,
 };
 use arcxa_traceability::{
     EventBusRuntimeMonitor, GraphProjectionConfig, KafkaTraceabilityConsumerConfig,
@@ -11,9 +11,10 @@ use arcxa_verification::VerificationManager;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use graphica_core::distributed::proto::migration_evidence::{
-    evidence_ingestion_service_client::EvidenceIngestionServiceClient, traceability_service_client::TraceabilityServiceClient,
-    GetEvidencePacketRequest, GetObjectRequest, GetProgramRequest, RebuildReadModelsRequest,
-    RuntimeStatusRequest, RunConnectorRequest as ProtoRunConnectorRequest, UpsertConnectorRequest,
+    evidence_ingestion_service_client::EvidenceIngestionServiceClient,
+    traceability_service_client::TraceabilityServiceClient, GetEvidencePacketRequest,
+    GetObjectRequest, GetProgramRequest, RebuildReadModelsRequest,
+    RunConnectorRequest as ProtoRunConnectorRequest, RuntimeStatusRequest, UpsertConnectorRequest,
 };
 use graphica_core::migration_evidence::{
     ApprovalEvent, ConnectorRunRequest, ConnectorRunSummary, ControlResult,
@@ -22,6 +23,7 @@ use graphica_core::migration_evidence::{
     TraceabilityRebuildSummary, TraceabilityRuntimeStatus, ValueExplanation, ValueLocator,
     VerificationDispatchRequest, VerificationDispatchResult,
 };
+use graphica_core::secrets::providers::SecretStoreRegistry;
 use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +43,7 @@ pub struct MigrationEvidenceRemoteGatewayConfig {
     pub traceability_endpoint: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MigrationEvidenceGatewayConfig {
     pub connector_state_path: PathBuf,
     pub connector_rocksdb_path: Option<PathBuf>,
@@ -51,6 +53,7 @@ pub struct MigrationEvidenceGatewayConfig {
     pub shard_endpoint: Option<String>,
     pub event_bus: Option<MigrationEvidenceEventBusConfig>,
     pub remote_services: Option<MigrationEvidenceRemoteGatewayConfig>,
+    pub secret_store_registry: Option<Arc<SecretStoreRegistry>>,
 }
 
 #[derive(Clone)]
@@ -159,13 +162,22 @@ impl MigrationEvidenceGateway {
         };
         let verification_event_forwarder: Arc<dyn MigrationEvidenceEventForwarder> =
             Arc::new(forwarder.clone());
-        let verification = Arc::new(VerificationManager::new(verification_event_forwarder));
-        let ingestion = Arc::new(EvidenceIngestionManager::new(
+        let mut verification_manager = VerificationManager::new(verification_event_forwarder);
+        if let Some(secret_store_registry) = config.secret_store_registry.clone() {
+            verification_manager =
+                verification_manager.with_secret_store_registry(secret_store_registry);
+        }
+        let verification = Arc::new(verification_manager);
+        let mut ingestion_manager = EvidenceIngestionManager::new(
             connector_store,
             Arc::new(forwarder),
             Arc::new(LocalVerificationForwarder { verification }),
             event_delivery_mode,
-        ));
+        );
+        if let Some(secret_store_registry) = config.secret_store_registry {
+            ingestion_manager = ingestion_manager.with_secret_store_registry(secret_store_registry);
+        }
+        let ingestion = Arc::new(ingestion_manager);
         Ok(Self {
             backend: MigrationEvidenceGatewayBackend::Embedded {
                 ingestion,
@@ -183,12 +195,17 @@ impl MigrationEvidenceGateway {
         }
     }
 
-    pub async fn upsert_connector(&self, connector: MigrationConnector) -> Result<MigrationConnector> {
+    pub async fn upsert_connector(
+        &self,
+        connector: MigrationConnector,
+    ) -> Result<MigrationConnector> {
         match &self.backend {
             MigrationEvidenceGatewayBackend::Embedded { ingestion, .. } => {
                 ingestion.upsert_connector(connector).await
             }
-            MigrationEvidenceGatewayBackend::Remote(remote) => remote.upsert_connector(connector).await,
+            MigrationEvidenceGatewayBackend::Remote(remote) => {
+                remote.upsert_connector(connector).await
+            }
         }
     }
 
@@ -223,10 +240,14 @@ impl MigrationEvidenceGateway {
     ) -> Result<EvidencePacket> {
         match &self.backend {
             MigrationEvidenceGatewayBackend::Embedded { traceability, .. } => {
-                traceability.evidence_packet_for_object(object_id, value_key).await
+                traceability
+                    .evidence_packet_for_object(object_id, value_key)
+                    .await
             }
             MigrationEvidenceGatewayBackend::Remote(remote) => {
-                remote.evidence_packet_for_object(object_id, value_key).await
+                remote
+                    .evidence_packet_for_object(object_id, value_key)
+                    .await
             }
         }
     }
@@ -236,7 +257,9 @@ impl MigrationEvidenceGateway {
             MigrationEvidenceGatewayBackend::Embedded { traceability, .. } => {
                 traceability.controls_for_object(object_id).await
             }
-            MigrationEvidenceGatewayBackend::Remote(remote) => remote.controls_for_object(object_id).await,
+            MigrationEvidenceGatewayBackend::Remote(remote) => {
+                remote.controls_for_object(object_id).await
+            }
         }
     }
 
@@ -329,19 +352,25 @@ impl RemoteMigrationEvidenceGateway {
     async fn explain_value(&self, locator: ValueLocator) -> Result<ValueExplanation> {
         let mut client = self.traceability_client().await?;
         let response = client
-            .explain_value(graphica_core::distributed::proto::migration_evidence::ExplainValueRequest {
-                program_id: locator.program_id,
-                object_id: locator.object_id,
-                target_field_path: locator.target_field_path,
-                target_record_id: locator.target_record_id.unwrap_or_default(),
-                source_record_id: locator.source_record_id.unwrap_or_default(),
-            })
+            .explain_value(
+                graphica_core::distributed::proto::migration_evidence::ExplainValueRequest {
+                    program_id: locator.program_id,
+                    object_id: locator.object_id,
+                    target_field_path: locator.target_field_path,
+                    target_record_id: locator.target_record_id.unwrap_or_default(),
+                    source_record_id: locator.source_record_id.unwrap_or_default(),
+                },
+            )
             .await?
             .into_inner();
         deserialize(&response.value_explanation_json)
     }
 
-    async fn evidence_packet_for_object(&self, object_id: &str, value_key: Option<&str>) -> Result<EvidencePacket> {
+    async fn evidence_packet_for_object(
+        &self,
+        object_id: &str,
+        value_key: Option<&str>,
+    ) -> Result<EvidencePacket> {
         let mut client = self.traceability_client().await?;
         let response = client
             .get_evidence_packet(GetEvidencePacketRequest {
@@ -425,7 +454,9 @@ impl RemoteMigrationEvidenceGateway {
         deserialize(&response.rebuild_summary_json)
     }
 
-    async fn evidence_ingestion_client(&self) -> Result<EvidenceIngestionServiceClient<tonic::transport::Channel>> {
+    async fn evidence_ingestion_client(
+        &self,
+    ) -> Result<EvidenceIngestionServiceClient<tonic::transport::Channel>> {
         EvidenceIngestionServiceClient::connect(self.evidence_ingestion_endpoint.clone())
             .await
             .with_context(|| {
@@ -436,7 +467,9 @@ impl RemoteMigrationEvidenceGateway {
             })
     }
 
-    async fn traceability_client(&self) -> Result<TraceabilityServiceClient<tonic::transport::Channel>> {
+    async fn traceability_client(
+        &self,
+    ) -> Result<TraceabilityServiceClient<tonic::transport::Channel>> {
         TraceabilityServiceClient::connect(self.traceability_endpoint.clone())
             .await
             .with_context(|| {
@@ -459,10 +492,8 @@ impl TraceabilityForwarder for LocalTraceabilityForwarder {
         &self,
         events: Vec<MigrationEvidenceEvent>,
     ) -> Result<EventDispatchSummary> {
-        self.traceability
-            .ingest_events(events)
-            .await
-            .map(|(accepted_event_count, touched_program_ids, touched_object_ids)| {
+        self.traceability.ingest_events(events).await.map(
+            |(accepted_event_count, touched_program_ids, touched_object_ids)| {
                 EventDispatchSummary {
                     accepted_event_count,
                     touched_program_ids,
@@ -471,7 +502,8 @@ impl TraceabilityForwarder for LocalTraceabilityForwarder {
                         graphica_core::migration_evidence::MigrationEvidenceDeliveryMode::Direct,
                     traceability_acknowledged: true,
                 }
-            })
+            },
+        )
     }
 }
 

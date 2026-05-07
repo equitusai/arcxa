@@ -97,6 +97,7 @@ fn setup_test_app() -> (TempDir, Arc<SosStorageManager>, axum::Router) {
         cancellation_manager: None,
         sos_storage_manager: Some(sos_storage_manager.clone()),
         discovery_state: None,
+        migration_evidence_gateway: None,
         discovery_orchestrator: None,
     });
 
@@ -189,6 +190,7 @@ fn setup_authenticated_build_router_app() -> (TempDir, Arc<SosStorageManager>, a
         progress_store: None,
         cancellation_manager: None,
         sos_storage_manager: Some(sos_storage_manager.clone()),
+        migration_evidence_gateway: None,
         discovery_state: None,
         discovery_orchestrator: None,
     };

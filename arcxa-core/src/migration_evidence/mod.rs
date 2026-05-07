@@ -1,3 +1,4 @@
+mod auth;
 mod delivery;
 mod ecc_adapter;
 mod ecc_rfc_bapi;
@@ -5,6 +6,7 @@ mod ecc_staged_export;
 mod idoc_extractor;
 mod odata;
 
+pub use auth::{resolve_connector_auth, ConnectorAuthResolutionMetadata, ResolvedConnectorAuth};
 pub use delivery::{
     GrpcMigrationEvidenceEventForwarder, KafkaMigrationEvidenceEventForwarder,
     MigrationEvidenceEventForwarder,
@@ -12,15 +14,15 @@ pub use delivery::{
 pub use ecc_adapter::{
     derive_sap_ecc_projection_fields, discover_sap_ecc_adapter_capabilities,
     extract_sap_ecc_adapter_next_path, field_types_by_name, merge_sap_ecc_adapter_page_payloads,
-    normalize_sap_ecc_adapter_payload, resolve_sap_ecc_adapter_value,
-    SapEccAdapterCapabilities, SapEccAdapterField, SapEccProjectionFields,
+    normalize_sap_ecc_adapter_payload, resolve_sap_ecc_adapter_value, SapEccAdapterCapabilities,
+    SapEccAdapterField, SapEccProjectionFields,
 };
 pub use ecc_rfc_bapi::{
     derive_sap_ecc_rfc_bapi_projection_fields, discover_sap_ecc_rfc_bapi_capabilities,
-    extract_sap_ecc_rfc_bapi_next_cursor, merge_sap_ecc_rfc_bapi_page_payloads,
-    normalize_sap_ecc_rfc_bapi_payload, resolve_sap_ecc_rfc_bapi_value,
-    rfc_field_types_by_name, SapEccRfcBapiCapabilities, SapEccRfcBapiField,
-    SapEccRfcBapiProjectionFields,
+    extract_sap_ecc_rfc_bapi_next_cursor, extract_sap_ecc_rfc_bapi_next_cursor_from_path,
+    merge_sap_ecc_rfc_bapi_page_payloads, normalize_sap_ecc_rfc_bapi_payload,
+    resolve_sap_ecc_rfc_bapi_value, rfc_field_types_by_name, SapEccRfcBapiCapabilities,
+    SapEccRfcBapiField, SapEccRfcBapiProfile, SapEccRfcBapiProjectionFields,
 };
 pub use ecc_staged_export::{
     SapEccStagedApprovalEvidence, SapEccStagedControlEvidence, SapEccStagedExceptionEvidence,
@@ -28,17 +30,16 @@ pub use ecc_staged_export::{
     SapEccStagedExportDataSet, SapEccStagedExportManifest, SapEccStagedRuleEvidence,
 };
 pub use idoc_extractor::{
-    SapIdocExtractorApprovalEvidence, SapIdocExtractorBundle, SapIdocExtractorControlEvidence,
-    SapIdocExtractorDataFormat, SapIdocExtractorDataSet, SapIdocExtractorExceptionEvidence,
-    SapIdocExtractorExecutionEvidence, SapIdocExtractorManifest,
+    SapExtractorFamily, SapExtractorMode, SapIdocExtractorApprovalEvidence, SapIdocExtractorBundle,
+    SapIdocExtractorControlEvidence, SapIdocExtractorDataFormat, SapIdocExtractorDataSet,
+    SapIdocExtractorExceptionEvidence, SapIdocExtractorExecutionEvidence, SapIdocExtractorManifest,
 };
 pub use odata::{
     derive_sap_s4_odata_projection_fields, discover_sap_s4_odata_capabilities,
-    extract_json_path_value, extract_sap_s4_odata_next_link,
-    infer_sap_s4_odata_metadata_path, infer_sap_s4_odata_service_root_path,
-    merge_sap_s4_odata_page_payloads, normalize_sap_s4_odata_payload,
-    resolve_sap_s4_odata_value, SapS4ODataCapabilities, SapS4ODataProjectionFields,
-    SapS4ODataProperty, SapS4ODataVersion,
+    extract_json_path_value, extract_sap_s4_odata_next_link, infer_sap_s4_odata_metadata_path,
+    infer_sap_s4_odata_service_root_path, merge_sap_s4_odata_page_payloads,
+    normalize_sap_s4_odata_payload, resolve_sap_s4_odata_value, SapS4ODataCapabilities,
+    SapS4ODataProjectionFields, SapS4ODataProperty, SapS4ODataVersion,
 };
 
 use chrono::{DateTime, Utc};
@@ -76,6 +77,7 @@ pub enum ConnectorTransport {
     SapEccRfcBapi,
     SapEccStagedExport,
     SapIdocExtractorPackage,
+    SapOdpExtractorPackage,
     SapS4OData,
     ManualDrop,
 }
@@ -87,6 +89,24 @@ pub enum ConnectorAuthKind {
     Bearer,
     ApiKey,
     Basic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SapEccBackendAuthMode {
+    UserPassword,
+    Snc,
+    Sso2,
+    X509,
+    Destination,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SapEccSessionMode {
+    Stateless,
+    Stateful,
+    Cached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -937,7 +957,12 @@ pub fn verification_result_to_events(
         .metadata
         .get("value_key")
         .cloned()
-        .unwrap_or_else(|| format!("{}::{}", result.control_result.object_id, result.control_result.control_name));
+        .unwrap_or_else(|| {
+            format!(
+                "{}::{}",
+                result.control_result.object_id, result.control_result.control_name
+            )
+        });
 
     let mut events = vec![
         MigrationEvidenceEvent::new(
@@ -1001,7 +1026,10 @@ mod tests {
 
         assert_eq!(restored.connector_id, "connector-1");
         assert_eq!(restored.run_id, "run-1");
-        assert_eq!(restored.artifact_type, MigrationEvidenceArtifactType::TransformationRule);
+        assert_eq!(
+            restored.artifact_type,
+            MigrationEvidenceArtifactType::TransformationRule
+        );
         assert_eq!(restored.value_key.as_deref(), Some("sales_order.total"));
     }
 
@@ -1020,7 +1048,10 @@ mod tests {
 
         let envelope = MigrationEvidenceEventEnvelope::from_event(event);
 
-        assert_eq!(envelope.schema_version, MIGRATION_EVIDENCE_EVENT_SCHEMA_VERSION);
+        assert_eq!(
+            envelope.schema_version,
+            MIGRATION_EVIDENCE_EVENT_SCHEMA_VERSION
+        );
         assert_eq!(envelope.partition_key(), "program-1::object-1");
         assert_eq!(envelope.connector_id, "connector-1");
     }

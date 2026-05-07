@@ -60,7 +60,9 @@ pub use sla_validator::{
 };
 pub use transformation_validator::{
     evaluate_schema_transformability, validate_contract_transformation_rules,
-    CanonicalFieldMappingRuleSet, CanonicalTransformRule, FieldMappingRule,
-    SchemaTransformabilityReport, TransformationRulesValidation,
+    CanonicalCoordinateTransformRule, CanonicalFieldMappingRuleSet, CanonicalTransformRule,
+    CanonicalUnitTransformRule, CoordinateTransformSemantics, DeclaredErrorBudget,
+    FieldMappingRule, SchemaTransformabilityReport, TransformCompatibilityMode,
+    TransformationRulesValidation, UnitTransformSemantics,
 };
 pub use unit_validator::{validate_unit_compatibility, UnitCompatibilityResult};

@@ -158,12 +158,19 @@ Each known rule must be an object with explicit endpoints. The canonical shape i
   "unit_transform": {
     "from": "SI",
     "to": "Imperial",
-    "strategy": "linear_scale"
+    "strategy": "linear_scale",
+    "scale": 3.28084,
+    "offset": 0.0,
+    "tolerance": 0.01
   },
   "coordinate_transform": {
     "from": "WGS84",
     "to": "ECI_J2000",
-    "strategy": "helmert"
+    "strategy": "helmert",
+    "translation_m": [1.0, 2.0, 3.0],
+    "rotation_arcsec": [0.1, 0.2, 0.3],
+    "scale_ppm": 0.0,
+    "tolerance_m": 5.0
   },
   "field_mapping": {
     "mappings": [
@@ -188,6 +195,15 @@ What this means in practice:
 - the rule must declare non-empty endpoint values
 - only one alias for a given semantic rule family should be present at a time
 - the rule must actually match the interface direction being validated
+- unit conversion rules for mismatched systems must declare an executable strategy, not only `from` and `to`
+- supported unit strategies today are `identity` and `linear_scale`
+- `linear_scale` rules must declare a positive numeric `scale`; `offset` defaults to `0.0`; `tolerance` is optional and must be non-negative
+- `identity` is only valid when the provider and consumer unit system labels are the same
+- coordinate conversion rules for mismatched systems must declare an executable strategy, not only `from` and `to`
+- supported coordinate strategies today are `identity`, `helmert`, and `local_tangent_plane`
+- `helmert` rules must declare `translation_m` and `rotation_arcsec` arrays with three numeric values each; `scale_ppm` defaults to `0.0`; `tolerance_m` is optional and must be non-negative
+- `local_tangent_plane` rules must declare an `origin` object with `lat_deg`, `lon_deg`, and optional `alt_m`
+- coordinate `identity` is only valid when the provider and consumer coordinate system labels are the same
 - field-mapping rules must declare a `mappings` array
 - each mapping entry must declare either `from` or `value`
 - each mapping entry must declare one target `to`
@@ -196,6 +212,8 @@ What this means in practice:
 Examples:
 - provider unit system `SI`, consumer unit system `Imperial`, rule `SI -> Imperial`: compatible
 - provider unit system `SI`, consumer unit system `Imperial`, rule `Imperial -> SI`: not compatible
+- provider unit system `SI`, consumer unit system `Imperial`, rule `SI -> Imperial` with no strategy metadata: invalid at contract create or update time
+- provider coordinate system `WGS84`, consumer coordinate system `ECI_J2000`, rule `WGS84 -> ECI_J2000` with no strategy metadata: invalid at contract create or update time
 - `\"unit_transform\": \"SI->Imperial\"`: invalid at contract create or update time
 - a mapping from `$.payload.rank` to `$.payload.priority`: valid field-mapping rule
 - two mappings that both target `$.payload.priority`: invalid field-mapping rule
@@ -205,6 +223,8 @@ This matters because the validation engine now distinguishes:
 - malformed transform rule
 - transform rule present but pointed at the wrong direction
 - transform rule present and aligned with the actual provider and consumer metadata
+- transform rule present but still missing executable unit semantics
+- transform rule present but still missing executable coordinate semantics
 
 It also now distinguishes direct schema compatibility from schema transformability.
 
@@ -213,6 +233,38 @@ Today, the `schema_transformability` signal is intentionally narrower than full 
 - it does not yet claim to resolve every type mismatch, enum mismatch, array mismatch, or additional-properties mismatch
 - `schema_compatibility` still fails when the provider schema does not directly satisfy the consumer schema
 - `schema_transformability` can still pass at the same time, which means "not directly compatible, but a declared transform path exists for the missing field requirement"
+
+Today, unit compatibility has also moved one step past label-only matching:
+- a contract can no longer claim a unit transform just by naming `from` and `to`
+- mismatched unit systems now need executable declared semantics such as `linear_scale`
+- if a unit transform declares a tolerance, the compatibility result is treated as a bounded transform
+- if a unit transform omits a tolerance, the compatibility result can still pass, but it is treated as an unbounded transform that deserves runtime verification
+- this is still pragmatic contract semantics, not full dimensional-analysis reasoning across every field in a payload
+
+Coordinate compatibility has now moved one step past label-only matching too:
+- a contract can no longer claim a coordinate transform just by naming `from` and `to`
+- mismatched coordinate systems now need executable declared semantics such as `helmert` or `local_tangent_plane`
+- if a coordinate transform declares `tolerance_m`, the compatibility result is treated as a bounded transform
+- if a coordinate transform omits `tolerance_m`, the compatibility result can still pass, but it is treated as an unbounded transform that deserves runtime verification
+- this is still pragmatic contract semantics, not full geodesy-grade payload transformation or shape-aware spatial validation
+
+The current validation response now uses those distinctions to be more explicit:
+- direct alignment yields the strongest compatibility signal
+- bounded transforms surface a declared error budget in the check details
+- unbounded transforms still pass when the transform is structurally valid, but they lower confidence and surface a stronger verification warning
+
+At the interface-pair level, the platform now also derives an explicit compatibility state:
+- `semantically_equivalent`: direct structural and semantic alignment with no transform step required
+- `syntactically_compatible`: schema/format alignment is solid, but semantic metadata is incomplete enough that full equivalence should not be claimed
+- `transformable`: an explicit transform path exists, but direct equivalence is not present
+- `incompatible`: blocking gaps remain
+
+Confidence is also more explainable across the broader SoS validation surface now:
+- every validation response and persisted report can include a `confidence_assessment`
+- check `details` are normalized with fields like `confidence_score`, `confidence_category`, `confidence_source`, and `confidence_reason`
+- non-blocking advisory or dry-run policy failures no longer look identical to blocking failures
+- system-integration checks now carry forward the nested interface-pair confidence that justified a path
+- data-validation and contract/policy validations now expose the same confidence metadata shape as interface validation
 
 That distinction is deliberate. The platform is trying to separate:
 - directly interoperable contracts

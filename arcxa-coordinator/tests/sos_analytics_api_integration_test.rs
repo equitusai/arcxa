@@ -5,7 +5,8 @@ mod sos_api;
 
 use axum::http::{Method, StatusCode};
 use graphica_coordinator::api::sos_validation::types::{
-    CompatibilityMatrixResponse, DependencyGraphResponse, SosErrorResponse, WhatIfResponse,
+    CompatibilityMatrixResponse, CompatibilityState, DependencyGraphResponse, SosErrorResponse,
+    WhatIfResponse,
 };
 use sos_api::{
     assert_json_response, assert_status, authed_empty_request, empty_request, json_request,
@@ -40,6 +41,18 @@ async fn analytics_endpoints_return_matrix_dependency_graph_and_what_if() {
                 && score.consumer_interface_id == CONSUMER_INTERFACE_ID
         }),
         "compatibility matrix should include the seeded provider/consumer interface path"
+    );
+    let provider_consumer = matrix
+        .matrix
+        .iter()
+        .find(|score| {
+            score.provider_interface_id == PROVIDER_INTERFACE_ID
+                && score.consumer_interface_id == CONSUMER_INTERFACE_ID
+        })
+        .expect("provider/consumer matrix entry should exist");
+    assert_eq!(
+        provider_consumer.compatibility_state,
+        Some(CompatibilityState::Transformable)
     );
 
     let graph_response = harness

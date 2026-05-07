@@ -368,6 +368,7 @@ fn setup_state(
         cancellation_manager: None,
         sos_storage_manager: Some(sos_storage_manager.clone()),
         discovery_state: None,
+        migration_evidence_gateway: None,
         discovery_orchestrator: None,
     };
 

@@ -13,6 +13,23 @@ pub enum SapIdocExtractorDataFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SapExtractorFamily {
+    Idoc,
+    Odp,
+    Generic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SapExtractorMode {
+    Full,
+    Delta,
+    Snapshot,
+    Init,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SapIdocExtractorDataSet {
     pub format: SapIdocExtractorDataFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,9 +51,23 @@ pub struct SapIdocExtractorManifest {
     pub object_name: String,
     pub source_system_id: String,
     pub source_client: String,
+    #[serde(default = "default_extractor_family")]
+    pub extractor_family: SapExtractorFamily,
     pub extractor_name: String,
     pub extractor_run_id: String,
     pub extracted_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_object: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extraction_mode: Option<SapExtractorMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscriber_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idoc_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,4 +117,8 @@ pub struct SapIdocExtractorBundle {
     pub controls: Vec<SapIdocExtractorControlEvidence>,
     #[serde(default)]
     pub approvals: Vec<SapIdocExtractorApprovalEvidence>,
+}
+
+fn default_extractor_family() -> SapExtractorFamily {
+    SapExtractorFamily::Idoc
 }

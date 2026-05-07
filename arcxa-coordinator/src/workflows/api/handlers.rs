@@ -1822,6 +1822,7 @@ mod tests {
             progress_store: None,
             cancellation_manager: None,
             sos_storage_manager: None,
+            migration_evidence_gateway: None,
             discovery_state: None,
             discovery_orchestrator: None,
         })
@@ -1919,6 +1920,7 @@ mod tests {
             progress_store: None,
             cancellation_manager: None,
             sos_storage_manager: None,
+            migration_evidence_gateway: None,
             discovery_state: None,
             discovery_orchestrator: None,
         };

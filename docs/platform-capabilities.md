@@ -141,8 +141,8 @@ Current capabilities include:
 - field-level and record-level explain-value responses
 - explicit modeling of transformation rules, execution runs, exceptions, controls, and approvals
 - read-only verification support that can emit control and exception evidence directly onto the shared event backbone
-- typed SAP verification controls for SAP HANA SQL, SAP S/4HANA OData, a bounded SAP ECC adapter path, and a bounded SAP ECC RFC/BAPI bridge, including record-projection and aggregate-projection checks, `$metadata` or capability-driven field validation, and paged rowset comparison
-- controlled ECC staged-export ingestion and IDoc/extractor-package ingestion with manifest-backed row-count and checksum validation for higher-assurance evidence capture
+- typed SAP verification controls for SAP HANA SQL, SAP S/4HANA OData, a bounded SAP ECC adapter path, and a bounded SAP ECC RFC/BAPI bridge, including record-projection and aggregate-projection checks, `$metadata` or capability-driven field validation, required-request-parameter enforcement, supported auth/session posture checks, secret-store-backed bridge credential resolution with rotation-aware metadata, advertised page-size limits, session reuse / explicit-close semantics, and paged rowset comparison
+- controlled ECC staged-export ingestion plus IDoc and ODP-aligned extractor-package ingestion with manifest-backed row-count and checksum validation, stricter extractor-family validation, and higher-assurance evidence capture
 
 This area is intentionally adjacent to migration execution tooling rather than a replacement for it.
 

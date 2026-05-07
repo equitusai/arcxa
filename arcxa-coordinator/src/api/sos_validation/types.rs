@@ -764,6 +764,67 @@ pub struct CheckResult {
     pub details: Option<serde_json::Value>,
 }
 
+/// Derived compatibility state for interface-pair validation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityState {
+    Incompatible,
+    SyntacticallyCompatible,
+    Transformable,
+    SemanticallyEquivalent,
+}
+
+/// Structured explanation of how a validation confidence score was derived.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct ConfidenceAssessment {
+    /// Confidence derivation method identifier.
+    pub method: String,
+
+    /// Human-readable summary of the main confidence drivers.
+    pub summary: String,
+
+    /// Total number of passed checks.
+    pub passed_check_count: usize,
+
+    /// Total number of failed checks.
+    pub failed_check_count: usize,
+
+    /// Number of checks carrying warning severity.
+    pub warning_check_count: usize,
+
+    /// Whether any check still requires runtime verification.
+    pub runtime_verification_required: bool,
+
+    /// Main contributors that materially changed the overall confidence score.
+    #[serde(default)]
+    pub contributors: Vec<ConfidenceContributor>,
+}
+
+/// A single check's contribution to the final confidence score.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct ConfidenceContributor {
+    /// Check name that influenced the score.
+    pub check_name: String,
+
+    /// Whether the check itself passed.
+    pub passed: bool,
+
+    /// Severity assigned to the check.
+    pub severity: String,
+
+    /// Normalized confidence contribution from this check.
+    pub score: f64,
+
+    /// Structured contributor category.
+    pub category: String,
+
+    /// Whether the score came from explicit rule semantics or a derived fallback.
+    pub source: String,
+
+    /// Human-readable reason for the contribution.
+    pub reason: String,
+}
+
 /// Validation response
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ValidationResponse {
@@ -778,6 +839,14 @@ pub struct ValidationResponse {
 
     /// Confidence score (0.0 to 1.0)
     pub confidence: f64,
+
+    /// Derived compatibility state for interface-compatibility validations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_state: Option<CompatibilityState>,
+
+    /// Structured explanation of how the confidence score was derived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_assessment: Option<ConfidenceAssessment>,
 
     /// Validation timestamp
     pub validated_at: String,
@@ -797,6 +866,10 @@ pub struct ValidationReportResponse {
     pub validation_type: String,
     pub passed: bool,
     pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_state: Option<CompatibilityState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_assessment: Option<ConfidenceAssessment>,
     pub checks: Vec<CheckResult>,
     pub validated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1467,6 +1540,10 @@ pub struct CompatibilityScore {
 
     /// Compatibility score (0.0 to 1.0)
     pub score: f64,
+
+    /// Derived compatibility state for this interface pair when it could be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_state: Option<CompatibilityState>,
 
     /// Compatibility details
     pub details: Vec<CompatibilityDetail>,

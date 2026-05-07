@@ -111,7 +111,13 @@ fn sample_contract(
         }],
         transformation_rules: HashMap::from([(
             "unit_transform".to_string(),
-            json!({"from": "SI", "to": "Imperial"}),
+            json!({
+                "from": "SI",
+                "to": "Imperial",
+                "strategy": "linear_scale",
+                "scale": 3.28084,
+                "offset": 0.0
+            }),
         )]),
         description: Some("Synthetic test contract".to_string()),
         tags: vec!["test".to_string()],

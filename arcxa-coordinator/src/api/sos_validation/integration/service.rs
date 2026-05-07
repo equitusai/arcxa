@@ -49,7 +49,9 @@ use crate::api::sos_validation::types::{
     AddSosContractApprovalEvidenceRequest, AddSosPolicyApprovalEvidenceRequest,
     ApproveSosContractApprovalRequest, ApproveSosPolicyApprovalRequest, ApproveSosPolicyRequest,
     CheckResult, CompatibilityDetail, CompatibilityMatrixQuery, CompatibilityMatrixResponse,
-    CompatibilityScore, CreateSosContractApprovalRequest, CreateSosPolicyApprovalRequest,
+    CompatibilityScore, CompatibilityState, ConfidenceAssessment, ConfidenceContributor,
+    CreateSosContractApprovalRequest,
+    CreateSosPolicyApprovalRequest,
     CreateSosPolicyRequest, DataContractResponse, DependencyGraphQuery, DependencyGraphResponse,
     EvaluatePolicyRequest, ListContractApprovalRequestsQuery, ListContractApprovalRequestsResponse,
     ListContractSignaturesResponse, ListPoliciesQuery, ListPoliciesResponse,
@@ -65,7 +67,9 @@ use crate::api::sos_validation::types::{
 };
 use crate::api::sos_validation::validators::{
     compare_interface_schemas, evaluate_policy_results, evaluate_schema_transformability,
+    DeclaredErrorBudget,
     extract_policy_placeholders, map_policy_severity, render_policy_query,
+    TransformCompatibilityMode,
     validate_contract_transformation_rules, validate_coordinate_compatibility,
     validate_data_against_schema, validate_sla_metrics, validate_unit_compatibility,
     PolicyQueryTemplateError,
@@ -887,12 +891,16 @@ impl SosValidationService {
 
     fn finalize_execution(
         &self,
-        execution: ValidationExecution,
+        mut execution: ValidationExecution,
         options: ValidationExecutionOptions,
     ) -> Result<ValidationResponse, SosValidationServiceError> {
+        annotate_checks_with_confidence(&mut execution.checks);
+        execution.confidence = compute_confidence(&execution.checks);
+
         let validation_id = Uuid::new_v4().to_string();
         let validated_at = Utc::now();
         let passed = execution_passed(&execution.checks);
+        let confidence_assessment = Some(build_confidence_assessment(&execution.checks));
 
         let report = if options.persist_report {
             let previous_report = self
@@ -953,11 +961,18 @@ impl SosValidationService {
             None
         };
 
+        let compatibility_state = match execution.validation_type.as_str() {
+            "interface_compatibility" => derive_interface_compatibility_state(&execution.checks),
+            _ => None,
+        };
+
         Ok(ValidationResponse {
             validation_id,
             passed,
             checks: execution.checks.into_iter().map(into_api_check).collect(),
             confidence: execution.confidence,
+            compatibility_state,
+            confidence_assessment,
             validated_at: validated_at.to_rfc3339(),
             report_id: report.map(|persisted| persisted.report_id),
         })
@@ -2164,25 +2179,27 @@ impl SosValidationService {
                 )
             },
         ));
-        checks.push(simple_check(
+        checks.push(simple_check_with_details(
             "unit_compatibility",
             unit_report.compatible,
-            if unit_report.compatible {
-                "info"
-            } else {
-                "error"
-            },
+            unit_report.severity(),
             unit_report.explanation,
+            Some(transform_compatibility_details(
+                &unit_report.compatibility_mode,
+                unit_report.declared_error_budget.as_ref(),
+                unit_report.confidence_score,
+            )),
         ));
-        checks.push(simple_check(
+        checks.push(simple_check_with_details(
             "coordinate_compatibility",
             coordinate_report.compatible,
-            if coordinate_report.compatible {
-                "info"
-            } else {
-                "error"
-            },
+            coordinate_report.severity(),
             coordinate_report.explanation,
+            Some(transform_compatibility_details(
+                &coordinate_report.compatibility_mode,
+                coordinate_report.declared_error_budget.as_ref(),
+                coordinate_report.confidence_score,
+            )),
         ));
         if contract.is_some() && !transformation_report.valid {
             checks.push(simple_check(
@@ -2607,13 +2624,15 @@ impl SosValidationService {
                     if execution_passed(&compatibility.checks) {
                         compatible_contracts += 1;
                     }
-                    checks.push(simple_check(
+                    let path_passed = execution_passed(&compatibility.checks);
+                    let path_confidence = compute_confidence(&compatibility.checks);
+                    checks.push(simple_check_with_details(
                         format!(
                             "contract_path:{}:{}",
                             provider.interface_id, consumer.interface_id
                         ),
-                        execution_passed(&compatibility.checks),
-                        if execution_passed(&compatibility.checks) {
+                        path_passed,
+                        if path_passed {
                             "info"
                         } else {
                             "error"
@@ -2622,6 +2641,25 @@ impl SosValidationService {
                             "Interface path '{} -> {}' evaluated via contract '{}'",
                             provider.interface_id, consumer.interface_id, contract.contract_id
                         ),
+                        Some(json!({
+                            "nested_validation_type": "interface_compatibility",
+                            "provider_interface_id": provider.interface_id.clone(),
+                            "consumer_interface_id": consumer.interface_id.clone(),
+                            "contract_id": contract.contract_id.clone(),
+                            "compatibility_state": derive_interface_compatibility_state(&compatibility.checks),
+                            "confidence_score": path_confidence,
+                            "confidence_source": "nested_validation",
+                            "confidence_category": if path_passed {
+                                "nested_interface_validation"
+                            } else {
+                                "nested_interface_validation_failure"
+                            },
+                            "confidence_reason": if path_passed {
+                                "System-integration path confidence is derived from the nested interface-compatibility result"
+                            } else {
+                                "System-integration path confidence is reduced by the nested interface-compatibility failure"
+                            },
+                        })),
                     ));
                     ontology_refs.extend(compatibility.ontology_refs);
                     shape_refs.extend(compatibility.shape_refs);
@@ -2968,12 +3006,22 @@ fn simple_check(
     severity: impl Into<String>,
     description: impl Into<String>,
 ) -> ValidationCheckRecord {
+    simple_check_with_details(check_name, passed, severity, description, None)
+}
+
+fn simple_check_with_details(
+    check_name: impl Into<String>,
+    passed: bool,
+    severity: impl Into<String>,
+    description: impl Into<String>,
+    details: Option<Value>,
+) -> ValidationCheckRecord {
     ValidationCheckRecord {
         check_name: check_name.into(),
         passed,
         severity: severity.into(),
         description: description.into(),
-        details: None,
+        details,
     }
 }
 
@@ -2982,8 +3030,457 @@ fn compute_confidence(checks: &[ValidationCheckRecord]) -> f64 {
         return 1.0;
     }
 
-    let passed = checks.iter().filter(|check| check.passed).count() as f64;
-    passed / checks.len() as f64
+    let total = checks.iter().map(check_confidence_score).sum::<f64>();
+    total / checks.len() as f64
+}
+
+fn annotate_checks_with_confidence(checks: &mut [ValidationCheckRecord]) {
+    for check in checks {
+        annotate_check_with_confidence(check);
+    }
+}
+
+fn annotate_check_with_confidence(check: &mut ValidationCheckRecord) {
+    let assessment = assess_check_confidence(check);
+    let mut details = take_details_object(&mut check.details);
+    details.insert("confidence_score".to_string(), json!(assessment.score));
+    details
+        .entry("confidence_category".to_string())
+        .or_insert_with(|| Value::String(assessment.category.clone()));
+    details
+        .entry("confidence_source".to_string())
+        .or_insert_with(|| Value::String(assessment.source.clone()));
+    details
+        .entry("confidence_reason".to_string())
+        .or_insert_with(|| Value::String(assessment.reason.clone()));
+    check.details = Some(Value::Object(details));
+}
+
+fn derive_interface_compatibility_state(
+    checks: &[ValidationCheckRecord],
+) -> Option<CompatibilityState> {
+    let check_map: HashMap<&str, &ValidationCheckRecord> = checks
+        .iter()
+        .map(|check| (check.check_name.as_str(), check))
+        .collect();
+
+    let data_format = check_map.get("data_format")?;
+    let schema = check_map.get("schema_compatibility")?;
+    let schema_transformability = check_map.get("schema_transformability");
+    let unit = check_map.get("unit_compatibility")?;
+    let coordinate = check_map.get("coordinate_compatibility")?;
+    let transformation_rules = check_map.get("transformation_rules");
+
+    if !data_format.passed {
+        return Some(CompatibilityState::Incompatible);
+    }
+    if matches!(transformation_rules, Some(check) if !check.passed) {
+        return Some(CompatibilityState::Incompatible);
+    }
+
+    let unit_mode = compatibility_mode_from_check(unit);
+    let coordinate_mode = compatibility_mode_from_check(coordinate);
+    let any_transform = matches!(
+        unit_mode,
+        Some(TransformCompatibilityMode::BoundedTransform | TransformCompatibilityMode::UnboundedTransform)
+    ) || matches!(
+        coordinate_mode,
+        Some(TransformCompatibilityMode::BoundedTransform | TransformCompatibilityMode::UnboundedTransform)
+    );
+    let any_metadata_absent = matches!(unit_mode, Some(TransformCompatibilityMode::MetadataAbsent))
+        || matches!(coordinate_mode, Some(TransformCompatibilityMode::MetadataAbsent));
+
+    let only_transformable_failure = !schema.passed
+        && schema_transformability.map(|check| check.passed).unwrap_or(false)
+        && unit.passed
+        && coordinate.passed
+        && checks.iter().all(|check| {
+            check.passed
+                || !check.severity.eq_ignore_ascii_case("error")
+                || check.check_name == "schema_compatibility"
+        });
+    if only_transformable_failure {
+        return Some(CompatibilityState::Transformable);
+    }
+
+    if checks
+        .iter()
+        .any(|check| !check.passed && check.severity.eq_ignore_ascii_case("error"))
+    {
+        return Some(CompatibilityState::Incompatible);
+    }
+
+    if any_transform {
+        return Some(CompatibilityState::Transformable);
+    }
+
+    if schema.passed && unit.passed && coordinate.passed {
+        if any_metadata_absent {
+            Some(CompatibilityState::SyntacticallyCompatible)
+        } else {
+            Some(CompatibilityState::SemanticallyEquivalent)
+        }
+    } else {
+        Some(CompatibilityState::Incompatible)
+    }
+}
+
+fn compatibility_mode_from_check(
+    check: &ValidationCheckRecord,
+) -> Option<TransformCompatibilityMode> {
+    compatibility_mode_from_optional_check(check)
+}
+
+fn check_confidence_score(check: &ValidationCheckRecord) -> f64 {
+    assess_check_confidence(check).score
+}
+
+fn transform_compatibility_details(
+    compatibility_mode: &TransformCompatibilityMode,
+    declared_error_budget: Option<&DeclaredErrorBudget>,
+    confidence_score: f64,
+) -> Value {
+    let compatibility_mode = match compatibility_mode {
+        TransformCompatibilityMode::DirectAlignment => "direct_alignment",
+        TransformCompatibilityMode::MetadataAbsent => "metadata_absent",
+        TransformCompatibilityMode::BoundedTransform => "bounded_transform",
+        TransformCompatibilityMode::UnboundedTransform => "unbounded_transform",
+    };
+
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "compatibility_mode".to_string(),
+        Value::String(compatibility_mode.to_string()),
+    );
+    details.insert("confidence_score".to_string(), json!(confidence_score));
+    details.insert(
+        "requires_runtime_verification".to_string(),
+        Value::Bool(matches!(
+            compatibility_mode,
+            "unbounded_transform"
+        )),
+    );
+    if let Some(budget) = declared_error_budget {
+        details.insert(
+            "declared_error_budget".to_string(),
+            json!({
+                "value": budget.value,
+                "label": budget.label,
+            }),
+        );
+    }
+
+    Value::Object(details)
+}
+
+fn build_confidence_assessment(checks: &[ValidationCheckRecord]) -> ConfidenceAssessment {
+    let contributors = checks
+        .iter()
+        .map(|check| (check, assess_check_confidence(check)))
+        .collect::<Vec<_>>();
+
+    let passed_check_count = checks.iter().filter(|check| check.passed).count();
+    let failed_check_count = checks.len().saturating_sub(passed_check_count);
+    let warning_check_count = checks
+        .iter()
+        .filter(|check| check.severity.eq_ignore_ascii_case("warning"))
+        .count();
+    let runtime_verification_required = checks.iter().any(requires_runtime_verification);
+
+    let mut material_contributors = contributors
+        .iter()
+        .filter(|(check, assessment)| {
+            !check.passed
+                || check.severity.eq_ignore_ascii_case("warning")
+                || assessment.score < 0.999
+                || requires_runtime_verification(check)
+        })
+        .map(|(check, assessment)| ConfidenceContributor {
+            check_name: check.check_name.clone(),
+            passed: check.passed,
+            severity: check.severity.clone(),
+            score: assessment.score,
+            category: assessment.category.clone(),
+            source: assessment.source.clone(),
+            reason: assessment.reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    material_contributors.sort_by(|left, right| {
+        left.score
+            .partial_cmp(&right.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.check_name.cmp(&right.check_name))
+    });
+
+    ConfidenceAssessment {
+        method: "per_check_average_v2".to_string(),
+        summary: summarize_confidence_findings(
+            checks,
+            failed_check_count,
+            warning_check_count,
+            runtime_verification_required,
+            &material_contributors,
+        ),
+        passed_check_count,
+        failed_check_count,
+        warning_check_count,
+        runtime_verification_required,
+        contributors: material_contributors,
+    }
+}
+
+fn summarize_confidence_findings(
+    checks: &[ValidationCheckRecord],
+    failed_check_count: usize,
+    warning_check_count: usize,
+    runtime_verification_required: bool,
+    contributors: &[ConfidenceContributor],
+) -> String {
+    if checks.is_empty() {
+        return "No checks were executed, so confidence defaults to 1.0.".to_string();
+    }
+
+    if contributors.is_empty() {
+        return "All checks passed without declared uncertainty.".to_string();
+    }
+
+    let blocking_failures = contributors
+        .iter()
+        .filter(|contributor| contributor.category == "blocking_failure")
+        .count();
+    let non_blocking_failures = contributors
+        .iter()
+        .filter(|contributor| {
+            contributor.category == "non_blocking_policy_failure"
+                || contributor.category == "warning_failure"
+        })
+        .count();
+    let transform_contributors = contributors
+        .iter()
+        .filter(|contributor| {
+            contributor.category == "bounded_transform"
+                || contributor.category == "runtime_verification_required"
+        })
+        .count();
+    let metadata_gaps = contributors
+        .iter()
+        .filter(|contributor| contributor.category == "metadata_absent")
+        .count();
+
+    let mut findings = Vec::new();
+    if blocking_failures > 0 {
+        findings.push(format!("{blocking_failures} blocking failure(s)"));
+    }
+    if non_blocking_failures > 0 {
+        findings.push(format!("{non_blocking_failures} non-blocking warning failure(s)"));
+    }
+    if transform_contributors > 0 {
+        findings.push(format!("{transform_contributors} transform-driven check(s)"));
+    }
+    if metadata_gaps > 0 {
+        findings.push(format!("{metadata_gaps} metadata-gap check(s)"));
+    }
+    if runtime_verification_required {
+        findings.push("runtime verification is still required".to_string());
+    }
+    if findings.is_empty() && warning_check_count > 0 {
+        findings.push(format!("{warning_check_count} warning-severity check(s)"));
+    }
+    if findings.is_empty() && failed_check_count > 0 {
+        findings.push(format!("{failed_check_count} failed check(s)"));
+    }
+
+    format!("Confidence reflects {}.", findings.join(", "))
+}
+
+#[derive(Debug, Clone)]
+struct CheckConfidenceAssessment {
+    score: f64,
+    category: String,
+    source: String,
+    reason: String,
+}
+
+fn assess_check_confidence(check: &ValidationCheckRecord) -> CheckConfidenceAssessment {
+    if let Some(score) = explicit_confidence_score(check) {
+        let category = confidence_category(check);
+        return CheckConfidenceAssessment {
+            score,
+            category: category.clone(),
+            source: "explicit".to_string(),
+            reason: confidence_reason(check, &category, score),
+        };
+    }
+
+    let (score, category) = if !check.passed {
+        if check.severity.eq_ignore_ascii_case("warning") {
+            if is_non_blocking_policy_failure(check) {
+                (0.65, "non_blocking_policy_failure".to_string())
+            } else {
+                (0.5, "warning_failure".to_string())
+            }
+        } else if check.severity.eq_ignore_ascii_case("info") {
+            (0.75, "informational_failure".to_string())
+        } else {
+            (0.0, "blocking_failure".to_string())
+        }
+    } else if check.severity.eq_ignore_ascii_case("warning") {
+        (0.85, "warning_pass".to_string())
+    } else {
+        (1.0, confidence_category(check))
+    };
+
+    CheckConfidenceAssessment {
+        score,
+        category: category.clone(),
+        source: "derived".to_string(),
+        reason: confidence_reason(check, &category, score),
+    }
+}
+
+fn explicit_confidence_score(check: &ValidationCheckRecord) -> Option<f64> {
+    check.details
+        .as_ref()
+        .and_then(|details| details.get("confidence_score"))
+        .and_then(Value::as_f64)
+        .filter(|score| (0.0..=1.0).contains(score))
+}
+
+fn confidence_category(check: &ValidationCheckRecord) -> String {
+    if let Some(existing) = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("confidence_category"))
+        .and_then(Value::as_str)
+    {
+        return existing.to_string();
+    }
+
+    match compatibility_mode_from_optional_check(check) {
+        Some(TransformCompatibilityMode::DirectAlignment) => "semantic_alignment".to_string(),
+        Some(TransformCompatibilityMode::MetadataAbsent) => "metadata_absent".to_string(),
+        Some(TransformCompatibilityMode::BoundedTransform) => "bounded_transform".to_string(),
+        Some(TransformCompatibilityMode::UnboundedTransform) => {
+            "runtime_verification_required".to_string()
+        }
+        None if is_non_blocking_policy_failure(check) => "non_blocking_policy_failure".to_string(),
+        None if !check.passed && check.severity.eq_ignore_ascii_case("error") => {
+            "blocking_failure".to_string()
+        }
+        None if !check.passed && check.severity.eq_ignore_ascii_case("warning") => {
+            "warning_failure".to_string()
+        }
+        None if check.passed && check.severity.eq_ignore_ascii_case("warning") => {
+            "warning_pass".to_string()
+        }
+        _ => "passed_check".to_string(),
+    }
+}
+
+fn confidence_reason(check: &ValidationCheckRecord, category: &str, score: f64) -> String {
+    if let Some(existing) = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("confidence_reason"))
+        .and_then(Value::as_str)
+    {
+        return existing.to_string();
+    }
+
+    let description = check.description.trim();
+    match category {
+        "bounded_transform" => format!(
+            "{description}. Confidence is reduced because this check depends on a declared transform."
+        ),
+        "runtime_verification_required" => format!(
+            "{description}. Confidence is reduced further because runtime verification is still required."
+        ),
+        "metadata_absent" => format!(
+            "{description}. Confidence remains below semantic-equivalence because metadata is incomplete."
+        ),
+        "non_blocking_policy_failure" => {
+            let mode = check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("policy_execution_mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("non_blocking");
+            format!(
+                "{description}. This {mode} policy violation is non-blocking but still reduces confidence."
+            )
+        }
+        "blocking_failure" => {
+            format!("{description}. This blocking failure drives confidence to {score:.2}.")
+        }
+        "warning_failure" => format!(
+            "{description}. This warning-level failure lowers confidence without blocking execution."
+        ),
+        "warning_pass" => format!(
+            "{description}. The check passed, but warning severity keeps confidence below 1.0."
+        ),
+        "semantic_alignment" => {
+            "Direct semantic alignment supports full confidence for this check.".to_string()
+        }
+        "nested_interface_validation" | "nested_interface_validation_failure" => {
+            description.to_string()
+        }
+        _ => {
+            if check.passed {
+                "The check passed without declared uncertainty.".to_string()
+            } else {
+                description.to_string()
+            }
+        }
+    }
+}
+
+fn compatibility_mode_from_optional_check(
+    check: &ValidationCheckRecord,
+) -> Option<TransformCompatibilityMode> {
+    let raw = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("compatibility_mode"))
+        .and_then(Value::as_str)?;
+
+    match raw {
+        "direct_alignment" => Some(TransformCompatibilityMode::DirectAlignment),
+        "metadata_absent" => Some(TransformCompatibilityMode::MetadataAbsent),
+        "bounded_transform" => Some(TransformCompatibilityMode::BoundedTransform),
+        "unbounded_transform" => Some(TransformCompatibilityMode::UnboundedTransform),
+        _ => None,
+    }
+}
+
+fn requires_runtime_verification(check: &ValidationCheckRecord) -> bool {
+    check.details
+        .as_ref()
+        .and_then(|details| details.get("requires_runtime_verification"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_non_blocking_policy_failure(check: &ValidationCheckRecord) -> bool {
+    !check.passed
+        && check.severity.eq_ignore_ascii_case("warning")
+        && check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("policy_blocking"))
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
+fn take_details_object(details: &mut Option<Value>) -> serde_json::Map<String, Value> {
+    match details.take() {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("detail".to_string(), other);
+            map
+        }
+        None => serde_json::Map::new(),
+    }
 }
 
 fn execution_passed(checks: &[ValidationCheckRecord]) -> bool {
@@ -3058,7 +3555,15 @@ fn policy_revision_ref(policy: &SosPolicy) -> String {
     format!("policy:{}@{}", policy.policy_id, policy.revision)
 }
 
-fn to_report_response(report: ValidationReport) -> ValidationReportResponse {
+fn to_report_response(mut report: ValidationReport) -> ValidationReportResponse {
+    annotate_checks_with_confidence(&mut report.checks);
+    let compatibility_state = if report.validation_type == "interface_compatibility" {
+        derive_interface_compatibility_state(&report.checks)
+    } else {
+        None
+    };
+    let confidence_assessment = Some(build_confidence_assessment(&report.checks));
+
     ValidationReportResponse {
         report_id: report.report_id,
         validation_id: report.validation_id,
@@ -3067,6 +3572,8 @@ fn to_report_response(report: ValidationReport) -> ValidationReportResponse {
         validation_type: report.validation_type,
         passed: report.passed,
         confidence: report.confidence,
+        compatibility_state,
+        confidence_assessment,
         checks: report.checks.into_iter().map(into_api_check).collect(),
         validated_at: report.validated_at.to_rfc3339(),
         previous_report_id: report.previous_report_id,
@@ -3942,7 +4449,13 @@ mod tests {
             }],
             transformation_rules: HashMap::from([(
                 "unit_transform".to_string(),
-                json!({"from": "SI", "to": "Imperial"}),
+                json!({
+                    "from": "SI",
+                    "to": "Imperial",
+                    "strategy": "linear_scale",
+                    "scale": 3.28084,
+                    "offset": 0.0
+                }),
             )]),
             description: Some("Synthetic test contract".to_string()),
             tags: vec!["test".to_string()],
@@ -4311,7 +4824,13 @@ mod tests {
         let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
         contract.transformation_rules = HashMap::from([(
             "unit_transform".to_string(),
-            json!({"from": "Imperial", "to": "SI"}),
+            json!({
+                "from": "Imperial",
+                "to": "SI",
+                "strategy": "linear_scale",
+                "scale": 0.3048,
+                "offset": 0.0
+            }),
         )]);
         storage_manager
             .put_contract(&contract)
@@ -4373,6 +4892,256 @@ mod tests {
             .expect("transformation_rules check should be present");
         assert!(!transform_check.passed);
         assert!(transform_check.description.contains("must be an object"));
+    }
+
+    #[test]
+    fn interface_validation_surfaces_incomplete_unit_transform_semantics() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        register_minimal_catalog(&storage_manager);
+
+        let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
+        contract.transformation_rules = HashMap::from([(
+            "unit_transform".to_string(),
+            json!({
+                "from": "SI",
+                "to": "Imperial"
+            }),
+        )]);
+        storage_manager
+            .put_contract(&contract)
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(!response.passed);
+
+        let transform_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "transformation_rules")
+            .expect("transformation_rules check should be present");
+        assert!(!transform_check.passed);
+        assert!(transform_check
+            .description
+            .contains("must declare a unit conversion strategy"));
+
+        let unit_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "unit_compatibility")
+            .expect("unit compatibility check should be present");
+        assert!(!unit_check.passed);
+        assert!(unit_check
+            .description
+            .contains("no semantically valid transformation rule"));
+    }
+
+    #[test]
+    fn interface_validation_surfaces_incomplete_coordinate_transform_semantics() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        storage_manager
+            .put_system(&sample_system("provider-system", "Provider"))
+            .expect("provider system should be stored");
+        storage_manager
+            .put_system(&sample_system("consumer-system", "Consumer"))
+            .expect("consumer system should be stored");
+
+        let provider = sample_interface("provider-if", "provider-system", "SI");
+        let mut consumer = sample_interface("consumer-if", "consumer-system", "SI");
+        consumer.coordinate_system = Some("ECI_J2000".to_string());
+
+        storage_manager
+            .put_interface(&provider)
+            .expect("provider interface should be stored");
+        storage_manager
+            .put_interface(&consumer)
+            .expect("consumer interface should be stored");
+
+        let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
+        contract.transformation_rules = HashMap::from([(
+            "coordinate_transform".to_string(),
+            json!({
+                "from": "WGS84",
+                "to": "ECI_J2000"
+            }),
+        )]);
+        storage_manager
+            .put_contract(&contract)
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(!response.passed);
+
+        let transform_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "transformation_rules")
+            .expect("transformation_rules check should be present");
+        assert!(!transform_check.passed);
+        assert!(transform_check
+            .description
+            .contains("must declare a coordinate conversion strategy"));
+
+        let coordinate_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "coordinate_compatibility")
+            .expect("coordinate compatibility check should be present");
+        assert!(!coordinate_check.passed);
+        assert!(coordinate_check
+            .description
+            .contains("no semantically valid transformation rule"));
+    }
+
+    #[test]
+    fn interface_validation_marks_unbounded_unit_transform_as_warning_with_reduced_confidence() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        register_minimal_catalog(&storage_manager);
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(response.passed);
+        assert!(response.confidence < 1.0);
+        assert_eq!(
+            response.compatibility_state,
+            Some(CompatibilityState::Transformable)
+        );
+
+        let unit_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "unit_compatibility")
+            .expect("unit compatibility check should be present");
+        assert!(unit_check.passed);
+        assert_eq!(unit_check.severity, "warning");
+        assert!(unit_check
+            .description
+            .contains("no declared error budget"));
+
+        let details = unit_check
+            .details
+            .as_ref()
+            .expect("unit compatibility details should be present");
+        assert_eq!(
+            details.get("compatibility_mode"),
+            Some(&json!("unbounded_transform"))
+        );
+        assert_eq!(details.get("confidence_score"), Some(&json!(0.75)));
+        assert_eq!(
+            details.get("requires_runtime_verification"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn interface_validation_records_bounded_coordinate_transform_error_budget() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        storage_manager
+            .put_system(&sample_system("provider-system", "Provider"))
+            .expect("provider system should be stored");
+        storage_manager
+            .put_system(&sample_system("consumer-system", "Consumer"))
+            .expect("consumer system should be stored");
+
+        let provider = sample_interface("provider-if", "provider-system", "SI");
+        let mut consumer = sample_interface("consumer-if", "consumer-system", "SI");
+        consumer.coordinate_system = Some("ECI_J2000".to_string());
+
+        storage_manager
+            .put_interface(&provider)
+            .expect("provider interface should be stored");
+        storage_manager
+            .put_interface(&consumer)
+            .expect("consumer interface should be stored");
+
+        let mut contract = sample_contract("contract-1", "provider-if", "consumer-if");
+        contract.transformation_rules = HashMap::from([(
+            "coordinate_transform".to_string(),
+            json!({
+                "from": "WGS84",
+                "to": "ECI_J2000",
+                "strategy": "helmert",
+                "translation_m": [1.0, 2.0, 3.0],
+                "rotation_arcsec": [0.1, 0.2, 0.3],
+                "scale_ppm": 0.0,
+                "tolerance_m": 5.0
+            }),
+        )]);
+        storage_manager
+            .put_contract(&contract)
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(response.passed);
+        assert!(response.confidence < 1.0);
+        assert_eq!(
+            response.compatibility_state,
+            Some(CompatibilityState::Transformable)
+        );
+
+        let coordinate_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "coordinate_compatibility")
+            .expect("coordinate compatibility check should be present");
+        assert!(coordinate_check.passed);
+        assert_eq!(coordinate_check.severity, "info");
+        assert!(coordinate_check.description.contains("tolerance_m=5"));
+
+        let details = coordinate_check
+            .details
+            .as_ref()
+            .expect("coordinate compatibility details should be present");
+        assert_eq!(
+            details.get("compatibility_mode"),
+            Some(&json!("bounded_transform"))
+        );
+        assert_eq!(details.get("confidence_score"), Some(&json!(0.9)));
+        assert_eq!(
+            details.get("requires_runtime_verification"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            details.get("declared_error_budget"),
+            Some(&json!({
+                "value": 5.0,
+                "label": "m"
+            }))
+        );
     }
 
     #[test]
@@ -4448,6 +5217,10 @@ mod tests {
             .expect("transformability validation should execute");
 
         assert!(!response.passed);
+        assert_eq!(
+            response.compatibility_state,
+            Some(CompatibilityState::Transformable)
+        );
 
         let schema_check = response
             .checks
@@ -4466,6 +5239,86 @@ mod tests {
         assert!(transformability_check
             .description
             .contains("$.payload.priority"));
+    }
+
+    #[test]
+    fn interface_validation_reports_semantically_equivalent_when_no_transforms_are_needed() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        storage_manager
+            .put_system(&sample_system("provider-system", "Provider"))
+            .expect("provider system should be stored");
+        storage_manager
+            .put_system(&sample_system("consumer-system", "Consumer"))
+            .expect("consumer system should be stored");
+
+        let provider = sample_interface("provider-if", "provider-system", "SI");
+        let mut consumer = sample_interface("consumer-if", "consumer-system", "SI");
+        consumer.coordinate_system = Some("WGS84".to_string());
+
+        storage_manager
+            .put_interface(&provider)
+            .expect("provider interface should be stored");
+        storage_manager
+            .put_interface(&consumer)
+            .expect("consumer interface should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(response.passed);
+        assert_eq!(
+            response.compatibility_state,
+            Some(CompatibilityState::SemanticallyEquivalent)
+        );
+    }
+
+    #[test]
+    fn interface_validation_reports_syntactically_compatible_when_semantic_metadata_is_absent() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        storage_manager
+            .put_system(&sample_system("provider-system", "Provider"))
+            .expect("provider system should be stored");
+        storage_manager
+            .put_system(&sample_system("consumer-system", "Consumer"))
+            .expect("consumer system should be stored");
+
+        let mut provider = sample_interface("provider-if", "provider-system", "SI");
+        provider.unit_system = None;
+        provider.coordinate_system = None;
+
+        let mut consumer = sample_interface("consumer-if", "consumer-system", "SI");
+        consumer.unit_system = None;
+        consumer.coordinate_system = None;
+
+        storage_manager
+            .put_interface(&provider)
+            .expect("provider interface should be stored");
+        storage_manager
+            .put_interface(&consumer)
+            .expect("consumer interface should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::InterfaceCompatibility {
+                    provider_interface_id: "provider-if".to_string(),
+                    consumer_interface_id: "consumer-if".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("interface compatibility should execute");
+
+        assert!(response.passed);
+        assert_eq!(
+            response.compatibility_state,
+            Some(CompatibilityState::SyntacticallyCompatible)
+        );
     }
 
     #[test]
@@ -5106,6 +5959,29 @@ mod tests {
                 ValidationExecutionOptions::persisted(),
             )
             .expect("data validation should succeed");
+        assert_eq!(response.compatibility_state, None);
+        let schema_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "schema_validation")
+            .expect("schema validation check should be present");
+        let schema_details = schema_check
+            .details
+            .as_ref()
+            .expect("schema validation should include normalized confidence details");
+        assert_eq!(schema_details.get("confidence_score"), Some(&json!(1.0)));
+        assert_eq!(
+            schema_details.get("confidence_category"),
+            Some(&json!("passed_check"))
+        );
+        assert_eq!(
+            response
+                .confidence_assessment
+                .as_ref()
+                .expect("confidence assessment should be present")
+                .failed_check_count,
+            0
+        );
 
         let report = storage_manager
             .get_validation_report(
@@ -5230,6 +6106,23 @@ mod tests {
             response.passed,
             "advisory policies should not fail the enclosing validation"
         );
+        assert!(
+            response.confidence > 0.0 && response.confidence < 1.0,
+            "non-blocking advisory failures should reduce confidence without zeroing it"
+        );
+        let confidence_assessment = response
+            .confidence_assessment
+            .as_ref()
+            .expect("confidence assessment should be present");
+        assert_eq!(confidence_assessment.method, "per_check_average_v2");
+        assert_eq!(confidence_assessment.failed_check_count, 1);
+        assert_eq!(confidence_assessment.warning_check_count, 1);
+        assert!(
+            confidence_assessment
+                .summary
+                .contains("non-blocking warning failure"),
+            "summary should explain why confidence dropped"
+        );
 
         let report = storage_manager
             .get_validation_report(
@@ -5257,6 +6150,11 @@ mod tests {
             Some(&json!("advisory"))
         );
         assert_eq!(details.get("policy_blocking"), Some(&json!(false)));
+        assert_eq!(details.get("confidence_score"), Some(&json!(0.65)));
+        assert_eq!(
+            details.get("confidence_category"),
+            Some(&json!("non_blocking_policy_failure"))
+        );
     }
 
     #[test]
@@ -5290,6 +6188,19 @@ mod tests {
             !response.passed,
             "direct policy evaluation should still report the raw policy failure"
         );
+        assert_eq!(response.confidence, 0.0);
+        let confidence_assessment = response
+            .confidence_assessment
+            .as_ref()
+            .expect("confidence assessment should be present");
+        assert_eq!(confidence_assessment.failed_check_count, 1);
+        assert!(
+            confidence_assessment
+                .contributors
+                .iter()
+                .any(|contributor| contributor.category == "blocking_failure"),
+            "blocking direct policy failures should be called out explicitly"
+        );
         let policy_check = response
             .checks
             .iter()
@@ -5307,6 +6218,10 @@ mod tests {
         assert!(
             details.get("policy_execution_mode").is_none(),
             "direct evaluation should not be rewritten as an automatic rollout mode"
+        );
+        assert_eq!(
+            details.get("confidence_category"),
+            Some(&json!("blocking_failure"))
         );
     }
 
@@ -5474,6 +6389,71 @@ mod tests {
         assert!(report
             .policy_refs
             .contains(&"policy:payload-policy".to_string()));
+    }
+
+    #[test]
+    fn system_integration_propagates_nested_interface_confidence() {
+        let (_temp_dir, storage_manager, service) = create_service();
+        register_minimal_catalog(&storage_manager);
+        storage_manager
+            .put_contract(&sample_contract("contract-1", "provider-if", "consumer-if"))
+            .expect("contract should be stored");
+
+        let response = service
+            .validate_spec(
+                SosValidationSpec::SystemIntegration {
+                    source_system_id: "provider-system".to_string(),
+                    target_system_id: "consumer-system".to_string(),
+                },
+                ValidationExecutionOptions::dry_run(),
+            )
+            .expect("system integration validation should execute");
+
+        assert!(response.passed);
+        assert_eq!(response.compatibility_state, None);
+        assert!(
+            response.confidence < 1.0,
+            "transform-backed path confidence should flow into the system-level score"
+        );
+
+        let path_check = response
+            .checks
+            .iter()
+            .find(|check| check.check_name == "contract_path:provider-if:consumer-if")
+            .expect("contract-backed path check should be present");
+        let details = path_check
+            .details
+            .as_ref()
+            .expect("path check should include nested confidence details");
+        assert_eq!(
+            details.get("nested_validation_type"),
+            Some(&json!("interface_compatibility"))
+        );
+        assert_eq!(
+            details.get("compatibility_state"),
+            Some(&json!("transformable"))
+        );
+        let path_confidence = details
+            .get("confidence_score")
+            .and_then(Value::as_f64)
+            .expect("nested path should expose a numeric confidence score");
+        assert!(path_confidence > 0.9 && path_confidence < 1.0);
+        assert_eq!(
+            details.get("confidence_source"),
+            Some(&json!("nested_validation"))
+        );
+
+        let confidence_assessment = response
+            .confidence_assessment
+            .as_ref()
+            .expect("confidence assessment should be present");
+        assert!(
+            confidence_assessment
+                .contributors
+                .iter()
+                .any(|contributor| contributor.check_name == "contract_path:provider-if:consumer-if"),
+            "the nested path should be surfaced as a material confidence contributor"
+        );
     }
 
     #[test]
@@ -6038,6 +7018,7 @@ mod tests {
             .expect("provider/consumer matrix entry should exist");
 
         assert_eq!(persisted_entry.score, 0.42);
+        assert_eq!(persisted_entry.compatibility_state, None);
         assert_eq!(persisted_entry.details.len(), 1);
         assert_eq!(persisted_entry.details[0].aspect, "persisted_check");
     }

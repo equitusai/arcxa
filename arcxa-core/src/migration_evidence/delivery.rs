@@ -2,11 +2,11 @@ use super::{
     MigrationEvidenceDeliveryMode, MigrationEvidenceDispatchSummary, MigrationEvidenceEvent,
     MigrationEvidenceEventEnvelope,
 };
-use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use crate::distributed::proto::migration_evidence::{
     traceability_service_client::TraceabilityServiceClient, IngestEventsRequest,
 };
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
@@ -15,7 +15,10 @@ use std::time::Duration;
 
 #[async_trait]
 pub trait MigrationEvidenceEventForwarder: Send + Sync {
-    async fn ingest_events(&self, events: Vec<MigrationEvidenceEvent>) -> Result<MigrationEvidenceDispatchSummary>;
+    async fn ingest_events(
+        &self,
+        events: Vec<MigrationEvidenceEvent>,
+    ) -> Result<MigrationEvidenceDispatchSummary>;
 }
 
 #[derive(Clone)]
@@ -33,7 +36,10 @@ impl GrpcMigrationEvidenceEventForwarder {
 
 #[async_trait]
 impl MigrationEvidenceEventForwarder for GrpcMigrationEvidenceEventForwarder {
-    async fn ingest_events(&self, events: Vec<MigrationEvidenceEvent>) -> Result<MigrationEvidenceDispatchSummary> {
+    async fn ingest_events(
+        &self,
+        events: Vec<MigrationEvidenceEvent>,
+    ) -> Result<MigrationEvidenceDispatchSummary> {
         let mut client = TraceabilityServiceClient::connect(self.endpoint.clone()).await?;
         let response = client
             .ingest_events(IngestEventsRequest {
@@ -84,7 +90,10 @@ impl KafkaMigrationEvidenceEventForwarder {
 
 #[async_trait]
 impl MigrationEvidenceEventForwarder for KafkaMigrationEvidenceEventForwarder {
-    async fn ingest_events(&self, events: Vec<MigrationEvidenceEvent>) -> Result<MigrationEvidenceDispatchSummary> {
+    async fn ingest_events(
+        &self,
+        events: Vec<MigrationEvidenceEvent>,
+    ) -> Result<MigrationEvidenceDispatchSummary> {
         for event in &events {
             let envelope = MigrationEvidenceEventEnvelope::from_event(event.clone());
             let key = envelope.partition_key();
@@ -97,7 +106,9 @@ impl MigrationEvidenceEventForwarder for KafkaMigrationEvidenceEventForwarder {
                     Duration::from_secs(5),
                 )
                 .await
-                .map_err(|(error, _)| anyhow!("failed to publish migration evidence event to Kafka: {error}"))?;
+                .map_err(|(error, _)| {
+                    anyhow!("failed to publish migration evidence event to Kafka: {error}")
+                })?;
         }
 
         Ok(MigrationEvidenceDispatchSummary::from_events(

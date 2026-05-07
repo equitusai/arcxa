@@ -111,9 +111,10 @@ pub fn discover_sap_s4_odata_capabilities(
                         current_schema_namespace = attribute_value(&event, "Namespace");
                     }
                     "EntityType" => {
-                        if let (Some(namespace), Some(name)) =
-                            (current_schema_namespace.clone(), attribute_value(&event, "Name"))
-                        {
+                        if let (Some(namespace), Some(name)) = (
+                            current_schema_namespace.clone(),
+                            attribute_value(&event, "Name"),
+                        ) {
                             let full_name = format!("{namespace}.{name}");
                             entity_keys.entry(full_name.clone()).or_default();
                             entity_properties.entry(full_name.clone()).or_default();
@@ -125,9 +126,10 @@ pub fn discover_sap_s4_odata_capabilities(
                     }
                     "PropertyRef" => {
                         if in_key_block {
-                            if let (Some(entity_type), Some(name)) =
-                                (current_entity_type.as_ref(), attribute_value(&event, "Name"))
-                            {
+                            if let (Some(entity_type), Some(name)) = (
+                                current_entity_type.as_ref(),
+                                attribute_value(&event, "Name"),
+                            ) {
                                 entity_keys
                                     .entry(entity_type.clone())
                                     .or_default()
@@ -171,9 +173,10 @@ pub fn discover_sap_s4_odata_capabilities(
                 match name.as_str() {
                     "PropertyRef" => {
                         if in_key_block {
-                            if let (Some(entity_type), Some(name)) =
-                                (current_entity_type.as_ref(), attribute_value(&event, "Name"))
-                            {
+                            if let (Some(entity_type), Some(name)) = (
+                                current_entity_type.as_ref(),
+                                attribute_value(&event, "Name"),
+                            ) {
                                 entity_keys
                                     .entry(entity_type.clone())
                                     .or_default()
@@ -228,8 +231,7 @@ pub fn discover_sap_s4_odata_capabilities(
         buf.clear();
     }
 
-    let entity_set = entity_set_from_path
-        .or_else(|| entity_sets.keys().next().cloned());
+    let entity_set = entity_set_from_path.or_else(|| entity_sets.keys().next().cloned());
     let entity_type = entity_set
         .as_ref()
         .and_then(|name| entity_sets.get(name))
@@ -345,10 +347,9 @@ pub fn merge_sap_s4_odata_page_payloads(current: Value, next_page: Value) -> Val
             merged.append(&mut right);
             Value::Array(merged)
         }
-        (Value::Object(left), Value::Object(right)) => Value::Array(vec![
-            Value::Object(left),
-            Value::Object(right),
-        ]),
+        (Value::Object(left), Value::Object(right)) => {
+            Value::Array(vec![Value::Object(left), Value::Object(right)])
+        }
         (_, next) => next,
     }
 }
@@ -378,7 +379,9 @@ pub fn resolve_sap_s4_odata_value(payload: Value, preferred_paths: &[&str]) -> R
     }
 
     match normalized {
-        Value::Array(items) if items.len() == 1 => Ok(items.into_iter().next().unwrap_or(Value::Null)),
+        Value::Array(items) if items.len() == 1 => {
+            Ok(items.into_iter().next().unwrap_or(Value::Null))
+        }
         value => Ok(value),
     }
 }
@@ -485,18 +488,18 @@ fn local_name(name: &[u8]) -> String {
     raw.rsplit(':').next().unwrap_or(raw.as_ref()).to_string()
 }
 
-fn attribute_value(event: &quick_xml::events::BytesStart<'_>, attribute_name: &str) -> Option<String> {
-    event
-        .attributes()
-        .flatten()
-        .find_map(|attribute| {
-            let key = local_name(attribute.key.as_ref());
-            if key == attribute_name {
-                Some(String::from_utf8_lossy(attribute.value.as_ref()).to_string())
-            } else {
-                None
-            }
-        })
+fn attribute_value(
+    event: &quick_xml::events::BytesStart<'_>,
+    attribute_name: &str,
+) -> Option<String> {
+    event.attributes().flatten().find_map(|attribute| {
+        let key = local_name(attribute.key.as_ref());
+        if key == attribute_name {
+            Some(String::from_utf8_lossy(attribute.value.as_ref()).to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn detect_odata_version(metadata_document: &str) -> SapS4ODataVersion {
@@ -514,7 +517,10 @@ fn detect_odata_version(metadata_document: &str) -> SapS4ODataVersion {
 }
 
 fn parse_sap_s4_odata_select_fields(request_path: &str) -> Vec<String> {
-    let query = request_path.split_once('?').map(|(_, query)| query).unwrap_or("");
+    let query = request_path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("");
     if query.is_empty() {
         return Vec::new();
     }
@@ -688,8 +694,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(capabilities.version, SapS4ODataVersion::V4);
-        assert_eq!(capabilities.service_root_path, "/sap/opu/odata4/API_SALES_ORDER");
-        assert_eq!(capabilities.metadata_path, "/sap/opu/odata4/API_SALES_ORDER/$metadata");
+        assert_eq!(
+            capabilities.service_root_path,
+            "/sap/opu/odata4/API_SALES_ORDER"
+        );
+        assert_eq!(
+            capabilities.metadata_path,
+            "/sap/opu/odata4/API_SALES_ORDER/$metadata"
+        );
         assert_eq!(capabilities.entity_set, Some("A_SalesOrder".to_string()));
         assert_eq!(
             capabilities.entity_type,
@@ -822,7 +834,10 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(projection.requested_fields, vec!["UnknownField".to_string()]);
+        assert_eq!(
+            projection.requested_fields,
+            vec!["UnknownField".to_string()]
+        );
         assert_eq!(projection.missing_fields, vec!["UnknownField".to_string()]);
     }
 

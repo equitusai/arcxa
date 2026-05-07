@@ -10,38 +10,77 @@ use graphica_core::distributed::proto::migration_evidence::{
     RunVerificationResponse,
 };
 use graphica_core::migration_evidence::{
-    derive_sap_ecc_projection_fields, derive_sap_s4_odata_projection_fields,
-    derive_sap_ecc_rfc_bapi_projection_fields, extract_sap_ecc_adapter_next_path,
-    extract_sap_ecc_rfc_bapi_next_cursor, extract_sap_s4_odata_next_link,
-    merge_sap_ecc_adapter_page_payloads, merge_sap_ecc_rfc_bapi_page_payloads,
-    merge_sap_s4_odata_page_payloads, resolve_sap_ecc_adapter_value,
-    resolve_sap_ecc_rfc_bapi_value, resolve_sap_s4_odata_value, verification_result_to_events,
-    ConnectorTransport, ControlResult, ControlStatus, ExecutionEvent, ExecutionStatus,
-    ExceptionRecord, ExceptionSeverity, ExceptionStatus, MigrationEvidenceEventForwarder,
-    SapEccAdapterCapabilities, SapEccAdapterField, SapEccProjectionFields,
-    SapEccRfcBapiCapabilities, SapEccRfcBapiField, SapEccRfcBapiProjectionFields,
-    SapS4ODataCapabilities, SapS4ODataProjectionFields, SapS4ODataProperty, SapS4ODataVersion,
-    VerificationDispatchRequest, VerificationDispatchResult, VerificationRequest,
-    VerificationResult,
+    derive_sap_ecc_projection_fields, derive_sap_ecc_rfc_bapi_projection_fields,
+    derive_sap_s4_odata_projection_fields, extract_json_path_value,
+    extract_sap_ecc_adapter_next_path, extract_sap_ecc_rfc_bapi_next_cursor_from_path,
+    extract_sap_s4_odata_next_link, merge_sap_ecc_adapter_page_payloads,
+    merge_sap_ecc_rfc_bapi_page_payloads, merge_sap_s4_odata_page_payloads, resolve_connector_auth,
+    resolve_sap_ecc_adapter_value, resolve_sap_ecc_rfc_bapi_value, resolve_sap_s4_odata_value,
+    verification_result_to_events, ConnectorAuth, ConnectorAuthResolutionMetadata,
+    ConnectorTransport, ControlResult, ControlStatus, ExceptionRecord, ExceptionSeverity,
+    ExceptionStatus, ExecutionEvent, ExecutionStatus, MigrationEvidenceEventForwarder,
+    SapEccAdapterCapabilities, SapEccAdapterField, SapEccBackendAuthMode, SapEccProjectionFields,
+    SapEccRfcBapiCapabilities, SapEccRfcBapiField, SapEccRfcBapiProfile,
+    SapEccRfcBapiProjectionFields, SapEccSessionMode, SapS4ODataCapabilities,
+    SapS4ODataProjectionFields, SapS4ODataProperty, SapS4ODataVersion, VerificationDispatchRequest,
+    VerificationDispatchResult, VerificationRequest, VerificationResult,
 };
+use graphica_core::secrets::providers::SecretStoreRegistry;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub struct VerificationManager {
     event_forwarder: Arc<dyn MigrationEvidenceEventForwarder>,
+    secret_store_registry: Option<Arc<SecretStoreRegistry>>,
+    session_cache: Arc<Mutex<HashMap<String, CachedBridgeSession>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedBridgeSession {
+    session_id: String,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BridgeSessionOutcome {
+    session_id_present: bool,
+    session_reused: bool,
+    session_closed: bool,
+    session_ttl_seconds: Option<u64>,
 }
 
 impl VerificationManager {
     pub fn new(event_forwarder: Arc<dyn MigrationEvidenceEventForwarder>) -> Self {
-        Self { event_forwarder }
+        Self {
+            event_forwarder,
+            secret_store_registry: None,
+            session_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
-    pub async fn run_verification(&self, request: VerificationRequest) -> Result<VerificationResult> {
+    pub fn with_secret_store_registry(mut self, registry: Arc<SecretStoreRegistry>) -> Self {
+        self.secret_store_registry = Some(registry);
+        self
+    }
+
+    async fn resolve_connector_auth(
+        &self,
+        auth: &ConnectorAuth,
+    ) -> Result<graphica_core::migration_evidence::ResolvedConnectorAuth> {
+        resolve_connector_auth(auth, self.secret_store_registry.clone()).await
+    }
+
+    pub async fn run_verification(
+        &self,
+        request: VerificationRequest,
+    ) -> Result<VerificationResult> {
+        let resolved_auth = self.resolve_connector_auth(&request.source.auth).await?;
         let mut s4_odata_context = None;
         let mut ecc_adapter_context = None;
         let mut ecc_rfc_context = None;
@@ -52,7 +91,8 @@ impl VerificationManager {
                     .endpoint
                     .clone()
                     .ok_or_else(|| anyhow!("http_json verification requires endpoint"))?;
-                self.fetch_http_json_actual_value(&endpoint, &request.source.auth).await?
+                self.fetch_http_json_actual_value(&endpoint, &resolved_auth.auth)
+                    .await?
             }
             ConnectorTransport::SapS4OData => {
                 let endpoint = request
@@ -62,7 +102,7 @@ impl VerificationManager {
                     .ok_or_else(|| anyhow!("sap_s4_odata verification requires endpoint"))?;
                 self.fetch_s4_odata_actual_value(
                     &endpoint,
-                    &request.source.auth,
+                    &resolved_auth.auth,
                     &request.source.connection,
                     &request.target_field.field_path,
                     request.expected_value.as_ref(),
@@ -79,8 +119,12 @@ impl VerificationManager {
                     .query
                     .clone()
                     .ok_or_else(|| anyhow!("sap_hana_sql verification requires query"))?;
-                self.fetch_hana_actual_value(&request.source.connection, &request.source.auth, &query)
-                    .await?
+                self.fetch_hana_actual_value(
+                    &request.source.connection,
+                    &resolved_auth.auth,
+                    &query,
+                )
+                .await?
             }
             ConnectorTransport::SapEccAdapter => {
                 let endpoint = request
@@ -90,7 +134,7 @@ impl VerificationManager {
                     .ok_or_else(|| anyhow!("sap_ecc_adapter verification requires endpoint"))?;
                 self.fetch_ecc_adapter_actual_value(
                     &endpoint,
-                    &request.source.auth,
+                    &resolved_auth.auth,
                     &request.source.connection,
                     &request.target_field.field_path,
                     request.expected_value.as_ref(),
@@ -102,14 +146,13 @@ impl VerificationManager {
                 })?
             }
             ConnectorTransport::SapEccRfcBapi => {
-                let endpoint = request
-                    .source
-                    .endpoint
-                    .clone()
-                    .ok_or_else(|| anyhow!("sap_ecc_rfc_bapi verification requires endpoint"))?;
+                let endpoint =
+                    request.source.endpoint.clone().ok_or_else(|| {
+                        anyhow!("sap_ecc_rfc_bapi verification requires endpoint")
+                    })?;
                 self.fetch_ecc_rfc_bapi_actual_value(
                     &endpoint,
-                    &request.source.auth,
+                    &resolved_auth.auth,
                     &request.source.connection,
                     &request.target_field.field_path,
                     request.expected_value.as_ref(),
@@ -130,6 +173,11 @@ impl VerificationManager {
                     "sap_idoc_extractor_package is an ingestion transport, not a live verification transport"
                 ));
             }
+            ConnectorTransport::SapOdpExtractorPackage => {
+                return Err(anyhow!(
+                    "sap_odp_extractor_package is an ingestion transport, not a live verification transport"
+                ));
+            }
             ConnectorTransport::ManualDrop => {
                 return Err(anyhow!(
                     "manual_drop transport is not supported for live verification"
@@ -143,6 +191,17 @@ impl VerificationManager {
             request.tolerance,
         );
         let mut control_metadata = merge_control_metadata(&request.metadata, &assessment);
+        apply_auth_resolution_metadata(
+            &mut control_metadata,
+            "source_auth_",
+            &resolved_auth.metadata,
+        );
+        let mut execution_metadata = request.metadata.clone();
+        apply_auth_resolution_metadata(
+            &mut execution_metadata,
+            "source_auth_",
+            &resolved_auth.metadata,
+        );
         let mut summary_override = None;
         if let Some(context) = s4_odata_context.as_ref() {
             apply_s4_odata_verification_metadata(&mut control_metadata, context);
@@ -187,8 +246,15 @@ impl VerificationManager {
                 ConnectorTransport::HttpJson => "sap_verification_api".to_string(),
                 ConnectorTransport::SapEccAdapter => "sap_ecc_adapter_verification".to_string(),
                 ConnectorTransport::SapEccRfcBapi => "sap_ecc_rfc_bapi_verification".to_string(),
-                ConnectorTransport::SapEccStagedExport => "sap_ecc_staged_export_ingest".to_string(),
-                ConnectorTransport::SapIdocExtractorPackage => "sap_idoc_extractor_ingest".to_string(),
+                ConnectorTransport::SapEccStagedExport => {
+                    "sap_ecc_staged_export_ingest".to_string()
+                }
+                ConnectorTransport::SapIdocExtractorPackage => {
+                    "sap_idoc_extractor_ingest".to_string()
+                }
+                ConnectorTransport::SapOdpExtractorPackage => {
+                    "sap_odp_extractor_ingest".to_string()
+                }
                 ConnectorTransport::SapS4OData => "sap_s4_odata_verification".to_string(),
                 ConnectorTransport::SapHanaSql => "sap_hana_verification".to_string(),
                 ConnectorTransport::ManualDrop => "verification".to_string(),
@@ -206,7 +272,7 @@ impl VerificationManager {
             target_snapshot_ref: None,
             records_examined: Some(1),
             records_affected: Some(1),
-            metadata: request.metadata.clone(),
+            metadata: execution_metadata,
         };
 
         let control_result = ControlResult {
@@ -274,8 +340,13 @@ impl VerificationManager {
             request.vendor,
             verification_result.clone(),
         )
-        .context("failed to translate verification result into canonical migration evidence events")?;
-        let dispatch_summary = self.event_forwarder.ingest_events(emitted_events.clone()).await?;
+        .context(
+            "failed to translate verification result into canonical migration evidence events",
+        )?;
+        let dispatch_summary = self
+            .event_forwarder
+            .ingest_events(emitted_events.clone())
+            .await?;
 
         Ok(VerificationDispatchResult {
             verification_result,
@@ -382,6 +453,8 @@ impl VerificationManager {
         }
 
         let capabilities = parse_ecc_adapter_capabilities(connection);
+        let request_config = parse_ecc_adapter_request_config(connection)?;
+        validate_ecc_adapter_runtime_requirements(capabilities.as_ref(), &request_config)?;
         let projection = derive_sap_ecc_projection_fields(
             capabilities.as_ref(),
             target_field_path,
@@ -389,8 +462,48 @@ impl VerificationManager {
             connection,
         );
         let pagination = parse_ecc_adapter_pagination_config(connection);
+        let session_config =
+            parse_ecc_adapter_session_config(connection, capabilities.as_ref(), &request_config);
+        let missing_required_parameters = find_missing_required_adapter_parameters(
+            endpoint,
+            &request_config.request_parameters,
+            capabilities.as_ref(),
+        )?;
+        if !missing_required_parameters.is_empty() {
+            return Err(anyhow!(
+                "sap_ecc_adapter verification is missing required request parameter(s): {}",
+                missing_required_parameters.join(", ")
+            ));
+        }
+        let mut effective_request_parameters = request_config.request_parameters.clone();
+        if let Some(language) = request_config.language.as_deref() {
+            let parameter_name = capabilities
+                .as_ref()
+                .and_then(|caps| caps.language_parameter_name.as_deref())
+                .or_else(|| {
+                    connection
+                        .get("ecc_language_parameter_name")
+                        .map(String::as_str)
+                })
+                .unwrap_or("language");
+            effective_request_parameters
+                .entry(parameter_name.to_string())
+                .or_insert_with(|| language.to_string());
+        }
+        if let Some(page_size) = request_config.page_size {
+            effective_request_parameters
+                .entry(pagination.page_size_parameter_name.clone())
+                .or_insert_with(|| page_size.to_string());
+        }
         let response = self
-            .request_ecc_adapter_payload(endpoint, auth, extra_headers, &pagination)
+            .request_ecc_adapter_payload(
+                endpoint,
+                auth,
+                extra_headers,
+                &effective_request_parameters,
+                &pagination,
+                &session_config,
+            )
             .await?;
         let explicit_path = connection
             .get("ecc_value_path")
@@ -415,6 +528,16 @@ impl VerificationManager {
             actual_value,
             projection,
             metadata_capabilities: capabilities,
+            request_parameters: effective_request_parameters,
+            missing_required_parameters,
+            session_mode: request_config.session_mode,
+            backend_auth_mode: request_config.backend_auth_mode,
+            language: request_config.language,
+            page_size: request_config.page_size,
+            session_id_present: response.session.session_id_present,
+            session_reused: response.session.session_reused,
+            session_closed: response.session.session_closed,
+            session_ttl_seconds: response.session.session_ttl_seconds,
             page_count: response.page_count,
             paginated: response.page_count > 1,
             pagination_truncated: response.truncated,
@@ -446,6 +569,8 @@ impl VerificationManager {
         }
 
         let capabilities = parse_ecc_rfc_bapi_capabilities(connection);
+        let request_config = parse_ecc_rfc_request_config(connection)?;
+        validate_ecc_rfc_runtime_requirements(capabilities.as_ref(), &request_config)?;
         let projection = derive_sap_ecc_rfc_bapi_projection_fields(
             capabilities.as_ref(),
             target_field_path,
@@ -453,8 +578,48 @@ impl VerificationManager {
             connection,
         );
         let pagination = parse_ecc_rfc_bapi_pagination_config(connection);
+        let session_config =
+            parse_ecc_rfc_session_config(connection, capabilities.as_ref(), &request_config);
+        let mut request_parameters = request_config.request_parameters.clone();
+        if let Some(language) = request_config.language.as_deref() {
+            let parameter_name = capabilities
+                .as_ref()
+                .and_then(|caps| caps.language_parameter_name.as_deref())
+                .or_else(|| {
+                    connection
+                        .get("ecc_rfc_language_parameter_name")
+                        .map(String::as_str)
+                })
+                .unwrap_or("language");
+            request_parameters
+                .entry(parameter_name.to_string())
+                .or_insert_with(|| language.to_string());
+        }
+        if let Some(page_size) = request_config.page_size {
+            request_parameters
+                .entry(pagination.page_size_parameter_name.clone())
+                .or_insert_with(|| page_size.to_string());
+        }
+        let missing_required_parameters = find_missing_required_rfc_parameters(
+            endpoint,
+            &request_parameters,
+            capabilities.as_ref(),
+        )?;
+        if !missing_required_parameters.is_empty() {
+            return Err(anyhow!(
+                "sap_ecc_rfc_bapi verification is missing required request parameter(s): {}",
+                missing_required_parameters.join(", ")
+            ));
+        }
         let response = self
-            .request_ecc_rfc_bapi_payload(endpoint, auth, extra_headers, &pagination)
+            .request_ecc_rfc_bapi_payload(
+                endpoint,
+                auth,
+                extra_headers,
+                &request_parameters,
+                &pagination,
+                &session_config,
+            )
             .await?;
         let explicit_path = connection
             .get("ecc_rfc_value_path")
@@ -478,6 +643,17 @@ impl VerificationManager {
         Ok(SapEccRfcBapiVerificationOutcome {
             actual_value,
             projection,
+            profile: capabilities.as_ref().map(|caps| caps.profile.clone()),
+            request_parameters,
+            missing_required_parameters,
+            session_mode: request_config.session_mode,
+            backend_auth_mode: request_config.backend_auth_mode,
+            language: request_config.language,
+            page_size: request_config.page_size,
+            session_id_present: response.session.session_id_present,
+            session_reused: response.session.session_reused,
+            session_closed: response.session.session_closed,
+            session_ttl_seconds: response.session.session_ttl_seconds,
             metadata_capabilities: capabilities,
             page_count: response.page_count,
             paginated: response.page_count > 1,
@@ -495,7 +671,11 @@ impl VerificationManager {
     ) -> Result<Value> {
         let method = reqwest::Method::from_bytes(endpoint.method.as_bytes())
             .context("invalid HTTP method")?;
-        let url = format!("{}{}", endpoint.base_url.trim_end_matches('/'), endpoint.path);
+        let url = format!(
+            "{}{}",
+            endpoint.base_url.trim_end_matches('/'),
+            endpoint.path
+        );
         self.request_json_url(&url, method, &endpoint.headers, auth, extra_headers)
             .await
     }
@@ -509,12 +689,28 @@ impl VerificationManager {
         let source = build_hana_source(connection)?;
         let connector = SAPHANAConnector::new();
         let credentials = Credentials {
-            username: auth.username.clone().unwrap_or_else(|| connection.get("username").cloned().unwrap_or_default()),
-            password: auth.password.clone().unwrap_or_else(|| connection.get("password").cloned().unwrap_or_default()),
-            additional: ["odbc_driver", "odbc_dsn", "odbc_connection_string", "odbc_options"]
-                .into_iter()
-                .filter_map(|key| connection.get(key).cloned().map(|value| (key.to_string(), value)))
-                .collect(),
+            username: auth
+                .username
+                .clone()
+                .unwrap_or_else(|| connection.get("username").cloned().unwrap_or_default()),
+            password: auth
+                .password
+                .clone()
+                .unwrap_or_else(|| connection.get("password").cloned().unwrap_or_default()),
+            additional: [
+                "odbc_driver",
+                "odbc_dsn",
+                "odbc_connection_string",
+                "odbc_options",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                connection
+                    .get(key)
+                    .cloned()
+                    .map(|value| (key.to_string(), value))
+            })
+            .collect(),
         };
         let result = connector
             .execute_query(&source, credentials, query, HashMap::new(), Some(1), 30)
@@ -540,6 +736,16 @@ struct SapEccAdapterVerificationOutcome {
     actual_value: Value,
     projection: SapEccProjectionFields,
     metadata_capabilities: Option<SapEccAdapterCapabilities>,
+    request_parameters: HashMap<String, String>,
+    missing_required_parameters: Vec<String>,
+    session_mode: Option<SapEccSessionMode>,
+    backend_auth_mode: Option<SapEccBackendAuthMode>,
+    language: Option<String>,
+    page_size: Option<usize>,
+    session_id_present: bool,
+    session_reused: bool,
+    session_closed: bool,
+    session_ttl_seconds: Option<u64>,
     page_count: usize,
     paginated: bool,
     pagination_truncated: bool,
@@ -552,6 +758,17 @@ struct SapEccRfcBapiVerificationOutcome {
     actual_value: Value,
     projection: SapEccRfcBapiProjectionFields,
     metadata_capabilities: Option<SapEccRfcBapiCapabilities>,
+    profile: Option<SapEccRfcBapiProfile>,
+    request_parameters: HashMap<String, String>,
+    missing_required_parameters: Vec<String>,
+    session_mode: Option<SapEccSessionMode>,
+    backend_auth_mode: Option<SapEccBackendAuthMode>,
+    language: Option<String>,
+    page_size: Option<usize>,
+    session_id_present: bool,
+    session_reused: bool,
+    session_closed: bool,
+    session_ttl_seconds: Option<u64>,
     page_count: usize,
     paginated: bool,
     pagination_truncated: bool,
@@ -575,6 +792,7 @@ struct SapEccAdapterPageFetchResult {
     page_count: usize,
     truncated: bool,
     next_path_remaining: Option<String>,
+    session: BridgeSessionOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -584,6 +802,7 @@ struct SapEccRfcBapiPageFetchResult {
     page_count: usize,
     truncated: bool,
     next_cursor_remaining: Option<String>,
+    session: BridgeSessionOutcome,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -592,16 +811,60 @@ struct SapS4ODataPaginationConfig {
     max_pages: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SapEccAdapterPaginationConfig {
     follow_next_path: bool,
     max_pages: usize,
+    page_size_parameter_name: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SapEccRfcBapiPaginationConfig {
     follow_next_cursor: bool,
     max_pages: usize,
+    page_size_parameter_name: String,
+    cursor_parameter_name: String,
+    next_cursor_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SapEccAdapterSessionConfig {
+    session_mode: Option<SapEccSessionMode>,
+    session_id_path: Option<String>,
+    session_id_parameter_name: String,
+    close_session_path: Option<String>,
+    close_session_method: String,
+    requires_explicit_session_close: bool,
+    session_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SapEccRfcSessionConfig {
+    session_mode: Option<SapEccSessionMode>,
+    session_id_path: Option<String>,
+    session_id_parameter_name: String,
+    close_session_path: Option<String>,
+    close_session_method: String,
+    requires_explicit_session_close: bool,
+    session_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SapEccAdapterRequestConfig {
+    request_parameters: HashMap<String, String>,
+    session_mode: Option<SapEccSessionMode>,
+    backend_auth_mode: Option<SapEccBackendAuthMode>,
+    language: Option<String>,
+    page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SapEccRfcBapiRequestConfig {
+    request_parameters: HashMap<String, String>,
+    session_mode: Option<SapEccSessionMode>,
+    backend_auth_mode: Option<SapEccBackendAuthMode>,
+    language: Option<String>,
+    page_size: Option<usize>,
 }
 
 impl VerificationManager {
@@ -648,6 +911,92 @@ impl VerificationManager {
         Ok(value)
     }
 
+    async fn lookup_cached_session(&self, cache_key: &str) -> Option<CachedBridgeSession> {
+        let now = Utc::now();
+        let mut cache = self.session_cache.lock().await;
+        if let Some(entry) = cache.get(cache_key).cloned() {
+            if entry
+                .expires_at
+                .map(|expires_at| expires_at > now)
+                .unwrap_or(true)
+            {
+                return Some(entry);
+            }
+            cache.remove(cache_key);
+        }
+        None
+    }
+
+    async fn store_cached_session(
+        &self,
+        cache_key: &str,
+        session_id: &str,
+        ttl_seconds: Option<u64>,
+    ) {
+        let expires_at = ttl_seconds.and_then(|ttl| {
+            chrono::Duration::from_std(std::time::Duration::from_secs(ttl))
+                .ok()
+                .map(|duration| Utc::now() + duration)
+        });
+        self.session_cache.lock().await.insert(
+            cache_key.to_string(),
+            CachedBridgeSession {
+                session_id: session_id.to_string(),
+                expires_at,
+            },
+        );
+    }
+
+    async fn close_bridge_session(
+        &self,
+        base_url: &str,
+        auth: &graphica_core::migration_evidence::ConnectorAuth,
+        endpoint_headers: &HashMap<String, String>,
+        extra_headers: HashMap<String, String>,
+        method_name: &str,
+        close_path: &str,
+        session_parameter_name: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let method = reqwest::Method::from_bytes(method_name.as_bytes())
+            .with_context(|| format!("invalid bridge close-session HTTP method '{method_name}'"))?;
+        let url = append_query_parameters(
+            &resolve_s4_odata_next_link(base_url, close_path)?,
+            &HashMap::from([(session_parameter_name.to_string(), session_id.to_string())]),
+        )?;
+        let client = reqwest::Client::new();
+        let mut request = client.request(method, &url);
+        for (key, value) in endpoint_headers {
+            request = request.header(key, value);
+        }
+        for (key, value) in extra_headers {
+            request = request.header(key, value);
+        }
+        match auth.kind {
+            graphica_core::migration_evidence::ConnectorAuthKind::Bearer => {
+                if let Some(token) = auth.token.as_deref() {
+                    request = request.bearer_auth(token);
+                }
+            }
+            graphica_core::migration_evidence::ConnectorAuthKind::ApiKey => {
+                if let (Some(header), Some(api_key)) =
+                    (auth.header_name.as_deref(), auth.api_key.as_deref())
+                {
+                    request = request.header(header, api_key);
+                }
+            }
+            graphica_core::migration_evidence::ConnectorAuthKind::Basic => {
+                request = request.basic_auth(
+                    auth.username.clone().unwrap_or_default(),
+                    auth.password.clone(),
+                );
+            }
+            graphica_core::migration_evidence::ConnectorAuthKind::None => {}
+        }
+        request.send().await?.error_for_status()?;
+        Ok(())
+    }
+
     async fn request_s4_odata_payload(
         &self,
         endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
@@ -657,7 +1006,11 @@ impl VerificationManager {
     ) -> Result<SapS4ODataPageFetchResult> {
         let method = reqwest::Method::from_bytes(endpoint.method.as_bytes())
             .context("invalid SAP S/4 OData HTTP method")?;
-        let initial_url = format!("{}{}", endpoint.base_url.trim_end_matches('/'), endpoint.path);
+        let initial_url = format!(
+            "{}{}",
+            endpoint.base_url.trim_end_matches('/'),
+            endpoint.path
+        );
         let mut raw_payload = self
             .request_json_url(
                 &initial_url,
@@ -713,11 +1066,35 @@ impl VerificationManager {
         endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
         auth: &graphica_core::migration_evidence::ConnectorAuth,
         extra_headers: HashMap<String, String>,
+        request_parameters: &HashMap<String, String>,
         pagination: &SapEccAdapterPaginationConfig,
+        session: &SapEccAdapterSessionConfig,
     ) -> Result<SapEccAdapterPageFetchResult> {
         let method = reqwest::Method::from_bytes(endpoint.method.as_bytes())
             .context("invalid SAP ECC adapter HTTP method")?;
-        let initial_url = format!("{}{}", endpoint.base_url.trim_end_matches('/'), endpoint.path);
+        let base_url = format!(
+            "{}{}",
+            endpoint.base_url.trim_end_matches('/'),
+            endpoint.path
+        );
+        let cache_key = bridge_session_cache_key(&base_url, &session.session_id_parameter_name);
+        let cached_session = if matches!(session.session_mode, Some(SapEccSessionMode::Cached)) {
+            self.lookup_cached_session(&cache_key).await
+        } else {
+            None
+        };
+        let mut initial_parameters = request_parameters.clone();
+        let mut session_outcome = BridgeSessionOutcome {
+            session_reused: cached_session.is_some(),
+            session_ttl_seconds: session.session_ttl_seconds,
+            ..BridgeSessionOutcome::default()
+        };
+        if let Some(cached) = cached_session.as_ref() {
+            initial_parameters
+                .entry(session.session_id_parameter_name.clone())
+                .or_insert_with(|| cached.session_id.clone());
+        }
+        let initial_url = append_query_parameters(&base_url, &initial_parameters)?;
         let mut raw_payload = self
             .request_json_url(
                 &initial_url,
@@ -727,6 +1104,9 @@ impl VerificationManager {
                 extra_headers.clone(),
             )
             .await?;
+        let mut active_session_id =
+            extract_bridge_session_id(&raw_payload, session.session_id_path.as_deref());
+        session_outcome.session_id_present = active_session_id.is_some();
         let mut merged_payload = raw_payload.clone();
         let mut page_count = 1usize;
         let mut next_path_remaining = extract_sap_ecc_adapter_next_path(&raw_payload);
@@ -741,7 +1121,16 @@ impl VerificationManager {
                 break;
             }
 
-            let next_url = resolve_s4_odata_next_link(&initial_url, &next_path)?;
+            let mut next_url = resolve_s4_odata_next_link(&initial_url, &next_path)?;
+            if let Some(session_id) = active_session_id.as_deref() {
+                next_url = append_query_parameters(
+                    &next_url,
+                    &HashMap::from([(
+                        session.session_id_parameter_name.clone(),
+                        session_id.to_string(),
+                    )]),
+                )?;
+            }
             raw_payload = self
                 .request_json_url(
                     &next_url,
@@ -751,9 +1140,43 @@ impl VerificationManager {
                     extra_headers.clone(),
                 )
                 .await?;
-            merged_payload = merge_sap_ecc_adapter_page_payloads(merged_payload, raw_payload.clone());
+            merged_payload =
+                merge_sap_ecc_adapter_page_payloads(merged_payload, raw_payload.clone());
+            if let Some(session_id) =
+                extract_bridge_session_id(&raw_payload, session.session_id_path.as_deref())
+            {
+                active_session_id = Some(session_id);
+                session_outcome.session_id_present = true;
+            }
             next_path_remaining = extract_sap_ecc_adapter_next_path(&raw_payload);
             page_count += 1;
+        }
+
+        if let Some(session_id) = active_session_id.as_deref() {
+            match session.session_mode {
+                Some(SapEccSessionMode::Cached) => {
+                    self.store_cached_session(&cache_key, session_id, session.session_ttl_seconds)
+                        .await;
+                }
+                Some(SapEccSessionMode::Stateful)
+                    if session.requires_explicit_session_close
+                        && session.close_session_path.is_some() =>
+                {
+                    self.close_bridge_session(
+                        &base_url,
+                        auth,
+                        &endpoint.headers,
+                        extra_headers.clone(),
+                        session.close_session_method.as_str(),
+                        session.close_session_path.as_deref().unwrap_or_default(),
+                        &session.session_id_parameter_name,
+                        session_id,
+                    )
+                    .await?;
+                    session_outcome.session_closed = true;
+                }
+                _ => {}
+            }
         }
 
         let normalized_payload =
@@ -766,6 +1189,7 @@ impl VerificationManager {
             page_count,
             truncated,
             next_path_remaining,
+            session: session_outcome,
         })
     }
 
@@ -774,11 +1198,35 @@ impl VerificationManager {
         endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
         auth: &graphica_core::migration_evidence::ConnectorAuth,
         extra_headers: HashMap<String, String>,
+        request_parameters: &HashMap<String, String>,
         pagination: &SapEccRfcBapiPaginationConfig,
+        session: &SapEccRfcSessionConfig,
     ) -> Result<SapEccRfcBapiPageFetchResult> {
         let method = reqwest::Method::from_bytes(endpoint.method.as_bytes())
             .context("invalid SAP ECC RFC/BAPI bridge HTTP method")?;
-        let initial_url = format!("{}{}", endpoint.base_url.trim_end_matches('/'), endpoint.path);
+        let base_url = format!(
+            "{}{}",
+            endpoint.base_url.trim_end_matches('/'),
+            endpoint.path
+        );
+        let cache_key = bridge_session_cache_key(&base_url, &session.session_id_parameter_name);
+        let cached_session = if matches!(session.session_mode, Some(SapEccSessionMode::Cached)) {
+            self.lookup_cached_session(&cache_key).await
+        } else {
+            None
+        };
+        let mut initial_parameters = request_parameters.clone();
+        let mut session_outcome = BridgeSessionOutcome {
+            session_reused: cached_session.is_some(),
+            session_ttl_seconds: session.session_ttl_seconds,
+            ..BridgeSessionOutcome::default()
+        };
+        if let Some(cached) = cached_session.as_ref() {
+            initial_parameters
+                .entry(session.session_id_parameter_name.clone())
+                .or_insert_with(|| cached.session_id.clone());
+        }
+        let initial_url = append_query_parameters(&base_url, &initial_parameters)?;
         let mut raw_payload = self
             .request_json_url(
                 &initial_url,
@@ -788,9 +1236,15 @@ impl VerificationManager {
                 extra_headers.clone(),
             )
             .await?;
+        let mut active_session_id =
+            extract_bridge_session_id(&raw_payload, session.session_id_path.as_deref());
+        session_outcome.session_id_present = active_session_id.is_some();
         let mut merged_payload = raw_payload.clone();
         let mut page_count = 1usize;
-        let mut next_cursor_remaining = extract_sap_ecc_rfc_bapi_next_cursor(&raw_payload);
+        let mut next_cursor_remaining = extract_sap_ecc_rfc_bapi_next_cursor_from_path(
+            &raw_payload,
+            pagination.next_cursor_path.as_deref(),
+        );
         let mut truncated = false;
 
         while pagination.follow_next_cursor {
@@ -802,7 +1256,20 @@ impl VerificationManager {
                 break;
             }
 
-            let next_url = append_cursor_query(&initial_url, &next_cursor)?;
+            let mut next_url = append_cursor_query(
+                &initial_url,
+                &pagination.cursor_parameter_name,
+                &next_cursor,
+            )?;
+            if let Some(session_id) = active_session_id.as_deref() {
+                next_url = append_query_parameters(
+                    &next_url,
+                    &HashMap::from([(
+                        session.session_id_parameter_name.clone(),
+                        session_id.to_string(),
+                    )]),
+                )?;
+            }
             raw_payload = self
                 .request_json_url(
                     &next_url,
@@ -814,8 +1281,44 @@ impl VerificationManager {
                 .await?;
             merged_payload =
                 merge_sap_ecc_rfc_bapi_page_payloads(merged_payload, raw_payload.clone());
-            next_cursor_remaining = extract_sap_ecc_rfc_bapi_next_cursor(&raw_payload);
+            if let Some(session_id) =
+                extract_bridge_session_id(&raw_payload, session.session_id_path.as_deref())
+            {
+                active_session_id = Some(session_id);
+                session_outcome.session_id_present = true;
+            }
+            next_cursor_remaining = extract_sap_ecc_rfc_bapi_next_cursor_from_path(
+                &raw_payload,
+                pagination.next_cursor_path.as_deref(),
+            );
             page_count += 1;
+        }
+
+        if let Some(session_id) = active_session_id.as_deref() {
+            match session.session_mode {
+                Some(SapEccSessionMode::Cached) => {
+                    self.store_cached_session(&cache_key, session_id, session.session_ttl_seconds)
+                        .await;
+                }
+                Some(SapEccSessionMode::Stateful)
+                    if session.requires_explicit_session_close
+                        && session.close_session_path.is_some() =>
+                {
+                    self.close_bridge_session(
+                        &base_url,
+                        auth,
+                        &endpoint.headers,
+                        extra_headers.clone(),
+                        session.close_session_method.as_str(),
+                        session.close_session_path.as_deref().unwrap_or_default(),
+                        &session.session_id_parameter_name,
+                        session_id,
+                    )
+                    .await?;
+                    session_outcome.session_closed = true;
+                }
+                _ => {}
+            }
         }
 
         let normalized_payload =
@@ -828,6 +1331,7 @@ impl VerificationManager {
             page_count,
             truncated,
             next_cursor_remaining,
+            session: session_outcome,
         })
     }
 }
@@ -924,6 +1428,37 @@ fn parse_ecc_adapter_capabilities(
             .get("ecc_key_fields_json")
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
             .unwrap_or_default(),
+        required_parameters: connection
+            .get("ecc_required_parameters_json")
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .unwrap_or_default(),
+        supported_auth_modes: connection
+            .get("ecc_supported_auth_modes_json")
+            .and_then(|raw| serde_json::from_str::<Vec<SapEccBackendAuthMode>>(raw).ok())
+            .unwrap_or_default(),
+        supported_session_modes: connection
+            .get("ecc_supported_session_modes_json")
+            .and_then(|raw| serde_json::from_str::<Vec<SapEccSessionMode>>(raw).ok())
+            .unwrap_or_default(),
+        health_path: connection.get("ecc_health_path").cloned(),
+        session_id_path: connection.get("ecc_session_id_path").cloned(),
+        session_id_parameter_name: connection.get("ecc_session_id_parameter_name").cloned(),
+        close_session_path: connection.get("ecc_close_session_path").cloned(),
+        close_session_method: connection.get("ecc_close_session_method").cloned(),
+        requires_explicit_session_close: connection
+            .get("ecc_requires_explicit_session_close")
+            .map(|value| value == "true")
+            .unwrap_or(false),
+        session_ttl_seconds: connection
+            .get("ecc_session_ttl_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0),
+        max_page_size: connection
+            .get("ecc_max_page_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0),
+        page_size_parameter_name: connection.get("ecc_page_size_parameter_name").cloned(),
+        language_parameter_name: connection.get("ecc_language_parameter_name").cloned(),
         supports_record_projection: connection
             .get("ecc_supports_record_projection")
             .map(|value| value == "true")
@@ -952,10 +1487,16 @@ fn parse_ecc_adapter_pagination_config(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(25);
+    let page_size_parameter_name = connection
+        .get("ecc_page_size_parameter_name")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "page_size".to_string());
 
     SapEccAdapterPaginationConfig {
         follow_next_path,
         max_pages,
+        page_size_parameter_name,
     }
 }
 
@@ -976,6 +1517,20 @@ fn parse_ecc_rfc_bapi_capabilities(
     fields.sort_by(|left, right| left.name.cmp(&right.name));
 
     Some(SapEccRfcBapiCapabilities {
+        profile: connection
+            .get("ecc_rfc_profile")
+            .map(|value| parse_rfc_profile_value(value))
+            .unwrap_or_else(|| {
+                infer_rfc_profile_from_connection(
+                    connection.get("ecc_rfc_bapi_name").map(String::as_str),
+                    connection
+                        .get("ecc_rfc_function_module")
+                        .map(String::as_str),
+                    connection
+                        .get("ecc_rfc_export_structure")
+                        .map(String::as_str),
+                )
+            }),
         bridge_version: connection.get("ecc_rfc_bridge_version").cloned(),
         system_id: connection.get("ecc_rfc_system_id").cloned(),
         client: connection.get("ecc_rfc_client").cloned(),
@@ -986,6 +1541,39 @@ fn parse_ecc_rfc_bapi_capabilities(
             .get("ecc_rfc_key_fields_json")
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
             .unwrap_or_default(),
+        required_parameters: connection
+            .get("ecc_rfc_required_parameters_json")
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .unwrap_or_default(),
+        supported_auth_modes: connection
+            .get("ecc_rfc_supported_auth_modes_json")
+            .and_then(|raw| serde_json::from_str::<Vec<SapEccBackendAuthMode>>(raw).ok())
+            .unwrap_or_default(),
+        supported_session_modes: connection
+            .get("ecc_rfc_supported_session_modes_json")
+            .and_then(|raw| serde_json::from_str::<Vec<SapEccSessionMode>>(raw).ok())
+            .unwrap_or_default(),
+        health_path: connection.get("ecc_rfc_health_path").cloned(),
+        session_id_path: connection.get("ecc_rfc_session_id_path").cloned(),
+        session_id_parameter_name: connection.get("ecc_rfc_session_id_parameter_name").cloned(),
+        close_session_path: connection.get("ecc_rfc_close_session_path").cloned(),
+        close_session_method: connection.get("ecc_rfc_close_session_method").cloned(),
+        requires_explicit_session_close: connection
+            .get("ecc_rfc_requires_explicit_session_close")
+            .map(|value| value == "true")
+            .unwrap_or(false),
+        session_ttl_seconds: connection
+            .get("ecc_rfc_session_ttl_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0),
+        max_page_size: connection
+            .get("ecc_rfc_max_page_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0),
+        page_size_parameter_name: connection.get("ecc_rfc_page_size_parameter_name").cloned(),
+        language_parameter_name: connection.get("ecc_rfc_language_parameter_name").cloned(),
+        cursor_parameter_name: connection.get("ecc_rfc_cursor_parameter_name").cloned(),
+        next_cursor_path: connection.get("ecc_rfc_next_cursor_path").cloned(),
         supports_record_projection: connection
             .get("ecc_rfc_supports_record_projection")
             .map(|value| value == "true")
@@ -1018,10 +1606,27 @@ fn parse_ecc_rfc_bapi_pagination_config(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(25);
+    let page_size_parameter_name = connection
+        .get("ecc_rfc_page_size_parameter_name")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "page_size".to_string());
+    let cursor_parameter_name = connection
+        .get("ecc_rfc_cursor_parameter_name")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "cursor".to_string());
+    let next_cursor_path = connection
+        .get("ecc_rfc_next_cursor_path")
+        .cloned()
+        .filter(|value| !value.trim().is_empty());
 
     SapEccRfcBapiPaginationConfig {
         follow_next_cursor,
         max_pages,
+        page_size_parameter_name,
+        cursor_parameter_name,
+        next_cursor_path,
     }
 }
 
@@ -1038,11 +1643,439 @@ fn resolve_s4_odata_next_link(initial_url: &str, next_link: &str) -> Result<Stri
     Ok(joined.to_string())
 }
 
-fn append_cursor_query(initial_url: &str, cursor: &str) -> Result<String> {
+fn append_query_parameters(
+    initial_url: &str,
+    parameters: &HashMap<String, String>,
+) -> Result<String> {
     let mut url = reqwest::Url::parse(initial_url)
         .with_context(|| format!("invalid SAP ECC RFC/BAPI bridge base URL '{initial_url}'"))?;
-    url.query_pairs_mut().append_pair("cursor", cursor);
+    if !parameters.is_empty() {
+        let existing = url
+            .query_pairs()
+            .map(|(key, _)| key.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        let mut query_pairs = url.query_pairs_mut();
+        for (key, value) in parameters {
+            if !existing.contains(key) {
+                query_pairs.append_pair(key, value);
+            }
+        }
+    }
     Ok(url.to_string())
+}
+
+fn append_cursor_query(
+    initial_url: &str,
+    cursor_parameter_name: &str,
+    cursor: &str,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(initial_url)
+        .with_context(|| format!("invalid SAP ECC RFC/BAPI bridge base URL '{initial_url}'"))?;
+    url.query_pairs_mut()
+        .append_pair(cursor_parameter_name, cursor);
+    Ok(url.to_string())
+}
+
+fn bridge_session_cache_key(base_url: &str, session_parameter_name: &str) -> String {
+    format!("{base_url}::{session_parameter_name}")
+}
+
+fn extract_bridge_session_id(payload: &Value, session_id_path: Option<&str>) -> Option<String> {
+    let path = session_id_path?;
+    extract_json_path_value(payload, path)
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            Value::Number(value) => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn apply_auth_resolution_metadata(
+    metadata: &mut HashMap<String, String>,
+    prefix: &str,
+    resolution: &ConnectorAuthResolutionMetadata,
+) {
+    if let Some(secret_ref) = resolution.secret_ref.as_deref() {
+        metadata.insert(format!("{prefix}secret_ref"), secret_ref.to_string());
+    }
+    if let Some(secret_store) = resolution.secret_store.as_deref() {
+        metadata.insert(format!("{prefix}secret_store"), secret_store.to_string());
+    }
+    if let Some(secret_version) = resolution.secret_version.as_deref() {
+        metadata.insert(
+            format!("{prefix}secret_version"),
+            secret_version.to_string(),
+        );
+    }
+    if let Some(interval_days) = resolution.rotation_interval_days {
+        metadata.insert(
+            format!("{prefix}rotation_interval_days"),
+            interval_days.to_string(),
+        );
+    }
+    if let Some(next_rotation) = resolution.next_rotation {
+        metadata.insert(format!("{prefix}next_rotation"), next_rotation.to_rfc3339());
+    }
+    if let Some(last_rotated) = resolution.last_rotated {
+        metadata.insert(format!("{prefix}last_rotated"), last_rotated.to_rfc3339());
+    }
+}
+
+fn parse_rfc_profile_value(value: &str) -> SapEccRfcBapiProfile {
+    match value {
+        "bapi_record_lookup" | "bapi_lookup" | "bapi" => SapEccRfcBapiProfile::BapiRecordLookup,
+        "function_module_export" | "function_module" | "rfc_function" => {
+            SapEccRfcBapiProfile::FunctionModuleExport
+        }
+        "table_read_rowset" | "table_read" | "rowset" => SapEccRfcBapiProfile::TableReadRowset,
+        _ => SapEccRfcBapiProfile::QueryBridge,
+    }
+}
+
+fn infer_rfc_profile_from_connection(
+    bapi_name: Option<&str>,
+    function_module: Option<&str>,
+    export_structure: Option<&str>,
+) -> SapEccRfcBapiProfile {
+    if bapi_name.is_some() {
+        SapEccRfcBapiProfile::BapiRecordLookup
+    } else if function_module.is_some() && export_structure.is_some() {
+        SapEccRfcBapiProfile::FunctionModuleExport
+    } else if export_structure.is_some() {
+        SapEccRfcBapiProfile::TableReadRowset
+    } else {
+        SapEccRfcBapiProfile::QueryBridge
+    }
+}
+
+fn parse_request_parameters_json(
+    connection: &HashMap<String, String>,
+    key: &str,
+) -> Result<HashMap<String, String>> {
+    if let Some(raw) = connection.get(key) {
+        let value: Value =
+            serde_json::from_str(raw).with_context(|| format!("{key} must be valid JSON"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("{key} must be a JSON object"))?;
+        let mut parameters = HashMap::new();
+        for (key, value) in object {
+            let rendered = match value {
+                Value::Null => continue,
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                Value::Bool(value) => value.to_string(),
+                _ => {
+                    return Err(anyhow!(
+                        "{key} values must be strings, numbers, booleans, or null"
+                    ))
+                }
+            };
+            parameters.insert(key.clone(), rendered);
+        }
+        return Ok(parameters);
+    }
+
+    Ok(HashMap::new())
+}
+
+fn parse_ecc_adapter_request_config(
+    connection: &HashMap<String, String>,
+) -> Result<SapEccAdapterRequestConfig> {
+    Ok(SapEccAdapterRequestConfig {
+        request_parameters: parse_request_parameters_json(connection, "ecc_request_params_json")?,
+        session_mode: connection
+            .get("ecc_session_mode")
+            .map(|value| parse_session_mode_value(value))
+            .transpose()?,
+        backend_auth_mode: connection
+            .get("ecc_backend_auth_mode")
+            .map(|value| parse_backend_auth_mode_value(value))
+            .transpose()?,
+        language: connection.get("ecc_language").cloned(),
+        page_size: connection
+            .get("ecc_page_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0),
+    })
+}
+
+fn parse_ecc_rfc_request_config(
+    connection: &HashMap<String, String>,
+) -> Result<SapEccRfcBapiRequestConfig> {
+    Ok(SapEccRfcBapiRequestConfig {
+        request_parameters: parse_request_parameters_json(
+            connection,
+            "ecc_rfc_request_params_json",
+        )?,
+        session_mode: connection
+            .get("ecc_rfc_session_mode")
+            .map(|value| parse_session_mode_value(value))
+            .transpose()?,
+        backend_auth_mode: connection
+            .get("ecc_rfc_backend_auth_mode")
+            .map(|value| parse_backend_auth_mode_value(value))
+            .transpose()?,
+        language: connection.get("ecc_rfc_language").cloned(),
+        page_size: connection
+            .get("ecc_rfc_page_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0),
+    })
+}
+
+fn parse_ecc_adapter_session_config(
+    connection: &HashMap<String, String>,
+    capabilities: Option<&SapEccAdapterCapabilities>,
+    request: &SapEccAdapterRequestConfig,
+) -> SapEccAdapterSessionConfig {
+    SapEccAdapterSessionConfig {
+        session_mode: request.session_mode.clone(),
+        session_id_path: capabilities
+            .and_then(|caps| caps.session_id_path.clone())
+            .or_else(|| connection.get("ecc_session_id_path").cloned()),
+        session_id_parameter_name: capabilities
+            .and_then(|caps| caps.session_id_parameter_name.clone())
+            .or_else(|| connection.get("ecc_session_id_parameter_name").cloned())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "session_id".to_string()),
+        close_session_path: capabilities
+            .and_then(|caps| caps.close_session_path.clone())
+            .or_else(|| connection.get("ecc_close_session_path").cloned()),
+        close_session_method: capabilities
+            .and_then(|caps| caps.close_session_method.clone())
+            .or_else(|| connection.get("ecc_close_session_method").cloned())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "POST".to_string()),
+        requires_explicit_session_close: capabilities
+            .map(|caps| caps.requires_explicit_session_close)
+            .unwrap_or_else(|| {
+                connection
+                    .get("ecc_requires_explicit_session_close")
+                    .map(|value| value == "true")
+                    .unwrap_or(false)
+            }),
+        session_ttl_seconds: capabilities
+            .and_then(|caps| caps.session_ttl_seconds)
+            .or_else(|| {
+                connection
+                    .get("ecc_session_ttl_seconds")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+            }),
+    }
+}
+
+fn parse_ecc_rfc_session_config(
+    connection: &HashMap<String, String>,
+    capabilities: Option<&SapEccRfcBapiCapabilities>,
+    request: &SapEccRfcBapiRequestConfig,
+) -> SapEccRfcSessionConfig {
+    SapEccRfcSessionConfig {
+        session_mode: request.session_mode.clone(),
+        session_id_path: capabilities
+            .and_then(|caps| caps.session_id_path.clone())
+            .or_else(|| connection.get("ecc_rfc_session_id_path").cloned()),
+        session_id_parameter_name: capabilities
+            .and_then(|caps| caps.session_id_parameter_name.clone())
+            .or_else(|| connection.get("ecc_rfc_session_id_parameter_name").cloned())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "session_id".to_string()),
+        close_session_path: capabilities
+            .and_then(|caps| caps.close_session_path.clone())
+            .or_else(|| connection.get("ecc_rfc_close_session_path").cloned()),
+        close_session_method: capabilities
+            .and_then(|caps| caps.close_session_method.clone())
+            .or_else(|| connection.get("ecc_rfc_close_session_method").cloned())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "POST".to_string()),
+        requires_explicit_session_close: capabilities
+            .map(|caps| caps.requires_explicit_session_close)
+            .unwrap_or_else(|| {
+                connection
+                    .get("ecc_rfc_requires_explicit_session_close")
+                    .map(|value| value == "true")
+                    .unwrap_or(false)
+            }),
+        session_ttl_seconds: capabilities
+            .and_then(|caps| caps.session_ttl_seconds)
+            .or_else(|| {
+                connection
+                    .get("ecc_rfc_session_ttl_seconds")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+            }),
+    }
+}
+
+fn parse_backend_auth_mode_value(value: &str) -> Result<SapEccBackendAuthMode> {
+    serde_json::from_str::<SapEccBackendAuthMode>(&format!("\"{value}\""))
+        .with_context(|| format!("unsupported SAP ECC backend auth mode '{value}'"))
+}
+
+fn parse_session_mode_value(value: &str) -> Result<SapEccSessionMode> {
+    serde_json::from_str::<SapEccSessionMode>(&format!("\"{value}\""))
+        .with_context(|| format!("unsupported SAP ECC session mode '{value}'"))
+}
+
+fn validate_ecc_adapter_runtime_requirements(
+    capabilities: Option<&SapEccAdapterCapabilities>,
+    request: &SapEccAdapterRequestConfig,
+) -> Result<()> {
+    let Some(capabilities) = capabilities else {
+        return Ok(());
+    };
+    if let Some(session_mode) = request.session_mode.as_ref() {
+        if !capabilities.supported_session_modes.is_empty()
+            && !capabilities.supported_session_modes.contains(session_mode)
+        {
+            return Err(anyhow!(
+                "sap_ecc_adapter verification requested unsupported session_mode '{:?}'",
+                session_mode
+            ));
+        }
+    }
+    if let Some(auth_mode) = request.backend_auth_mode.as_ref() {
+        if !capabilities.supported_auth_modes.is_empty()
+            && !capabilities.supported_auth_modes.contains(auth_mode)
+        {
+            return Err(anyhow!(
+                "sap_ecc_adapter verification requested unsupported backend_auth_mode '{:?}'",
+                auth_mode
+            ));
+        }
+    }
+    if let Some(page_size) = request.page_size {
+        if let Some(max_page_size) = capabilities.max_page_size {
+            if page_size > max_page_size {
+                return Err(anyhow!(
+                    "sap_ecc_adapter verification requested page_size {} above capability limit {}",
+                    page_size,
+                    max_page_size
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ecc_rfc_runtime_requirements(
+    capabilities: Option<&SapEccRfcBapiCapabilities>,
+    request: &SapEccRfcBapiRequestConfig,
+) -> Result<()> {
+    let Some(capabilities) = capabilities else {
+        return Ok(());
+    };
+    if let Some(session_mode) = request.session_mode.as_ref() {
+        if !capabilities.supported_session_modes.is_empty()
+            && !capabilities.supported_session_modes.contains(session_mode)
+        {
+            return Err(anyhow!(
+                "sap_ecc_rfc_bapi verification requested unsupported session_mode '{:?}'",
+                session_mode
+            ));
+        }
+    }
+    if let Some(auth_mode) = request.backend_auth_mode.as_ref() {
+        if !capabilities.supported_auth_modes.is_empty()
+            && !capabilities.supported_auth_modes.contains(auth_mode)
+        {
+            return Err(anyhow!(
+                "sap_ecc_rfc_bapi verification requested unsupported backend_auth_mode '{:?}'",
+                auth_mode
+            ));
+        }
+    }
+    if let Some(page_size) = request.page_size {
+        if let Some(max_page_size) = capabilities.max_page_size {
+            if page_size > max_page_size {
+                return Err(anyhow!(
+                    "sap_ecc_rfc_bapi verification requested page_size {} above capability limit {}",
+                    page_size,
+                    max_page_size
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_missing_required_adapter_parameters(
+    endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
+    request_parameters: &HashMap<String, String>,
+    capabilities: Option<&SapEccAdapterCapabilities>,
+) -> Result<Vec<String>> {
+    let Some(capabilities) = capabilities else {
+        return Ok(Vec::new());
+    };
+    if capabilities.required_parameters.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let base_url = format!(
+        "{}{}",
+        endpoint.base_url.trim_end_matches('/'),
+        endpoint.path
+    );
+    let url = reqwest::Url::parse(&base_url)
+        .with_context(|| format!("invalid SAP ECC adapter URL '{}'", base_url))?;
+    let query_pairs = url
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<HashMap<_, _>>();
+
+    let mut missing = capabilities
+        .required_parameters
+        .iter()
+        .filter(|parameter| {
+            !query_pairs.contains_key(parameter.as_str())
+                && !request_parameters.contains_key(parameter.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
+}
+
+fn find_missing_required_rfc_parameters(
+    endpoint: &graphica_core::migration_evidence::ConnectorEndpoint,
+    request_parameters: &HashMap<String, String>,
+    capabilities: Option<&SapEccRfcBapiCapabilities>,
+) -> Result<Vec<String>> {
+    let Some(capabilities) = capabilities else {
+        return Ok(Vec::new());
+    };
+    if capabilities.required_parameters.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let base_url = format!(
+        "{}{}",
+        endpoint.base_url.trim_end_matches('/'),
+        endpoint.path
+    );
+    let url = reqwest::Url::parse(&base_url)
+        .with_context(|| format!("invalid SAP ECC RFC/BAPI bridge URL '{}'", base_url))?;
+    let query_pairs = url
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<HashMap<_, _>>();
+
+    let mut missing = capabilities
+        .required_parameters
+        .iter()
+        .filter(|parameter| {
+            !query_pairs.contains_key(parameter.as_str())
+                && !request_parameters.contains_key(parameter.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
 }
 
 fn count_s4_odata_rows(value: &Value) -> Option<usize> {
@@ -1057,7 +2090,10 @@ fn apply_s4_odata_verification_metadata(
     metadata: &mut HashMap<String, String>,
     context: &SapS4ODataVerificationOutcome,
 ) {
-    metadata.insert("odata_page_count".to_string(), context.page_count.to_string());
+    metadata.insert(
+        "odata_page_count".to_string(),
+        context.page_count.to_string(),
+    );
     metadata.insert("odata_paginated".to_string(), context.paginated.to_string());
     metadata.insert(
         "odata_pagination_truncated".to_string(),
@@ -1067,7 +2103,10 @@ fn apply_s4_odata_verification_metadata(
         metadata.insert("odata_row_count".to_string(), row_count.to_string());
     }
     if let Some(next_link) = context.next_link_remaining.as_deref() {
-        metadata.insert("odata_next_link_remaining".to_string(), next_link.to_string());
+        metadata.insert(
+            "odata_next_link_remaining".to_string(),
+            next_link.to_string(),
+        );
     }
     if !context.projection.requested_fields.is_empty() {
         metadata.insert(
@@ -1155,6 +2194,61 @@ fn apply_ecc_adapter_verification_metadata(
                 .unwrap_or_else(|_| "[]".to_string()),
         );
     }
+    if !context.request_parameters.is_empty() {
+        metadata.insert(
+            "ecc_request_parameters_json".to_string(),
+            serde_json::to_string(&context.request_parameters).unwrap_or_else(|_| "{}".to_string()),
+        );
+    }
+    if !context.missing_required_parameters.is_empty() {
+        metadata.insert(
+            "ecc_missing_required_parameters_json".to_string(),
+            serde_json::to_string(&context.missing_required_parameters)
+                .unwrap_or_else(|_| "[]".to_string()),
+        );
+    }
+    if let Some(session_mode) = context.session_mode.as_ref() {
+        metadata.insert(
+            "ecc_session_mode".to_string(),
+            serde_json::to_string(session_mode)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+        );
+    }
+    if let Some(backend_auth_mode) = context.backend_auth_mode.as_ref() {
+        metadata.insert(
+            "ecc_backend_auth_mode".to_string(),
+            serde_json::to_string(backend_auth_mode)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+        );
+    }
+    if let Some(language) = context.language.as_deref() {
+        metadata.insert("ecc_language".to_string(), language.to_string());
+    }
+    if let Some(page_size) = context.page_size {
+        metadata.insert("ecc_page_size".to_string(), page_size.to_string());
+    }
+    metadata.insert(
+        "ecc_session_id_present".to_string(),
+        context.session_id_present.to_string(),
+    );
+    metadata.insert(
+        "ecc_session_reused".to_string(),
+        context.session_reused.to_string(),
+    );
+    metadata.insert(
+        "ecc_session_closed".to_string(),
+        context.session_closed.to_string(),
+    );
+    if let Some(session_ttl_seconds) = context.session_ttl_seconds {
+        metadata.insert(
+            "ecc_session_ttl_seconds".to_string(),
+            session_ttl_seconds.to_string(),
+        );
+    }
     metadata.insert(
         "ecc_projection_metadata_validated".to_string(),
         context.metadata_capabilities.is_some().to_string(),
@@ -1170,6 +2264,13 @@ fn apply_ecc_adapter_verification_metadata(
                     .unwrap_or_else(|_| "[]".to_string()),
             );
         }
+        if !capabilities.required_parameters.is_empty() {
+            metadata.insert(
+                "ecc_required_parameters_json".to_string(),
+                serde_json::to_string(&capabilities.required_parameters)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
     }
 }
 
@@ -1177,8 +2278,14 @@ fn apply_ecc_rfc_verification_metadata(
     metadata: &mut HashMap<String, String>,
     context: &SapEccRfcBapiVerificationOutcome,
 ) {
-    metadata.insert("ecc_rfc_page_count".to_string(), context.page_count.to_string());
-    metadata.insert("ecc_rfc_paginated".to_string(), context.paginated.to_string());
+    metadata.insert(
+        "ecc_rfc_page_count".to_string(),
+        context.page_count.to_string(),
+    );
+    metadata.insert(
+        "ecc_rfc_paginated".to_string(),
+        context.paginated.to_string(),
+    );
     metadata.insert(
         "ecc_rfc_pagination_truncated".to_string(),
         context.pagination_truncated.to_string(),
@@ -1213,10 +2320,77 @@ fn apply_ecc_rfc_verification_metadata(
                 .unwrap_or_else(|_| "[]".to_string()),
         );
     }
+    if !context.request_parameters.is_empty() {
+        metadata.insert(
+            "ecc_rfc_request_parameters_json".to_string(),
+            serde_json::to_string(&context.request_parameters).unwrap_or_else(|_| "{}".to_string()),
+        );
+    }
+    if !context.missing_required_parameters.is_empty() {
+        metadata.insert(
+            "ecc_rfc_missing_required_parameters_json".to_string(),
+            serde_json::to_string(&context.missing_required_parameters)
+                .unwrap_or_else(|_| "[]".to_string()),
+        );
+    }
     metadata.insert(
         "ecc_rfc_projection_metadata_validated".to_string(),
         context.metadata_capabilities.is_some().to_string(),
     );
+    if let Some(profile) = context.profile.as_ref() {
+        metadata.insert(
+            "ecc_rfc_profile".to_string(),
+            match profile {
+                SapEccRfcBapiProfile::BapiRecordLookup => "bapi_record_lookup",
+                SapEccRfcBapiProfile::FunctionModuleExport => "function_module_export",
+                SapEccRfcBapiProfile::TableReadRowset => "table_read_rowset",
+                SapEccRfcBapiProfile::QueryBridge => "query_bridge",
+            }
+            .to_string(),
+        );
+    }
+    if let Some(session_mode) = context.session_mode.as_ref() {
+        metadata.insert(
+            "ecc_rfc_session_mode".to_string(),
+            serde_json::to_string(session_mode)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+        );
+    }
+    if let Some(backend_auth_mode) = context.backend_auth_mode.as_ref() {
+        metadata.insert(
+            "ecc_rfc_backend_auth_mode".to_string(),
+            serde_json::to_string(backend_auth_mode)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+        );
+    }
+    if let Some(language) = context.language.as_deref() {
+        metadata.insert("ecc_rfc_language".to_string(), language.to_string());
+    }
+    if let Some(page_size) = context.page_size {
+        metadata.insert("ecc_rfc_page_size".to_string(), page_size.to_string());
+    }
+    metadata.insert(
+        "ecc_rfc_session_id_present".to_string(),
+        context.session_id_present.to_string(),
+    );
+    metadata.insert(
+        "ecc_rfc_session_reused".to_string(),
+        context.session_reused.to_string(),
+    );
+    metadata.insert(
+        "ecc_rfc_session_closed".to_string(),
+        context.session_closed.to_string(),
+    );
+    if let Some(session_ttl_seconds) = context.session_ttl_seconds {
+        metadata.insert(
+            "ecc_rfc_session_ttl_seconds".to_string(),
+            session_ttl_seconds.to_string(),
+        );
+    }
     if let Some(capabilities) = context.metadata_capabilities.as_ref() {
         if let Some(function_module) = capabilities.function_module.as_deref() {
             metadata.insert(
@@ -1237,6 +2411,27 @@ fn apply_ecc_rfc_verification_metadata(
             metadata.insert(
                 "ecc_rfc_key_fields_json".to_string(),
                 serde_json::to_string(&capabilities.key_fields)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+        if !capabilities.required_parameters.is_empty() {
+            metadata.insert(
+                "ecc_rfc_required_parameters_json".to_string(),
+                serde_json::to_string(&capabilities.required_parameters)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+        if !capabilities.supported_session_modes.is_empty() {
+            metadata.insert(
+                "ecc_rfc_supported_session_modes_json".to_string(),
+                serde_json::to_string(&capabilities.supported_session_modes)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+        if !capabilities.supported_auth_modes.is_empty() {
+            metadata.insert(
+                "ecc_rfc_supported_auth_modes_json".to_string(),
+                serde_json::to_string(&capabilities.supported_auth_modes)
                     .unwrap_or_else(|_| "[]".to_string()),
             );
         }
@@ -1299,7 +2494,11 @@ fn build_ecc_rfc_projection_validation_summary(
     let bridge_label = context
         .metadata_capabilities
         .as_ref()
-        .and_then(|caps| caps.bapi_name.as_deref().or(caps.function_module.as_deref()))
+        .and_then(|caps| {
+            caps.bapi_name
+                .as_deref()
+                .or(caps.function_module.as_deref())
+        })
         .unwrap_or("unknown ECC RFC/BAPI bridge");
     format!(
         "Verification failed because SAP ECC RFC/BAPI bridge metadata for {} does not expose requested field(s): {}",
@@ -1308,9 +2507,7 @@ fn build_ecc_rfc_projection_validation_summary(
     )
 }
 
-fn build_ecc_rfc_pagination_warning_summary(
-    context: &SapEccRfcBapiVerificationOutcome,
-) -> String {
+fn build_ecc_rfc_pagination_warning_summary(context: &SapEccRfcBapiVerificationOutcome) -> String {
     let row_fragment = context
         .row_count
         .map(|rows| format!(" across {} fetched row(s)", rows))
@@ -1336,14 +2533,30 @@ fn build_hana_source(connection: &HashMap<String, String>) -> Result<DataSource>
         .cloned()
         .ok_or_else(|| anyhow!("sap_hana verification requires database"))?;
     let schema = connection.get("schema").cloned();
-    let metadata = ["odbc_driver", "odbc_dsn", "odbc_connection_string", "odbc_options"]
-        .into_iter()
-        .filter_map(|key| connection.get(key).cloned().map(|value| (key.to_string(), value)))
-        .collect();
+    let metadata = [
+        "odbc_driver",
+        "odbc_dsn",
+        "odbc_connection_string",
+        "odbc_options",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        connection
+            .get(key)
+            .cloned()
+            .map(|value| (key.to_string(), value))
+    })
+    .collect();
 
     Ok(DataSource {
-        id: connection.get("datasource_id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        title: connection.get("title").cloned().unwrap_or_else(|| "SAP HANA verification".to_string()),
+        id: connection
+            .get("datasource_id")
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        title: connection
+            .get("title")
+            .cloned()
+            .unwrap_or_else(|| "SAP HANA verification".to_string()),
         description: Some("ARCXA migration evidence verification datasource".to_string()),
         source_type: "SAPHANA".to_string(),
         connection: ConnectionDetails {
@@ -1368,7 +2581,11 @@ fn build_hana_source(connection: &HashMap<String, String>) -> Result<DataSource>
 }
 
 fn first_query_value(result: QueryResult) -> Result<Value> {
-    let row = result.rows.into_iter().next().ok_or_else(|| anyhow!("verification query returned no rows"))?;
+    let row = result
+        .rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("verification query returned no rows"))?;
     if let Some(object) = row.as_object() {
         if object.len() == 1 {
             if let Some(value) = object.values().next() {
@@ -1416,7 +2633,10 @@ fn assess_values(
         _ => {}
     }
 
-    match (expected.and_then(coerce_comparable_value), actual.and_then(coerce_comparable_value)) {
+    match (
+        expected.and_then(coerce_comparable_value),
+        actual.and_then(coerce_comparable_value),
+    ) {
         (Some(ComparableValue::Number(expected)), Some(ComparableValue::Number(actual))) => {
             let delta = (expected - actual).abs();
             match tolerance {
@@ -1697,14 +2917,13 @@ fn assess_object_values(
         match actual.get(field) {
             Some(actual_value) => {
                 verified_field_count += 1;
-                let field_assessment = assess_values(Some(expected_value), Some(actual_value), tolerance);
+                let field_assessment =
+                    assess_values(Some(expected_value), Some(actual_value), tolerance);
                 if field_assessment.status != ControlStatus::Passed {
                     mismatch_field_count += 1;
                     if mismatch_examples.len() < 5 {
-                        mismatch_examples.push(format!(
-                            "{}:{}",
-                            field, field_assessment.comparison_mode
-                        ));
+                        mismatch_examples
+                            .push(format!("{}:{}", field, field_assessment.comparison_mode));
                     }
                 }
                 status = merge_status(status, field_assessment.status);
@@ -1829,7 +3048,9 @@ fn build_summary(
     actual: &Value,
     tolerance: Option<f64>,
 ) -> String {
-    if assessment.comparison_scope == "record_projection" || assessment.comparison_scope == "aggregate_projection" {
+    if assessment.comparison_scope == "record_projection"
+        || assessment.comparison_scope == "aggregate_projection"
+    {
         let shape = if assessment.comparison_scope == "aggregate_projection" {
             "aggregate projection"
         } else {
@@ -1917,13 +3138,15 @@ fn merge_control_metadata(
     if !assessment.missing_actual_fields.is_empty() {
         merged.insert(
             "missing_actual_fields".to_string(),
-            serde_json::to_string(&assessment.missing_actual_fields).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&assessment.missing_actual_fields)
+                .unwrap_or_else(|_| "[]".to_string()),
         );
     }
     if !assessment.unexpected_actual_fields.is_empty() {
         merged.insert(
             "unexpected_actual_fields".to_string(),
-            serde_json::to_string(&assessment.unexpected_actual_fields).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&assessment.unexpected_actual_fields)
+                .unwrap_or_else(|_| "[]".to_string()),
         );
     }
     if !assessment.aggregate_keys.is_empty() {
@@ -1935,7 +3158,8 @@ fn merge_control_metadata(
     if !assessment.mismatch_examples.is_empty() {
         merged.insert(
             "mismatch_examples".to_string(),
-            serde_json::to_string(&assessment.mismatch_examples).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&assessment.mismatch_examples)
+                .unwrap_or_else(|_| "[]".to_string()),
         );
     }
     merged
@@ -2034,7 +3258,8 @@ impl VerificationService for VerificationServiceImpl {
         request: Request<RunVerificationRequest>,
     ) -> Result<Response<RunVerificationResponse>, Status> {
         let verification_request: VerificationRequest =
-            deserialize(&request.into_inner().verification_request_json).map_err(internal_status)?;
+            deserialize(&request.into_inner().verification_request_json)
+                .map_err(internal_status)?;
         let result = self
             .manager
             .run_verification(verification_request)
@@ -2050,7 +3275,8 @@ impl VerificationService for VerificationServiceImpl {
         request: Request<RunVerificationAndEmitRequest>,
     ) -> Result<Response<RunVerificationAndEmitResponse>, Status> {
         let dispatch_request: VerificationDispatchRequest =
-            deserialize(&request.into_inner().verification_dispatch_request_json).map_err(internal_status)?;
+            deserialize(&request.into_inner().verification_dispatch_request_json)
+                .map_err(internal_status)?;
         let result = self
             .manager
             .run_verification_and_emit(dispatch_request)
@@ -2090,11 +3316,12 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use graphica_core::migration_evidence::{
-        ConnectorAuth, ConnectorEndpoint, MigrationEvidenceDeliveryMode,
-        MigrationEvidenceDispatchSummary, MigrationEvidenceEvent,
-        MigrationEvidenceEventForwarder, SourceFieldRef, TargetFieldRef,
-        VerificationDispatchRequest, VerificationSource,
+        ConnectorAuth, ConnectorAuthKind, ConnectorEndpoint, MigrationEvidenceDeliveryMode,
+        MigrationEvidenceDispatchSummary, MigrationEvidenceEvent, MigrationEvidenceEventForwarder,
+        SourceFieldRef, TargetFieldRef, VerificationDispatchRequest, VerificationSource,
     };
+    use graphica_core::secrets::providers::{InlineSecretStore, SecretStoreRegistry};
+    use graphica_core::secrets::{put_secret_by_ref, SecretValue};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2120,9 +3347,7 @@ mod tests {
         }
     }
 
-    async fn spawn_s4_odata_server(
-        routes: Vec<(&'static str, &'static str)>,
-    ) -> String {
+    async fn spawn_s4_odata_server(routes: Vec<(&'static str, &'static str)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2163,15 +3388,11 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    async fn spawn_ecc_adapter_server(
-        routes: Vec<(&'static str, &'static str)>,
-    ) -> String {
+    async fn spawn_ecc_adapter_server(routes: Vec<(&'static str, &'static str)>) -> String {
         spawn_s4_odata_server(routes).await
     }
 
-    async fn spawn_ecc_rfc_server(
-        routes: Vec<(&'static str, &'static str)>,
-    ) -> String {
+    async fn spawn_ecc_rfc_server(routes: Vec<(&'static str, &'static str)>) -> String {
         spawn_s4_odata_server(routes).await
     }
 
@@ -2276,7 +3497,10 @@ mod tests {
                     },
                     expected_value: Some(json!(10)),
                     tolerance: Some(0.0),
-                    metadata: HashMap::from([("value_key".to_string(), "SO-1::$.amount".to_string())]),
+                    metadata: HashMap::from([(
+                        "value_key".to_string(),
+                        "SO-1::$.amount".to_string(),
+                    )]),
                     source: VerificationSource {
                         transport: ConnectorTransport::HttpJson,
                         query: None,
@@ -2296,7 +3520,10 @@ mod tests {
 
         assert_eq!(dispatch.emitted_events.len(), 2);
         assert_eq!(dispatch.dispatch_summary.accepted_event_count, 2);
-        assert_eq!(dispatch.dispatch_summary.delivery_mode, MigrationEvidenceDeliveryMode::Direct);
+        assert_eq!(
+            dispatch.dispatch_summary.delivery_mode,
+            MigrationEvidenceDeliveryMode::Direct
+        );
         assert!(dispatch.dispatch_summary.traceability_acknowledged);
         assert_eq!(forwarder.captured.lock().unwrap().len(), 2);
     }
@@ -2310,7 +3537,10 @@ mod tests {
                 let mut buffer = vec![0u8; 2048];
                 let _ = socket.read(&mut buffer).await;
                 let request = String::from_utf8_lossy(&buffer);
-                assert!(request.contains("Accept: application/json") || request.contains("accept: application/json"));
+                assert!(
+                    request.contains("Accept: application/json")
+                        || request.contains("accept: application/json")
+                );
                 let response = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 67\r\n\r\n{\"value\":[{\"SalesOrder\":\"500000001\",\"NetAmount\":\"100.00\"}]}";
                 let _ = socket.write_all(response).await;
             }
@@ -2503,12 +3733,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.control_result.status, ControlStatus::Failed);
-        assert!(
-            result
-                .control_result
-                .summary
-                .contains("does not expose requested field(s): UnknownField")
-        );
+        assert!(result
+            .control_result
+            .summary
+            .contains("does not expose requested field(s): UnknownField"));
         assert_eq!(
             result
                 .control_result
@@ -2577,7 +3805,10 @@ mod tests {
                         headers: HashMap::new(),
                     }),
                     auth: ConnectorAuth::default(),
-                    connection: HashMap::from([("odata_follow_next_link".to_string(), "true".to_string())]),
+                    connection: HashMap::from([(
+                        "odata_follow_next_link".to_string(),
+                        "true".to_string(),
+                    )]),
                 },
             })
             .await
@@ -2649,7 +3880,10 @@ mod tests {
                         ("ecc_system_id".to_string(), "PRD".to_string()),
                         ("ecc_client".to_string(), "100".to_string()),
                         ("ecc_object_name".to_string(), "VBAK".to_string()),
-                        ("ecc_key_fields_json".to_string(), r#"["VBELN"]"#.to_string()),
+                        (
+                            "ecc_key_fields_json".to_string(),
+                            r#"["VBELN"]"#.to_string(),
+                        ),
                         (
                             "ecc_field_types_json".to_string(),
                             r#"{"NETWR":"CURR","VBELN":"CHAR"}"#.to_string(),
@@ -2661,12 +3895,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.control_result.status, ControlStatus::Failed);
-        assert!(
-            result
-                .control_result
-                .summary
-                .contains("does not expose requested field(s): UNDECLARED")
-        );
+        assert!(result
+            .control_result
+            .summary
+            .contains("does not expose requested field(s): UNDECLARED"));
         assert_eq!(
             result
                 .control_result
@@ -2729,7 +3961,10 @@ mod tests {
                         headers: HashMap::new(),
                     }),
                     auth: ConnectorAuth::default(),
-                    connection: HashMap::from([("ecc_follow_next_path".to_string(), "true".to_string())]),
+                    connection: HashMap::from([(
+                        "ecc_follow_next_path".to_string(),
+                        "true".to_string(),
+                    )]),
                 },
             })
             .await
@@ -2748,6 +3983,214 @@ mod tests {
             result.control_result.metadata.get("ecc_row_count"),
             Some(&"3".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn ecc_adapter_verification_rejects_page_size_above_capability_limit() {
+        let endpoint = spawn_ecc_adapter_server(vec![]).await;
+
+        let manager = VerificationManager::new(Arc::new(CapturingForwarder::default()));
+        let error = manager
+            .run_verification(VerificationRequest {
+                control_name: "ecc-page-size-limit".to_string(),
+                program_id: "program-1".to_string(),
+                object_id: "object-1".to_string(),
+                source_field: SourceFieldRef {
+                    system: "SAP ECC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                target_field: TargetFieldRef {
+                    system: "ARCXA ECC Adapter".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                expected_value: Some(json!(100.0)),
+                tolerance: Some(0.0),
+                metadata: HashMap::new(),
+                source: VerificationSource {
+                    transport: ConnectorTransport::SapEccAdapter,
+                    query: None,
+                    endpoint: Some(ConnectorEndpoint {
+                        base_url: endpoint,
+                        path: "/adapter/v1/records/VBAK?record_id=500000001".to_string(),
+                        method: "GET".to_string(),
+                        headers: HashMap::new(),
+                    }),
+                    auth: ConnectorAuth::default(),
+                    connection: HashMap::from([
+                        (
+                            "ecc_field_types_json".to_string(),
+                            "{\"VBELN\":\"CHAR\",\"NETWR\":\"CURR\"}".to_string(),
+                        ),
+                        ("ecc_max_page_size".to_string(), "200".to_string()),
+                        ("ecc_page_size".to_string(), "500".to_string()),
+                    ]),
+                },
+            })
+            .await
+            .expect_err("page-size limit should fail before live adapter call");
+
+        assert!(error
+            .to_string()
+            .contains("requested page_size 500 above capability limit 200"));
+    }
+
+    #[tokio::test]
+    async fn ecc_adapter_verification_reuses_cached_session_and_rotated_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_handle = requests.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = vec![0u8; 4096];
+                    let bytes = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                    requests_handle.lock().unwrap().push(request);
+                    let response_body = r#"{"record":{"VBELN":"500000001","NETWR":"100.00"},"session":{"id":"sess-1"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            }
+        });
+
+        let registry = Arc::new(SecretStoreRegistry::new());
+        let store = Arc::new(InlineSecretStore::new());
+        registry.register("default", store.clone());
+        registry.set_default(store.clone());
+        let first_version = put_secret_by_ref(
+            store.as_ref(),
+            "vault://migration/ecc/adapter-token",
+            SecretValue::String("token-one".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let manager = VerificationManager::new(Arc::new(CapturingForwarder::default()))
+            .with_secret_store_registry(registry.clone());
+        let build_request = |base_url: String| VerificationRequest {
+            control_name: "ecc-secret-rotation".to_string(),
+            program_id: "program-1".to_string(),
+            object_id: "object-1".to_string(),
+            source_field: SourceFieldRef {
+                system: "SAP ECC".to_string(),
+                object_name: "VBAK".to_string(),
+                field_name: "NETWR".to_string(),
+                field_path: "$.NETWR".to_string(),
+                semantic_type: None,
+                record_id: Some("500000001".to_string()),
+            },
+            target_field: TargetFieldRef {
+                system: "ARCXA ECC Adapter".to_string(),
+                object_name: "VBAK".to_string(),
+                field_name: "NETWR".to_string(),
+                field_path: "$.NETWR".to_string(),
+                semantic_type: None,
+                record_id: Some("500000001".to_string()),
+            },
+            expected_value: Some(json!(100.0)),
+            tolerance: Some(0.0),
+            metadata: HashMap::new(),
+            source: VerificationSource {
+                transport: ConnectorTransport::SapEccAdapter,
+                query: None,
+                endpoint: Some(ConnectorEndpoint {
+                    base_url,
+                    path: "/adapter/v1/records/VBAK?record_id=500000001".to_string(),
+                    method: "GET".to_string(),
+                    headers: HashMap::new(),
+                }),
+                auth: ConnectorAuth {
+                    kind: ConnectorAuthKind::Bearer,
+                    secret_ref: Some("vault://migration/ecc/adapter-token".to_string()),
+                    token: None,
+                    api_key: None,
+                    header_name: None,
+                    username: None,
+                    password: None,
+                },
+                connection: HashMap::from([
+                    (
+                        "ecc_field_types_json".to_string(),
+                        "{\"VBELN\":\"CHAR\",\"NETWR\":\"CURR\"}".to_string(),
+                    ),
+                    ("ecc_session_mode".to_string(), "cached".to_string()),
+                    (
+                        "ecc_session_id_path".to_string(),
+                        "$.session.id".to_string(),
+                    ),
+                    (
+                        "ecc_session_id_parameter_name".to_string(),
+                        "sessionId".to_string(),
+                    ),
+                    ("ecc_session_ttl_seconds".to_string(), "300".to_string()),
+                ]),
+            },
+        };
+
+        let first = manager
+            .run_verification(build_request(format!("http://{}", addr)))
+            .await
+            .unwrap();
+
+        let second_version = put_secret_by_ref(
+            store.as_ref(),
+            "vault://migration/ecc/adapter-token",
+            SecretValue::String("token-two".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second = manager
+            .run_verification(build_request(format!("http://{}", addr)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first
+                .control_result
+                .metadata
+                .get("source_auth_secret_version"),
+            Some(&first_version)
+        );
+        assert_eq!(
+            second
+                .control_result
+                .metadata
+                .get("source_auth_secret_version"),
+            Some(&second_version)
+        );
+        assert_eq!(
+            second.control_result.metadata.get("ecc_session_reused"),
+            Some(&"true".to_string())
+        );
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured[0].contains("Authorization: Bearer token-one")
+                || captured[0].contains("authorization: Bearer token-one")
+        );
+        assert!(
+            captured[1].contains("Authorization: Bearer token-two")
+                || captured[1].contains("authorization: Bearer token-two")
+        );
+        assert!(!captured[0].contains("sessionId=sess-1"));
+        assert!(captured[1].contains("sessionId=sess-1"));
     }
 
     #[tokio::test]
@@ -2800,11 +4243,20 @@ mod tests {
                     connection: HashMap::from([
                         (
                             "ecc_rfc_field_types_json".to_string(),
-                            "{\"VBELN\":\"CHAR\",\"NETWR\":\"CURR\",\"WAERK\":\"CUKY\"}".to_string(),
+                            "{\"VBELN\":\"CHAR\",\"NETWR\":\"CURR\",\"WAERK\":\"CUKY\"}"
+                                .to_string(),
+                        ),
+                        (
+                            "ecc_rfc_profile".to_string(),
+                            "bapi_record_lookup".to_string(),
                         ),
                         (
                             "ecc_rfc_key_fields_json".to_string(),
                             "[\"VBELN\"]".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_required_parameters_json".to_string(),
+                            "[\"record_id\"]".to_string(),
                         ),
                         (
                             "ecc_rfc_bapi_name".to_string(),
@@ -2817,12 +4269,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.control_result.status, ControlStatus::Failed);
-        assert!(
-            result
-                .control_result
-                .summary
-                .contains("does not expose requested field(s): UNDECLARED")
-        );
+        assert!(result
+            .control_result
+            .summary
+            .contains("does not expose requested field(s): UNDECLARED"));
         assert_eq!(
             result
                 .control_result
@@ -2830,18 +4280,22 @@ mod tests {
                 .get("ecc_rfc_missing_projection_fields_json"),
             Some(&r#"["UNDECLARED"]"#.to_string())
         );
+        assert_eq!(
+            result.control_result.metadata.get("ecc_rfc_profile"),
+            Some(&"bapi_record_lookup".to_string())
+        );
     }
 
     #[tokio::test]
     async fn ecc_rfc_bapi_verification_follows_next_cursor_for_rowset_projection() {
         let endpoint = spawn_ecc_rfc_server(vec![
             (
-                "/bridge/v1/read/VBAP?record_id=500000001&cursor=cursor-2",
+                "/bridge/v1/read/VBAP?record_id=500000001&cursorToken=cursor-2",
                 r#"{"rows":[{"VBELN":"500000002","POSNR":"000010"}]}"#,
             ),
             (
                 "/bridge/v1/read/VBAP?record_id=500000001",
-                r#"{"rows":[{"VBELN":"500000001","POSNR":"000010"},{"VBELN":"500000001","POSNR":"000020"}],"pagination":{"next_cursor":"cursor-2"}}"#,
+                r#"{"rows":[{"VBELN":"500000001","POSNR":"000010"},{"VBELN":"500000001","POSNR":"000020"}],"pagination":{"token":"cursor-2"}}"#,
             ),
         ])
         .await;
@@ -2885,10 +4339,21 @@ mod tests {
                         headers: HashMap::new(),
                     }),
                     auth: ConnectorAuth::default(),
-                    connection: HashMap::from([(
-                        "ecc_rfc_follow_next_cursor".to_string(),
-                        "true".to_string(),
-                    )]),
+                    connection: HashMap::from([
+                        ("ecc_rfc_follow_next_cursor".to_string(), "true".to_string()),
+                        (
+                            "ecc_rfc_cursor_parameter_name".to_string(),
+                            "cursorToken".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_next_cursor_path".to_string(),
+                            "$.pagination.token".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_request_params_json".to_string(),
+                            r#"{"record_id":"500000001"}"#.to_string(),
+                        ),
+                    ]),
                 },
             })
             .await
@@ -2907,6 +4372,245 @@ mod tests {
             result.control_result.metadata.get("ecc_rfc_row_count"),
             Some(&"3".to_string())
         );
+        assert_eq!(
+            result
+                .control_result
+                .metadata
+                .get("ecc_rfc_request_parameters_json"),
+            Some(&r#"{"record_id":"500000001"}"#.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn ecc_rfc_bapi_verification_rejects_missing_required_request_parameters() {
+        let endpoint = spawn_ecc_rfc_server(vec![]).await;
+
+        let manager = VerificationManager::new(Arc::new(CapturingForwarder::default()));
+        let error = manager
+            .run_verification(VerificationRequest {
+                control_name: "rfc-required-params".to_string(),
+                program_id: "program-1".to_string(),
+                object_id: "object-1".to_string(),
+                source_field: SourceFieldRef {
+                    system: "SAP ECC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                target_field: TargetFieldRef {
+                    system: "SAP ECC RFC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                expected_value: Some(json!(100.0)),
+                tolerance: Some(0.0),
+                metadata: HashMap::new(),
+                source: VerificationSource {
+                    transport: ConnectorTransport::SapEccRfcBapi,
+                    query: None,
+                    endpoint: Some(ConnectorEndpoint {
+                        base_url: endpoint,
+                        path: "/bridge/v1/read/VBAK".to_string(),
+                        method: "GET".to_string(),
+                        headers: HashMap::new(),
+                    }),
+                    auth: ConnectorAuth::default(),
+                    connection: HashMap::from([
+                        (
+                            "ecc_rfc_required_parameters_json".to_string(),
+                            r#"["record_id"]"#.to_string(),
+                        ),
+                        ("ecc_rfc_field_types_json".to_string(), "{}".to_string()),
+                    ]),
+                },
+            })
+            .await
+            .expect_err("missing required request parameters should fail early");
+
+        assert!(error
+            .to_string()
+            .contains("missing required request parameter(s): record_id"));
+    }
+
+    #[tokio::test]
+    async fn ecc_rfc_bapi_verification_rejects_unsupported_session_mode() {
+        let endpoint = spawn_ecc_rfc_server(vec![]).await;
+
+        let manager = VerificationManager::new(Arc::new(CapturingForwarder::default()));
+        let error = manager
+            .run_verification(VerificationRequest {
+                control_name: "rfc-session-mode".to_string(),
+                program_id: "program-1".to_string(),
+                object_id: "object-1".to_string(),
+                source_field: SourceFieldRef {
+                    system: "SAP ECC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                target_field: TargetFieldRef {
+                    system: "SAP ECC RFC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                expected_value: Some(json!(100.0)),
+                tolerance: Some(0.0),
+                metadata: HashMap::new(),
+                source: VerificationSource {
+                    transport: ConnectorTransport::SapEccRfcBapi,
+                    query: None,
+                    endpoint: Some(ConnectorEndpoint {
+                        base_url: endpoint,
+                        path: "/bridge/v1/read/VBAK?record_id=500000001".to_string(),
+                        method: "GET".to_string(),
+                        headers: HashMap::new(),
+                    }),
+                    auth: ConnectorAuth::default(),
+                    connection: HashMap::from([
+                        (
+                            "ecc_rfc_field_types_json".to_string(),
+                            "{\"VBELN\":\"CHAR\",\"NETWR\":\"CURR\"}".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_supported_session_modes_json".to_string(),
+                            "[\"stateless\"]".to_string(),
+                        ),
+                        ("ecc_rfc_session_mode".to_string(), "stateful".to_string()),
+                    ]),
+                },
+            })
+            .await
+            .expect_err("unsupported session mode should fail before live RFC call");
+
+        assert!(error
+            .to_string()
+            .contains("requested unsupported session_mode"));
+    }
+
+    #[tokio::test]
+    async fn ecc_rfc_bapi_verification_closes_required_stateful_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_handle = requests.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = vec![0u8; 4096];
+                    let bytes = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                    requests_handle.lock().unwrap().push(request.clone());
+                    let (status, body) = if request.contains("/bridge/v1/session/close") {
+                        ("200 OK", "{\"closed\":true}")
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"result":{"VBELN":"500000001","NETWR":"100.00"},"session":{"id":"bridge-session-1"}}"#,
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            }
+        });
+
+        let manager = VerificationManager::new(Arc::new(CapturingForwarder::default()));
+        let result = manager
+            .run_verification(VerificationRequest {
+                control_name: "rfc-session-close".to_string(),
+                program_id: "program-1".to_string(),
+                object_id: "object-1".to_string(),
+                source_field: SourceFieldRef {
+                    system: "SAP ECC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                target_field: TargetFieldRef {
+                    system: "SAP ECC RFC".to_string(),
+                    object_name: "VBAK".to_string(),
+                    field_name: "NETWR".to_string(),
+                    field_path: "$.NETWR".to_string(),
+                    semantic_type: None,
+                    record_id: Some("500000001".to_string()),
+                },
+                expected_value: Some(json!(100.0)),
+                tolerance: Some(0.0),
+                metadata: HashMap::new(),
+                source: VerificationSource {
+                    transport: ConnectorTransport::SapEccRfcBapi,
+                    query: None,
+                    endpoint: Some(ConnectorEndpoint {
+                        base_url: format!("http://{}", addr),
+                        path: "/bridge/v1/read/VBAK?record_id=500000001".to_string(),
+                        method: "GET".to_string(),
+                        headers: HashMap::new(),
+                    }),
+                    auth: ConnectorAuth::default(),
+                    connection: HashMap::from([
+                        (
+                            "ecc_rfc_field_types_json".to_string(),
+                            "{\"VBELN\":\"CHAR\",\"NETWR\":\"CURR\"}".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_required_parameters_json".to_string(),
+                            "[\"record_id\"]".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_request_params_json".to_string(),
+                            r#"{"record_id":"500000001"}"#.to_string(),
+                        ),
+                        ("ecc_rfc_session_mode".to_string(), "stateful".to_string()),
+                        (
+                            "ecc_rfc_session_id_path".to_string(),
+                            "$.session.id".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_session_id_parameter_name".to_string(),
+                            "sessionId".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_close_session_path".to_string(),
+                            "/bridge/v1/session/close".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_close_session_method".to_string(),
+                            "POST".to_string(),
+                        ),
+                        (
+                            "ecc_rfc_requires_explicit_session_close".to_string(),
+                            "true".to_string(),
+                        ),
+                    ]),
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.control_result.metadata.get("ecc_rfc_session_closed"),
+            Some(&"true".to_string())
+        );
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].contains("/bridge/v1/read/VBAK?record_id=500000001"));
+        assert!(captured[1].contains("/bridge/v1/session/close?sessionId=bridge-session-1"));
     }
 
     #[test]
@@ -2939,10 +4643,22 @@ mod tests {
         let assessment = assess_values(Some(&json!(100)), Some(&json!(104)), Some(2.0));
         let metadata = merge_control_metadata(&HashMap::new(), &assessment);
 
-        assert_eq!(metadata.get("comparison_mode"), Some(&"numeric_tolerance".to_string()));
-        assert_eq!(metadata.get("comparison_scope"), Some(&"scalar".to_string()));
-        assert_eq!(metadata.get("expected_value_type"), Some(&"number".to_string()));
-        assert_eq!(metadata.get("actual_value_type"), Some(&"number".to_string()));
+        assert_eq!(
+            metadata.get("comparison_mode"),
+            Some(&"numeric_tolerance".to_string())
+        );
+        assert_eq!(
+            metadata.get("comparison_scope"),
+            Some(&"scalar".to_string())
+        );
+        assert_eq!(
+            metadata.get("expected_value_type"),
+            Some(&"number".to_string())
+        );
+        assert_eq!(
+            metadata.get("actual_value_type"),
+            Some(&"number".to_string())
+        );
         assert_eq!(metadata.get("tolerance_applied"), Some(&"true".to_string()));
         assert_eq!(metadata.get("numeric_delta"), Some(&"4".to_string()));
     }

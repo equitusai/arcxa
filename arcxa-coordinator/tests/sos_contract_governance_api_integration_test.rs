@@ -462,6 +462,119 @@ async fn build_router_contract_create_rejects_malformed_transformation_rules() {
 
 #[tokio::test]
 #[serial]
+async fn build_router_contract_create_rejects_incomplete_unit_transform_semantics() {
+    let harness = setup_authenticated_build_router_app();
+    let token = harness
+        .token
+        .as_deref()
+        .expect("authenticated harness should expose a token");
+    seed_contract_interfaces_only(&harness);
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/sos/contracts",
+            token,
+            json!({
+                "contract_id": "contract-incomplete-unit-transform",
+                "contract_name": "Incomplete Unit Transform Contract",
+                "provider_interface_id": "provider-if",
+                "consumer_interface_id": "consumer-if",
+                "sla_metrics": [{
+                    "name": "latency_ms",
+                    "value": 100.0,
+                    "operator": "<=",
+                    "unit": "ms"
+                }],
+                "transformation_rules": {
+                    "unit_transform": {
+                        "from": "SI",
+                        "to": "Imperial"
+                    }
+                },
+                "description": "Transform rule lacks executable unit semantics",
+                "tags": ["api-test"]
+            }),
+        ))
+        .await
+        .expect("contract creation request should complete");
+
+    let error: SosErrorResponse = assert_json_response(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(error.error, "INVALID_TRANSFORMATION_RULES");
+    assert!(error
+        .message
+        .contains("must declare a unit conversion strategy"));
+}
+
+#[tokio::test]
+#[serial]
+async fn build_router_contract_create_rejects_incomplete_coordinate_transform_semantics() {
+    let harness = setup_authenticated_build_router_app();
+    let token = harness
+        .token
+        .as_deref()
+        .expect("authenticated harness should expose a token");
+    seed_contract_interfaces_only(&harness);
+    harness
+        .storage_manager
+        .put_interface(&Interface {
+            interface_id: "consumer-if".to_string(),
+            system_id: "consumer-system".to_string(),
+            interface_name: "Consumer Interface".to_string(),
+            direction: "Consumer".to_string(),
+            protocol: "REST".to_string(),
+            data_format: "JSON".to_string(),
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": true}),
+            coordinate_system: Some("ECI_J2000".to_string()),
+            unit_system: Some("SI".to_string()),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .expect("consumer interface should be updated");
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/v1/sos/contracts",
+            token,
+            json!({
+                "contract_id": "contract-incomplete-coordinate-transform",
+                "contract_name": "Incomplete Coordinate Transform Contract",
+                "provider_interface_id": "provider-if",
+                "consumer_interface_id": "consumer-if",
+                "sla_metrics": [{
+                    "name": "latency_ms",
+                    "value": 100.0,
+                    "operator": "<=",
+                    "unit": "ms"
+                }],
+                "transformation_rules": {
+                    "coordinate_transform": {
+                        "from": "WGS84",
+                        "to": "ECI_J2000"
+                    }
+                },
+                "description": "Transform rule lacks executable coordinate semantics",
+                "tags": ["api-test"]
+            }),
+        ))
+        .await
+        .expect("contract creation request should complete");
+
+    let error: SosErrorResponse = assert_json_response(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(error.error, "INVALID_TRANSFORMATION_RULES");
+    assert!(error
+        .message
+        .contains("must declare a coordinate conversion strategy"));
+}
+
+#[tokio::test]
+#[serial]
 async fn build_router_interface_validation_rejects_misaligned_unit_transform_rule() {
     let harness = setup_authenticated_build_router_app();
     let token = harness
@@ -491,7 +604,10 @@ async fn build_router_interface_validation_rejects_misaligned_unit_transform_rul
                 "transformation_rules": {
                     "unit_transform": {
                         "from": "Imperial",
-                        "to": "SI"
+                        "to": "SI",
+                        "strategy": "linear_scale",
+                        "scale": 0.3048,
+                        "offset": 0.0
                     }
                 },
                 "description": "Rule endpoints do not match the interface direction",

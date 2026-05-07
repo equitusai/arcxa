@@ -102,7 +102,6 @@ fn persist_setup_token_output(token: Option<&str>) {
     }
 }
 
-
 fn decode_migration_evidence_seed(raw: &str) -> Option<[u8; 32]> {
     if raw.len() != 64 {
         return None;
@@ -1810,8 +1809,8 @@ async fn main() -> Result<()> {
 
     let migration_evidence_gateway = {
         use graphica_coordinator::api::migration_evidence::{
-            MigrationEvidenceEventBusConfig, MigrationEvidenceGateway, MigrationEvidenceGatewayConfig,
-            MigrationEvidenceRemoteGatewayConfig,
+            MigrationEvidenceEventBusConfig, MigrationEvidenceGateway,
+            MigrationEvidenceGatewayConfig, MigrationEvidenceRemoteGatewayConfig,
         };
 
         let connector_state_path = std::env::var("MIGRATION_EVIDENCE_CONNECTOR_STATE_PATH")
@@ -1823,10 +1822,10 @@ async fn main() -> Result<()> {
         let traceability_rocksdb_path =
             std::env::var("MIGRATION_EVIDENCE_TRACEABILITY_ROCKSDB_PATH")
                 .unwrap_or_else(|_| "./data/migration-evidence/traceability/rocksdb".to_string());
-        let signing_seed_hex = std::env::var("ARCXA_TRACEABILITY_SIGNING_KEY_HEX").unwrap_or_else(|_| {
-            "0101010101010101010101010101010101010101010101010101010101010101"
-                .to_string()
-        });
+        let signing_seed_hex =
+            std::env::var("ARCXA_TRACEABILITY_SIGNING_KEY_HEX").unwrap_or_else(|_| {
+                "0101010101010101010101010101010101010101010101010101010101010101".to_string()
+            });
 
         let signing_seed = decode_migration_evidence_seed(&signing_seed_hex).unwrap_or([1u8; 32]);
         let event_bus_mode = std::env::var("MIGRATION_EVIDENCE_EVENT_BUS_MODE")
@@ -1845,7 +1844,8 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let event_bus = if remote_services.is_none() && event_bus_mode.eq_ignore_ascii_case("kafka") {
+        let event_bus = if remote_services.is_none() && event_bus_mode.eq_ignore_ascii_case("kafka")
+        {
             Some(MigrationEvidenceEventBusConfig {
                 bootstrap_servers: std::env::var("MIGRATION_EVIDENCE_KAFKA_BOOTSTRAP_SERVERS")
                     .unwrap_or_else(|_| "127.0.0.1:9092".to_string()),
@@ -1867,6 +1867,7 @@ async fn main() -> Result<()> {
             shard_endpoint: std::env::var("ARCXA_MIGRATION_EVIDENCE_SHARD_ENDPOINT").ok(),
             event_bus,
             remote_services,
+            secret_store_registry: secret_store_registry.clone(),
         })
         .await
         {
@@ -1875,7 +1876,10 @@ async fn main() -> Result<()> {
                 Some(Arc::new(gateway))
             }
             Err(error) => {
-                warn!("WARNING: Failed to initialize migration evidence gateway: {}", error);
+                warn!(
+                    "WARNING: Failed to initialize migration evidence gateway: {}",
+                    error
+                );
                 None
             }
         }
