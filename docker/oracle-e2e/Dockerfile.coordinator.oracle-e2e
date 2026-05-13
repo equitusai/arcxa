@@ -39,6 +39,9 @@ COPY arcxa-coordinator ./arcxa-coordinator
 COPY arcxa-migrations ./arcxa-migrations
 COPY arcxa-cli ./arcxa-cli
 COPY arcxa-model-service ./arcxa-model-service
+COPY arcxa-evidence-ingestion ./arcxa-evidence-ingestion
+COPY arcxa-traceability ./arcxa-traceability
+COPY arcxa-verification ./arcxa-verification
 
 WORKDIR /build/arcxa-coordinator
 RUN --mount=type=cache,target=/root/.cargo/registry \
