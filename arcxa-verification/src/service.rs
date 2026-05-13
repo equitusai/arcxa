@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use graphica_core::catalog::api_types::QueryResult;
 use graphica_core::catalog::connector::{Credentials, DataSourceConnector};
+#[cfg(feature = "odbc")]
 use graphica_core::catalog::connectors::saphana::SAPHANAConnector;
 use graphica_core::catalog::types::{ConnectionDetails, DataSource, SAPHANAConfig, SourceConfig};
 use graphica_core::distributed::proto::migration_evidence::{

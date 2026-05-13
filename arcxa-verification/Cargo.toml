@@ -14,8 +14,11 @@ path = "src/lib.rs"
 name = "arcxa-verification"
 path = "src/main.rs"
 
+[features]
+odbc = ["graphica_core/odbc"]
+
 [dependencies]
-graphica_core = { package = "arcxa-core", path = "../arcxa-core", features = ["odbc"] }
+graphica_core = { package = "arcxa-core", path = "../arcxa-core" }
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
