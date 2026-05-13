@@ -34,6 +34,9 @@ COPY arcxa-coordinator ./arcxa-coordinator
 COPY arcxa-migrations ./arcxa-migrations
 COPY arcxa-model-service ./arcxa-model-service
 COPY arcxa-cli ./arcxa-cli
+COPY arcxa-evidence-ingestion ./arcxa-evidence-ingestion
+COPY arcxa-traceability ./arcxa-traceability
+COPY arcxa-verification ./arcxa-verification
 
 # Build coordinator (release mode)
 WORKDIR /build/arcxa-coordinator
